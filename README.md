@@ -49,6 +49,8 @@ Rsync-like workflow (destination runs a server):
 ```bash
 # destination host
 uv run ssync server --bind-port 9000 --root-dir ./received
+# equivalent daemon alias
+uv run ssyncd --bind-port 9000 --root-dir ./received
 
 # source host
 uv run ssync ./example.bin 127.0.0.1:incoming/example.bin --dest-port 9000
@@ -128,6 +130,22 @@ Run the same loopback validation using only the CLI commands:
 ./scripts/run_loopback_cli.sh
 ```
 
+Debug with tcpdump:
+
+```bash
+bash ./scripts/run_tcpdump_debug.sh
+```
+
+See detailed guidance in `docs/tcpdump-debugging.md`.
+
+Traffic emulation with `tc`/`netem`:
+
+```bash
+sudo bash ./scripts/run_emulated_scenario.sh
+```
+
+See detailed guidance in `docs/traffic-emulation.md`.
+
 ## Project layout
 
 - `src/ssync/space_sync/frames.py`: binary framing encode/decode
@@ -138,6 +156,8 @@ Run the same loopback validation using only the CLI commands:
 - `src/ssync/space_sync/cli.py`: command line entry points
 - `docs/space-sync-design.md`: design assumptions and roadmap
 - `docs/draft-space-sync-transport-00.md`: IETF-style protocol draft
+- `docs/tcpdump-debugging.md`: packet capture debugging guide
+- `docs/traffic-emulation.md`: tc/netem emulation guide and scenario matrix
 - `tests/`: protocol and end-to-end tests
 
 ## Developer checks

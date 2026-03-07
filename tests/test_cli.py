@@ -10,6 +10,7 @@ from ssync.space_sync import cli as cli_module
 from ssync.space_sync.cli import (
     _build_parser,
     _build_rsync_parser,
+    _build_ssyncd_parser,
     _collect_sync_items,
     _is_unchanged,
     _load_open_loop_state,
@@ -100,6 +101,20 @@ def test_send_and_sync_support_json_flag() -> None:
     assert sync_args.json_output is True
 
 
+def test_parser_supports_ssyncd_alias_subcommand() -> None:
+    parser = _build_parser()
+    args = parser.parse_args(["ssyncd", "--bind-port", "9010"])
+    assert args.command == "ssyncd"
+    assert args.bind_port == 9010
+
+
+def test_ssyncd_parser_accepts_server_args() -> None:
+    parser = _build_ssyncd_parser()
+    args = parser.parse_args(["--bind-port", "9011", "--root-dir", "./rx"])
+    assert args.bind_port == 9011
+    assert args.root_dir == Path("./rx")
+
+
 def test_top_level_rsync_parser_supports_options() -> None:
     parser = _build_rsync_parser()
     args = parser.parse_args(
@@ -119,6 +134,15 @@ def test_main_routes_top_level_to_sync(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(cli_module, "_run_sync", _fake_run_sync)
     assert cli_module.main(["src", "127.0.0.1:dst"]) == 0
+
+
+def test_main_routes_ssyncd_to_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_run_server(args: Namespace) -> int:
+        assert args.bind_port == 9012
+        return 0
+
+    monkeypatch.setattr(cli_module, "_run_server", _fake_run_server)
+    assert cli_module.main(["ssyncd", "--bind-port", "9012"]) == 0
 
 
 def test_checksum_requires_skip_unchanged(

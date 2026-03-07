@@ -8,6 +8,7 @@ dependencies = []
 
 [project.scripts]
 ssync = "ssync.space_sync.cli:main"
+ssyncd = "ssync.space_sync.cli:ssyncd_main"
 
 [dependency-groups]
 dev = ["mypy>=1.18.2", "pytest>=8.0.0", "ruff>=0.13.0"]

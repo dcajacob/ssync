@@ -33,32 +33,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "server",
         help="Run a destination server for rsync-like ssync sync operations",
     )
-    server.add_argument("--bind-host", default="0.0.0.0")
-    server.add_argument("--bind-port", type=int, default=9000)
-    server.add_argument(
-        "--root-dir",
-        type=Path,
-        default=Path("./received"),
-        help="Root directory where incoming files are written",
+    _add_server_args(server)
+    ssyncd = subparsers.add_parser(
+        "ssyncd",
+        help="Alias for the Space Sync destination server daemon",
     )
-    server.add_argument(
-        "--feedback",
-        action="store_true",
-        default=True,
-        help="Enable repair feedback (default: enabled)",
-    )
-    server.add_argument(
-        "--no-feedback",
-        action="store_false",
-        dest="feedback",
-        help="Disable feedback for open-loop only operation",
-    )
-    server.add_argument(
-        "--status-repeat",
-        type=int,
-        default=1,
-        help="How many times status is repeated when feedback is enabled",
-    )
+    _add_server_args(ssyncd)
 
     send = subparsers.add_parser("send", help="Send a file over Space Sync")
     send.add_argument("file", type=Path)
@@ -91,6 +71,41 @@ def _build_rsync_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Space Sync rsync-like file synchronization")
     _add_sync_args(parser)
     return parser
+
+
+def _build_ssyncd_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Space Sync destination server daemon")
+    _add_server_args(parser)
+    return parser
+
+
+def _add_server_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--bind-host", default="0.0.0.0")
+    parser.add_argument("--bind-port", type=int, default=9000)
+    parser.add_argument(
+        "--root-dir",
+        type=Path,
+        default=Path("./received"),
+        help="Root directory where incoming files are written",
+    )
+    parser.add_argument(
+        "--feedback",
+        action="store_true",
+        default=True,
+        help="Enable repair feedback (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-feedback",
+        action="store_false",
+        dest="feedback",
+        help="Disable feedback for open-loop only operation",
+    )
+    parser.add_argument(
+        "--status-repeat",
+        type=int,
+        default=1,
+        help="How many times status is repeated when feedback is enabled",
+    )
 
 
 def _add_sync_args(parser: argparse.ArgumentParser) -> None:
@@ -609,7 +624,7 @@ def _run_sync(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
-    subcommands = {"receive", "server", "send", "sync"}
+    subcommands = {"receive", "server", "ssyncd", "send", "sync"}
     if argv and argv[0] in subcommands:
         parser = _build_parser()
         args = parser.parse_args(argv)
@@ -619,7 +634,7 @@ def main(argv: list[str] | None = None) -> int:
         args.command = "sync"
     if args.command == "receive":
         return _run_receiver(args)
-    if args.command == "server":
+    if args.command in {"server", "ssyncd"}:
         return _run_server(args)
     if args.command == "send":
         return _run_sender(args)
@@ -631,4 +646,11 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def ssyncd_main(argv: list[str] | None = None) -> int:
+    argv = argv if argv is not None else sys.argv[1:]
+    parser = _build_ssyncd_parser()
+    args = parser.parse_args(argv)
+    return _run_server(args)
 
