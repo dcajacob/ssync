@@ -51,17 +51,64 @@ Rsync-like workflow (destination runs a server):
 uv run ssync server --bind-port 9000 --root-dir ./received
 
 # source host
-uv run ssync sync ./example.bin 127.0.0.1:incoming/example.bin --dest-port 9000
+uv run ssync ./example.bin 127.0.0.1:incoming/example.bin --dest-port 9000
 ```
 
 Sync a directory tree to a destination root path:
 
 ```bash
-uv run ssync sync ./payloads 127.0.0.1:missions/pass-001/ --dest-port 9000
+uv run ssync -r ./payloads 127.0.0.1:missions/pass-001/ --dest-port 9000
 ```
 
 The `sync` command enables repair feedback by default. Use `--no-feedback` for strict
 open-loop behavior.
+
+Rsync-style convenience options:
+
+```bash
+# dry run
+uv run ssync -n -r ./payloads 127.0.0.1:missions/pass-001/
+
+# include/exclude filters
+uv run ssync -r --include "*.txt" --exclude "tmp/*" ./payloads 127.0.0.1:missions/pass-001/
+
+# checksum-based unchanged detection
+uv run ssync -r --skip-unchanged --checksum ./payloads 127.0.0.1:missions/pass-001/
+```
+
+Compatibility note: `uv run ssync sync SRC DEST` still works as an alias, but
+`uv run ssync SRC DEST` is now the primary form.
+
+By default, sync does not pre-query the destination; it streams files immediately.
+Use `--skip-unchanged` (optionally with `--checksum`) when you want pre-transfer
+unchanged detection.
+
+Open-loop behavior (`--no-feedback`) is round-based and continuous by default:
+once the file set is finished, `ssync` starts another round. It keeps a persistent
+send-state file (`.ssync-open-loop-state.json`) with retransmission counts and
+orders each round so files with the lowest retransmission count are sent first.
+
+```bash
+# run open-loop continuously
+uv run ssync -r --no-feedback ./payloads 127.0.0.1:missions/pass-001/
+
+# run exactly two open-loop rounds
+uv run ssync -r --no-feedback --open-loop-max-rounds 2 ./payloads 127.0.0.1:missions/pass-001/
+```
+
+Machine-readable output for automation:
+
+```bash
+uv run ssync send ./example.bin --dest-port 9000 --json
+uv run ssync -r ./payloads 127.0.0.1:missions/pass-001/ --dest-port 9000 --json
+```
+
+Feedback mode timing controls:
+
+```bash
+uv run ssync send ./example.bin --dest-port 9000 --feedback \
+  --feedback-wait-s 2.0 --max-feedback-idle-timeouts 2 --max-repair-rounds 2
+```
 
 Simulate loss to exercise repair:
 
@@ -92,6 +139,14 @@ Run the same loopback validation using only the CLI commands:
 - `docs/space-sync-design.md`: design assumptions and roadmap
 - `docs/draft-space-sync-transport-00.md`: IETF-style protocol draft
 - `tests/`: protocol and end-to-end tests
+
+## Developer checks
+
+```bash
+uv run ruff check .
+uv run mypy
+uv run pytest -q
+```
 
 ## Current limitations
 

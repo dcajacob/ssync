@@ -10,7 +10,7 @@ dependencies = []
 ssync = "ssync.space_sync.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8.0.0"]
+dev = ["mypy>=1.18.2", "pytest>=8.0.0", "ruff>=0.13.0"]
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -25,3 +25,17 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.mypy]
+python_version = "3.13"
+files = ["src", "tests"]
+warn_return_any = true
+warn_unused_configs = true
+no_implicit_optional = true

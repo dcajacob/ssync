@@ -26,7 +26,7 @@ class TransferManifest:
         chunk_size: int,
         remote_name: str | None = None,
         metadata: dict[int, bytes] | None = None,
-    ) -> "TransferManifest":
+    ) -> TransferManifest:
         raw = file_path.read_bytes()
         file_size = len(raw)
         total_chunks = math.ceil(file_size / chunk_size) if file_size else 0

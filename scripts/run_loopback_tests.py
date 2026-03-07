@@ -48,7 +48,7 @@ def _run_open_loop(temp_dir: Path, chunk_size: int) -> ScenarioResult:
     name = "open-loop"
     rx_dir = temp_dir / "rx-open"
     source = temp_dir / "source-open.bin"
-    source.write_bytes((b"space-sync-open-loop-" * 4096))
+    source.write_bytes(b"space-sync-open-loop-" * 4096)
 
     port = _free_udp_port()
     receiver = SpaceSyncReceiver(
@@ -102,7 +102,7 @@ def _run_feedback_repair(
     name = "feedback-repair"
     rx_dir = temp_dir / "rx-repair"
     source = temp_dir / "source-repair.bin"
-    source.write_bytes((b"space-sync-feedback-repair-" * 4096))
+    source.write_bytes(b"space-sync-feedback-repair-" * 4096)
 
     port = _free_udp_port()
     receiver = SpaceSyncReceiver(
@@ -112,15 +112,18 @@ def _run_feedback_repair(
     )
     receiver.start()
     # Keep behavior consistent with open-loop startup sequencing.
-    time.sleep(0.15)
+    time.sleep(0.30)
     try:
         sender = SpaceSyncSender(
             config=SenderConfig(
                 chunk_size=chunk_size,
                 enable_feedback=True,
+                manifest_repeats=5,
+                inter_packet_delay_s=0.0005,
                 drop_every_nth_data=drop_every_nth_data,
                 max_repair_rounds=3,
                 feedback_wait_s=4.0,
+                max_feedback_idle_timeouts=4,
             ),
         )
         send_result = sender.send_file(source, "127.0.0.1", port)
@@ -130,7 +133,11 @@ def _run_feedback_repair(
         if _sha256(source) != _sha256(target):
             return ScenarioResult(name, False, "hash mismatch after feedback repair transfer")
         if send_result.repaired_chunks <= 0:
-            return ScenarioResult(name, False, "no chunks repaired; induced loss may not have triggered")
+            return ScenarioResult(
+                name,
+                False,
+                "no chunks repaired; induced loss may not have triggered",
+            )
         return ScenarioResult(
             name,
             True,

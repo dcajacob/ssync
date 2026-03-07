@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 
 from .types import Range
 
-
 RANGE_STRUCT = struct.Struct("!II")
 
 
@@ -72,9 +71,13 @@ class ChunkTracker:
     total_chunks: int
     _received: set[int] = field(default_factory=set)
 
-    def add(self, chunk_index: int) -> None:
+    def add(self, chunk_index: int) -> bool:
         if 0 <= chunk_index < self.total_chunks:
+            if chunk_index in self._received:
+                return False
             self._received.add(chunk_index)
+            return True
+        return False
 
     def is_complete(self) -> bool:
         return len(self._received) == self.total_chunks
@@ -86,4 +89,15 @@ class ChunkTracker:
 
     def missing_ranges(self) -> list[Range]:
         return ranges_from_indexes(self.missing_indexes())
+
+    def received_ranges(self) -> list[Range]:
+        return ranges_from_indexes(sorted(self._received))
+
+    @classmethod
+    def from_received_ranges(cls, total_chunks: int, received_ranges: list[Range]) -> ChunkTracker:
+        tracker = cls(total_chunks=total_chunks)
+        for start, end in received_ranges:
+            for chunk_index in range(start, end):
+                tracker._received.add(chunk_index)
+        return tracker
 

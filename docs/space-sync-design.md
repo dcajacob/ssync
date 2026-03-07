@@ -54,12 +54,16 @@ frame-specific payloads.
 - Integrity primitive: whole-file SHA-256 verification.
 - Current status model avoids per-packet ACK chatter.
 - Duplicate and out-of-order data chunks are tolerated.
+- Feedback mode sender behavior is timer-bounded (`feedback_wait_s`,
+  `max_feedback_idle_timeouts`, `max_repair_rounds`) with explicit incomplete
+  terminal outcome when no terminal status is received.
 
 ## Assumptions
 
 - Links are private/dedicated and fairness with public Internet traffic is out of scope.
 - Prototype runs over IPv4 UDP in local tests.
-- Transfer state is in-memory with temporary files; no durable database/state store.
+- Receiver transfer state is persisted as a local journal in output directories so
+  incomplete transfers can resume after receiver restart.
 - One active sender destination per transfer in the current implementation.
 
 ## Intentionally Deferred
@@ -67,7 +71,7 @@ frame-specific payloads.
 - Congestion control and adaptive rate control
 - FEC/parity transport
 - Cryptographic authentication and encryption
-- Persistent transfer ledger across process restarts/passes
+- Durable sender-side transfer ledgers and cross-contact scheduling
 - Prioritization, deletion/housekeeping controls
 - Stream transport semantics
 

@@ -1,7 +1,7 @@
 """Space Sync UDP transport prototype."""
 
-from .sender import SpaceSyncSender, SenderConfig, SendResult
-from .receiver import SpaceSyncReceiver, ReceiverConfig
+from .receiver import ReceiverConfig, SpaceSyncReceiver
+from .sender import SenderConfig, SendResult, SpaceSyncSender
 
 __all__ = [
     "ReceiverConfig",

@@ -4,11 +4,14 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
 
-
 PROTOCOL_MAGIC = b"SS"
 PROTOCOL_VERSION = 1
 TRANSFER_ID_SIZE = 16
 SHA256_SIZE = 32
+MAX_TLV_VALUE_SIZE = 65535
+MAX_TLV_TOTAL_SIZE = 65535
+MAX_FILE_NAME_BYTES = 4096
+MAX_RANGES_PER_FRAME = 2048
 DEFAULT_CHUNK_SIZE = 1024
 DEFAULT_MANIFEST_REPEATS = 3
 DEFAULT_SOCKET_TIMEOUT = 0.5
@@ -21,6 +24,8 @@ class FrameType(IntEnum):
     STATUS = 4
     REPAIR_REQUEST = 5
     REPAIR_DONE = 6
+    FILE_INFO_REQUEST = 7
+    FILE_INFO_RESPONSE = 8
 
 
 class TransferState(IntEnum):
@@ -32,6 +37,7 @@ class TransferState(IntEnum):
 class MetadataType(IntEnum):
     MISSION_TAG = 1
     USER_NOTE = 2
+    SOURCE_MTIME_NS = 3
 
 
 Range = tuple[int, int]
@@ -45,6 +51,7 @@ class SenderConfig:
     enable_feedback: bool = False
     feedback_wait_s: float = 2.0
     max_repair_rounds: int = 2
+    max_feedback_idle_timeouts: int = 2
     drop_every_nth_data: int = 0
 
 
@@ -71,4 +78,13 @@ class ReceivedTransferInfo:
     completed: bool
     missing_ranges: list[Range] = field(default_factory=list)
     hash_mismatch: bool = False
+
+
+@dataclass(slots=True)
+class RemoteFileInfo:
+    path: str
+    exists: bool
+    size: int = 0
+    mtime_ns: int = 0
+    sha256: bytes | None = None
 

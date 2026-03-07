@@ -130,10 +130,13 @@ send_output="$(
     --dest-host 127.0.0.1 \
     --dest-port "${repair_port}" \
     --chunk-size "${CHUNK_SIZE}" \
+    --manifest-repeats 5 \
+    --inter-packet-delay-s 0.0005 \
     --feedback \
     --drop-every-nth-data "${DROP_EVERY_NTH_DATA}" \
     --max-repair-rounds 3 \
-    --feedback-wait-s 4.0
+    --feedback-wait-s 4.0 \
+    --max-feedback-idle-timeouts 4 || true
 )"
 
 if wait_for_file "${REPAIR_RX_DIR}/$(basename "${SRC_REPAIR}")" 8 >/dev/null 2>&1; then

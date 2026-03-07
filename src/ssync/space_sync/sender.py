@@ -3,20 +3,23 @@ from __future__ import annotations
 import math
 import socket
 import time
+from hashlib import sha256
 from pathlib import Path
 
 from .frames import (
+    decode_file_info_response,
     decode_frame,
     decode_repair_request,
     decode_status,
     encode_data_chunk,
+    encode_file_info_request,
     encode_fin,
     encode_manifest,
     encode_repair_done,
 )
 from .manifest import TransferManifest
 from .ranges import expand_ranges
-from .types import FrameType, SendResult, SenderConfig, TransferState
+from .types import FrameType, MetadataType, RemoteFileInfo, SenderConfig, SendResult, TransferState
 
 
 class SpaceSyncSender:
@@ -26,7 +29,10 @@ class SpaceSyncSender:
     def _chunks(self, payload: bytes, chunk_size: int) -> list[bytes]:
         if not payload:
             return []
-        return [payload[offset : offset + chunk_size] for offset in range(0, len(payload), chunk_size)]
+        return [
+            payload[offset : offset + chunk_size]
+            for offset in range(0, len(payload), chunk_size)
+        ]
 
     def send_file(
         self,
@@ -37,10 +43,15 @@ class SpaceSyncSender:
     ) -> SendResult:
         file_path = file_path.resolve()
         raw = file_path.read_bytes()
+        file_stat = file_path.stat()
+        metadata = {
+            int(MetadataType.SOURCE_MTIME_NS): int(file_stat.st_mtime_ns).to_bytes(8, "big"),
+        }
         manifest = TransferManifest.from_file(
             file_path=file_path,
             chunk_size=self.config.chunk_size,
             remote_name=remote_name,
+            metadata=metadata,
         )
         chunks = self._chunks(raw, self.config.chunk_size)
         destination = (destination_host, destination_port)
@@ -83,14 +94,22 @@ class SpaceSyncSender:
                 )
 
             repair_rounds = 0
+            completed = False
+            idle_timeouts = 0
             while repair_rounds < self.config.max_repair_rounds:
                 try:
                     response_raw, response_addr = sock.recvfrom(65535)
                 except TimeoutError:
-                    break
+                    idle_timeouts += 1
+                    if idle_timeouts >= self.config.max_feedback_idle_timeouts:
+                        break
+                    continue
                 try:
                     parsed = decode_frame(response_raw)
                 except ValueError:
+                    continue
+                idle_timeouts = 0
+                if parsed.frame_type is None:
                     continue
                 if parsed.frame_type == FrameType.STATUS:
                     status = decode_status(parsed.payload)
@@ -134,4 +153,30 @@ class SpaceSyncSender:
             repair_rounds=repair_rounds,
             completed=completed,
         )
+
+    def query_remote_file(
+        self,
+        *,
+        destination_host: str,
+        destination_port: int,
+        remote_name: str,
+        include_checksum: bool,
+    ) -> RemoteFileInfo:
+        destination = (destination_host, destination_port)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(self.config.feedback_wait_s)
+            sock.sendto(encode_file_info_request(remote_name, include_checksum), destination)
+            while True:
+                response_raw, _ = sock.recvfrom(65535)
+                parsed = decode_frame(response_raw)
+                if parsed.frame_type != FrameType.FILE_INFO_RESPONSE:
+                    continue
+                response = decode_file_info_response(parsed.payload)
+                if response.path != remote_name:
+                    continue
+                return response
+
+    @staticmethod
+    def local_file_checksum(file_path: Path) -> bytes:
+        return sha256(file_path.read_bytes()).digest()
 
