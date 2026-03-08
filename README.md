@@ -51,6 +51,8 @@ Rsync-like workflow (destination runs a server):
 uv run ssync server --bind-port 9000 --root-dir ./received
 # equivalent daemon alias
 uv run ssyncd --bind-port 9000 --root-dir ./received
+# optional: keep hidden .part files after successful completion for debugging
+uv run ssyncd --bind-port 9000 --root-dir ./received --keep-part-files-on-complete
 
 # source host
 uv run ssync ./example.bin 127.0.0.1:incoming/example.bin --dest-port 9000
@@ -128,6 +130,18 @@ Run the same loopback validation using only the CLI commands:
 
 ```bash
 ./scripts/run_loopback_cli.sh
+```
+
+Probe the fastest stable loopback send rate for the current machine/settings:
+
+```bash
+uv run python scripts/benchmark_loopback_rate.py --start-bps 1000000 --max-bps 50000000
+```
+
+Or test exact candidate rates:
+
+```bash
+uv run python scripts/benchmark_loopback_rate.py --rates-bps 5000000,10000000,20000000
 ```
 
 Debug with tcpdump:

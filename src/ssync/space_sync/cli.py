@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
+import logging
+import os
 import signal
 import sys
 import time
@@ -11,6 +13,26 @@ from pathlib import Path, PurePosixPath
 from .receiver import SpaceSyncReceiver
 from .sender import SpaceSyncSender
 from .types import ReceiverConfig, RemoteFileInfo, SenderConfig
+
+
+def _default_log_level() -> str:
+    return os.getenv("SSYNC_LOG_LEVEL", "WARNING")
+
+
+def _add_log_level_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--log-level",
+        default=_default_log_level(),
+        choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"],
+        help="Runtime logging level (or set SSYNC_LOG_LEVEL)",
+    )
+
+
+def _configure_logging(level_name: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level_name.upper(), logging.WARNING),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -23,11 +45,65 @@ def _build_parser() -> argparse.ArgumentParser:
     recv.add_argument("--output-dir", type=Path, default=Path("./received"))
     recv.add_argument("--feedback", action="store_true", help="Enable repair feedback")
     recv.add_argument(
+        "--keep-part-files-on-complete",
+        action="store_true",
+        help="Keep .part files after successful completion (debugging)",
+    )
+    recv.add_argument(
         "--status-repeat",
         type=int,
-        default=1,
+        default=3,
         help="How many times status is repeated when feedback is enabled",
     )
+    recv.add_argument(
+        "--periodic-repair-request-s",
+        type=float,
+        default=0.5,
+        help="Periodic repair request interval while transfer is in progress",
+    )
+    recv.add_argument(
+        "--periodic-repair-min-seen-chunks",
+        type=int,
+        default=32,
+        help="Minimum received chunk frontier before periodic repair requests",
+    )
+    recv.add_argument(
+        "--max-repair-chunks-per-request",
+        type=int,
+        default=256,
+        help="Cap chunks requested in each repair request (0 means unlimited)",
+    )
+    recv.add_argument(
+        "--repair-request-cooldown-s",
+        type=float,
+        default=0.2,
+        help="Minimum delay before re-requesting unchanged missing ranges after REPAIR_DONE",
+    )
+    recv.add_argument(
+        "--repair-request-inflight-timeout-s",
+        type=float,
+        default=1.5,
+        help="Timeout before resending a repair request still considered in-flight",
+    )
+    recv.add_argument(
+        "--transfer-inactivity-timeout-s",
+        type=float,
+        default=10.0,
+        help="Finalize transfer as incomplete after FIN + inactivity timeout",
+    )
+    recv.add_argument(
+        "--socket-rcvbuf-bytes",
+        type=int,
+        default=8 * 1024 * 1024,
+        help="OS socket receive buffer size in bytes",
+    )
+    recv.add_argument(
+        "--journal-flush-interval-s",
+        type=float,
+        default=0.5,
+        help="Receiver journal flush interval in seconds (0 flushes every update)",
+    )
+    _add_log_level_arg(recv)
 
     server = subparsers.add_parser(
         "server",
@@ -48,7 +124,12 @@ def _build_parser() -> argparse.ArgumentParser:
     send.add_argument("--manifest-repeats", type=int, default=3)
     send.add_argument("--feedback", action="store_true", help="Enable repair flow")
     send.add_argument("--feedback-wait-s", type=float, default=2.0)
-    send.add_argument("--max-repair-rounds", type=int, default=2)
+    send.add_argument(
+        "--max-repair-rounds",
+        type=int,
+        default=32,
+        help="Post-FIN repair rounds (0 means unlimited until timeout/complete)",
+    )
     send.add_argument("--max-feedback-idle-timeouts", type=int, default=2)
     send.add_argument(
         "--drop-every-nth-data",
@@ -56,20 +137,47 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0,
         help="Test helper: drop every nth data frame",
     )
-    send.add_argument("--inter-packet-delay-s", type=float, default=0.0)
+    send.add_argument("--inter-packet-delay-s", type=float, default=0.0002)
+    send.add_argument(
+        "--max-data-rate-bps",
+        type=int,
+        default=0,
+        help="Throttle payload transmit rate in bits/sec (0 means unlimited)",
+    )
+    send.add_argument(
+        "--midstream-repair-max-rounds-per-poll",
+        type=int,
+        default=1,
+        help="Maximum repair requests handled per midstream polling pass (0 unlimited)",
+    )
+    send.add_argument(
+        "--midstream-repair-max-chunks-per-poll",
+        type=int,
+        default=512,
+        help="Maximum repair chunks sent per midstream polling pass (0 unlimited)",
+    )
+    send.add_argument(
+        "--repair-duplicate-suppression-s",
+        type=float,
+        default=0.2,
+        help="Suppress servicing identical repair requests within this interval",
+    )
     send.add_argument("--json", action="store_true", dest="json_output")
+    _add_log_level_arg(send)
 
     sync = subparsers.add_parser(
         "sync",
         help="Compatibility alias for rsync-like sync behavior",
     )
     _add_sync_args(sync)
+    _add_log_level_arg(sync)
     return parser
 
 
 def _build_rsync_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Space Sync rsync-like file synchronization")
     _add_sync_args(parser)
+    _add_log_level_arg(parser)
     return parser
 
 
@@ -101,11 +209,65 @@ def _add_server_args(parser: argparse.ArgumentParser) -> None:
         help="Disable feedback for open-loop only operation",
     )
     parser.add_argument(
+        "--keep-part-files-on-complete",
+        action="store_true",
+        help="Keep .part files after successful completion (debugging)",
+    )
+    parser.add_argument(
         "--status-repeat",
         type=int,
-        default=1,
+        default=3,
         help="How many times status is repeated when feedback is enabled",
     )
+    parser.add_argument(
+        "--periodic-repair-request-s",
+        type=float,
+        default=0.5,
+        help="Periodic repair request interval while transfer is in progress",
+    )
+    parser.add_argument(
+        "--periodic-repair-min-seen-chunks",
+        type=int,
+        default=32,
+        help="Minimum received chunk frontier before periodic repair requests",
+    )
+    parser.add_argument(
+        "--max-repair-chunks-per-request",
+        type=int,
+        default=256,
+        help="Cap chunks requested in each repair request (0 means unlimited)",
+    )
+    parser.add_argument(
+        "--repair-request-cooldown-s",
+        type=float,
+        default=0.2,
+        help="Minimum delay before re-requesting unchanged missing ranges after REPAIR_DONE",
+    )
+    parser.add_argument(
+        "--repair-request-inflight-timeout-s",
+        type=float,
+        default=1.5,
+        help="Timeout before resending a repair request still considered in-flight",
+    )
+    parser.add_argument(
+        "--transfer-inactivity-timeout-s",
+        type=float,
+        default=10.0,
+        help="Finalize transfer as incomplete after FIN + inactivity timeout",
+    )
+    parser.add_argument(
+        "--socket-rcvbuf-bytes",
+        type=int,
+        default=8 * 1024 * 1024,
+        help="OS socket receive buffer size in bytes",
+    )
+    parser.add_argument(
+        "--journal-flush-interval-s",
+        type=float,
+        default=0.5,
+        help="Receiver journal flush interval in seconds (0 flushes every update)",
+    )
+    _add_log_level_arg(parser)
 
 
 def _add_sync_args(parser: argparse.ArgumentParser) -> None:
@@ -167,7 +329,12 @@ def _add_sync_args(parser: argparse.ArgumentParser) -> None:
         help="Disable feedback/repair flow",
     )
     parser.add_argument("--feedback-wait-s", type=float, default=2.0)
-    parser.add_argument("--max-repair-rounds", type=int, default=2)
+    parser.add_argument(
+        "--max-repair-rounds",
+        type=int,
+        default=32,
+        help="Post-FIN repair rounds (0 means unlimited until timeout/complete)",
+    )
     parser.add_argument("--max-feedback-idle-timeouts", type=int, default=2)
     parser.add_argument(
         "--drop-every-nth-data",
@@ -175,7 +342,31 @@ def _add_sync_args(parser: argparse.ArgumentParser) -> None:
         default=0,
         help="Test helper: drop every nth data frame",
     )
-    parser.add_argument("--inter-packet-delay-s", type=float, default=0.0)
+    parser.add_argument("--inter-packet-delay-s", type=float, default=0.0002)
+    parser.add_argument(
+        "--max-data-rate-bps",
+        type=int,
+        default=0,
+        help="Throttle payload transmit rate in bits/sec (0 means unlimited)",
+    )
+    parser.add_argument(
+        "--midstream-repair-max-rounds-per-poll",
+        type=int,
+        default=1,
+        help="Maximum repair requests handled per midstream polling pass (0 unlimited)",
+    )
+    parser.add_argument(
+        "--midstream-repair-max-chunks-per-poll",
+        type=int,
+        default=512,
+        help="Maximum repair chunks sent per midstream polling pass (0 unlimited)",
+    )
+    parser.add_argument(
+        "--repair-duplicate-suppression-s",
+        type=float,
+        default=0.2,
+        help="Suppress servicing identical repair requests within this interval",
+    )
     parser.add_argument(
         "--state-file",
         type=Path,
@@ -197,7 +388,16 @@ def _run_receiver_common(
     bind_port: int,
     output_dir: Path,
     feedback: bool,
+    keep_part_files_on_complete: bool,
     status_repeat: int,
+    periodic_repair_request_s: float,
+    periodic_repair_min_seen_chunks: int,
+    max_repair_chunks_per_request: int,
+    repair_request_cooldown_s: float,
+    repair_request_inflight_timeout_s: float,
+    transfer_inactivity_timeout_s: float,
+    socket_rcvbuf_bytes: int,
+    journal_flush_interval_s: float,
     banner: str,
 ) -> int:
     receiver = SpaceSyncReceiver(
@@ -206,7 +406,16 @@ def _run_receiver_common(
         config=ReceiverConfig(
             output_dir=output_dir,
             enable_feedback=feedback,
+            keep_part_files_on_complete=keep_part_files_on_complete,
             status_repeat=max(1, status_repeat),
+            periodic_repair_request_s=max(0.0, periodic_repair_request_s),
+            periodic_repair_min_seen_chunks=max(1, periodic_repair_min_seen_chunks),
+            max_repair_chunks_per_request=max(0, max_repair_chunks_per_request),
+            repair_request_cooldown_s=max(0.0, repair_request_cooldown_s),
+            repair_request_inflight_timeout_s=max(0.0, repair_request_inflight_timeout_s),
+            transfer_inactivity_timeout_s=max(0.0, transfer_inactivity_timeout_s),
+            socket_rcvbuf_bytes=max(0, socket_rcvbuf_bytes),
+            journal_flush_interval_s=max(0.0, journal_flush_interval_s),
         ),
     )
     receiver.start()
@@ -234,7 +443,16 @@ def _run_receiver(args: argparse.Namespace) -> int:
         bind_port=args.bind_port,
         output_dir=args.output_dir,
         feedback=args.feedback,
+        keep_part_files_on_complete=args.keep_part_files_on_complete,
         status_repeat=args.status_repeat,
+        periodic_repair_request_s=args.periodic_repair_request_s,
+        periodic_repair_min_seen_chunks=args.periodic_repair_min_seen_chunks,
+        max_repair_chunks_per_request=args.max_repair_chunks_per_request,
+        repair_request_cooldown_s=args.repair_request_cooldown_s,
+        repair_request_inflight_timeout_s=args.repair_request_inflight_timeout_s,
+        transfer_inactivity_timeout_s=args.transfer_inactivity_timeout_s,
+        socket_rcvbuf_bytes=args.socket_rcvbuf_bytes,
+        journal_flush_interval_s=args.journal_flush_interval_s,
         banner=f"Space Sync receiver listening on {args.bind_host}:{args.bind_port}",
     )
 
@@ -245,7 +463,16 @@ def _run_server(args: argparse.Namespace) -> int:
         bind_port=args.bind_port,
         output_dir=args.root_dir,
         feedback=args.feedback,
+        keep_part_files_on_complete=args.keep_part_files_on_complete,
         status_repeat=args.status_repeat,
+        periodic_repair_request_s=args.periodic_repair_request_s,
+        periodic_repair_min_seen_chunks=args.periodic_repair_min_seen_chunks,
+        max_repair_chunks_per_request=args.max_repair_chunks_per_request,
+        repair_request_cooldown_s=args.repair_request_cooldown_s,
+        repair_request_inflight_timeout_s=args.repair_request_inflight_timeout_s,
+        transfer_inactivity_timeout_s=args.transfer_inactivity_timeout_s,
+        socket_rcvbuf_bytes=args.socket_rcvbuf_bytes,
+        journal_flush_interval_s=args.journal_flush_interval_s,
         banner=(
             "Space Sync server listening on "
             f"{args.bind_host}:{args.bind_port} root={args.root_dir}"
@@ -264,6 +491,14 @@ def _run_sender(args: argparse.Namespace) -> int:
             max_repair_rounds=args.max_repair_rounds,
             max_feedback_idle_timeouts=args.max_feedback_idle_timeouts,
             drop_every_nth_data=args.drop_every_nth_data,
+            max_data_rate_bps=max(0, args.max_data_rate_bps),
+            midstream_repair_max_rounds_per_poll=max(
+                0, args.midstream_repair_max_rounds_per_poll
+            ),
+            midstream_repair_max_chunks_per_poll=max(
+                0, args.midstream_repair_max_chunks_per_poll
+            ),
+            repair_duplicate_suppression_s=max(0.0, args.repair_duplicate_suppression_s),
         )
     )
     result = sender.send_file(
@@ -459,6 +694,14 @@ def _run_sync(args: argparse.Namespace) -> int:
             max_repair_rounds=args.max_repair_rounds,
             max_feedback_idle_timeouts=args.max_feedback_idle_timeouts,
             drop_every_nth_data=args.drop_every_nth_data,
+            max_data_rate_bps=max(0, args.max_data_rate_bps),
+            midstream_repair_max_rounds_per_poll=max(
+                0, args.midstream_repair_max_rounds_per_poll
+            ),
+            midstream_repair_max_chunks_per_poll=max(
+                0, args.midstream_repair_max_chunks_per_poll
+            ),
+            repair_duplicate_suppression_s=max(0.0, args.repair_duplicate_suppression_s),
         )
     )
 
@@ -632,6 +875,7 @@ def main(argv: list[str] | None = None) -> int:
         parser = _build_rsync_parser()
         args = parser.parse_args(argv)
         args.command = "sync"
+    _configure_logging(args.log_level)
     if args.command == "receive":
         return _run_receiver(args)
     if args.command in {"server", "ssyncd"}:
@@ -652,5 +896,6 @@ def ssyncd_main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     parser = _build_ssyncd_parser()
     args = parser.parse_args(argv)
+    _configure_logging(args.log_level)
     return _run_server(args)
 

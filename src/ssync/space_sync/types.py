@@ -26,6 +26,7 @@ class FrameType(IntEnum):
     REPAIR_DONE = 6
     FILE_INFO_REQUEST = 7
     FILE_INFO_RESPONSE = 8
+    TRANSFER_COMPLETE = 9
 
 
 class TransferState(IntEnum):
@@ -47,19 +48,32 @@ Range = tuple[int, int]
 class SenderConfig:
     chunk_size: int = DEFAULT_CHUNK_SIZE
     manifest_repeats: int = DEFAULT_MANIFEST_REPEATS
-    inter_packet_delay_s: float = 0.0
+    inter_packet_delay_s: float = 0.0002
     enable_feedback: bool = False
     feedback_wait_s: float = 2.0
-    max_repair_rounds: int = 2
+    max_repair_rounds: int = 32
     max_feedback_idle_timeouts: int = 2
     drop_every_nth_data: int = 0
+    max_data_rate_bps: int = 0
+    midstream_repair_max_rounds_per_poll: int = 1
+    midstream_repair_max_chunks_per_poll: int = 512
+    repair_duplicate_suppression_s: float = 0.2
 
 
 @dataclass(slots=True)
 class ReceiverConfig:
     output_dir: Path
     enable_feedback: bool = False
-    status_repeat: int = 1
+    keep_part_files_on_complete: bool = False
+    status_repeat: int = 3
+    periodic_repair_request_s: float = 0.5
+    periodic_repair_min_seen_chunks: int = 32
+    max_repair_chunks_per_request: int = 256
+    transfer_inactivity_timeout_s: float = 10.0
+    socket_rcvbuf_bytes: int = 8 * 1024 * 1024
+    journal_flush_interval_s: float = 0.5
+    repair_request_cooldown_s: float = 0.2
+    repair_request_inflight_timeout_s: float = 1.5
 
 
 @dataclass(slots=True)

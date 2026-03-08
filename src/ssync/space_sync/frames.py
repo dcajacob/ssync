@@ -279,6 +279,14 @@ def decode_repair_done(payload: bytes) -> bytes:
     return decode_fin(payload)
 
 
+def encode_transfer_complete(transfer_id: bytes) -> bytes:
+    return encode_frame(FrameType.TRANSFER_COMPLETE, FIN_STRUCT.pack(transfer_id))
+
+
+def decode_transfer_complete(payload: bytes) -> bytes:
+    return decode_fin(payload)
+
+
 def encode_file_info_request(path: str, include_checksum: bool) -> bytes:
     path_bytes = path.encode("utf-8")
     if not path_bytes:

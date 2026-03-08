@@ -63,6 +63,41 @@ def test_open_loop_local_transfer(tmp_path: Path) -> None:
         target_path = receiver_dir / source_path.name
         assert _wait_for_file(target_path)
         assert target_path.read_bytes() == source_payload
+        part_path = receiver_dir / f".{result.transfer_id_hex}.part"
+        assert not part_path.exists()
+    finally:
+        receiver.stop()
+
+
+def test_receiver_can_keep_part_file_on_success(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-keep-part"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(
+            output_dir=receiver_dir,
+            enable_feedback=False,
+            keep_part_files_on_complete=True,
+        ),
+    )
+    receiver.start()
+    try:
+        source_path = tmp_path / "source-keep-part.bin"
+        source_payload = b"keep-part" * 700
+        source_path.write_bytes(source_payload)
+
+        sender = SpaceSyncSender(
+            config=SenderConfig(chunk_size=256, enable_feedback=False),
+        )
+        result = sender.send_file(source_path, "127.0.0.1", receiver.bind_port)
+        assert result.total_chunks > 0
+
+        target_path = receiver_dir / source_path.name
+        assert _wait_for_file(target_path)
+        assert target_path.read_bytes() == source_payload
+        part_path = receiver_dir / f".{result.transfer_id_hex}.part"
+        assert part_path.exists()
+        assert part_path.read_bytes() == source_payload
     finally:
         receiver.stop()
 
@@ -255,4 +290,196 @@ def test_receiver_recovers_incomplete_transfer_after_restart(tmp_path: Path) -> 
         assert target_path.read_bytes() == source_payload
     finally:
         receiver2.stop()
+
+
+def test_feedback_repair_converges_with_bounded_rounds(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-bounded-repair"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(
+            output_dir=receiver_dir,
+            enable_feedback=True,
+            periodic_repair_request_s=0.25,
+            periodic_repair_min_seen_chunks=64,
+            max_repair_chunks_per_request=128,
+            repair_request_cooldown_s=0.2,
+            repair_request_inflight_timeout_s=0.8,
+            socket_rcvbuf_bytes=32 * 1024 * 1024,
+            journal_flush_interval_s=0.5,
+        ),
+    )
+    receiver.start()
+    try:
+        source_path = tmp_path / "source-bounded-repair.bin"
+        source_payload = b"post-fin-repair-" * 400_000
+        source_path.write_bytes(source_payload)
+
+        sender = SpaceSyncSender(
+            config=SenderConfig(
+                chunk_size=1024,
+                enable_feedback=True,
+                drop_every_nth_data=17,
+                feedback_wait_s=0.5,
+                max_repair_rounds=0,
+                max_feedback_idle_timeouts=120,
+                max_data_rate_bps=16_000_000,
+                midstream_repair_max_rounds_per_poll=1,
+                midstream_repair_max_chunks_per_poll=128,
+                repair_duplicate_suppression_s=0.2,
+            )
+        )
+        result = sender.send_file(source_path, "127.0.0.1", receiver.bind_port)
+        assert result.completed is True
+        assert result.repaired_chunks > 0
+        # Regression guard: prevent uncontrolled post-FIN repair storms.
+        assert result.repair_rounds < 600
+
+        target_path = receiver_dir / source_path.name
+        assert _wait_for_file(target_path, timeout_s=8.0)
+        assert target_path.read_bytes() == source_payload
+    finally:
+        receiver.stop()
+
+
+def test_receiver_chains_post_fin_repairs_without_periodic_wait(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-chain-post-fin"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(
+            output_dir=receiver_dir,
+            enable_feedback=True,
+            periodic_repair_request_s=60.0,
+            periodic_repair_min_seen_chunks=10_000,
+            max_repair_chunks_per_request=2,
+            repair_request_cooldown_s=0.0,
+            transfer_inactivity_timeout_s=2.0,
+        ),
+    )
+    receiver.start()
+    try:
+        source_path = tmp_path / "source-chain-post-fin.bin"
+        source_payload = b"post-fin-chain-" * 8_000
+        source_path.write_bytes(source_payload)
+        sender = SpaceSyncSender(
+            config=SenderConfig(
+                chunk_size=512,
+                enable_feedback=True,
+                drop_every_nth_data=2,
+                max_repair_rounds=0,
+                max_feedback_idle_timeouts=30,
+                feedback_wait_s=0.2,
+                midstream_repair_max_rounds_per_poll=0,
+                midstream_repair_max_chunks_per_poll=0,
+            )
+        )
+        result = sender.send_file(source_path, "127.0.0.1", receiver.bind_port)
+        assert result.completed is True
+        assert result.repair_rounds > 1
+        target_path = receiver_dir / source_path.name
+        assert _wait_for_file(target_path, timeout_s=4.0)
+        assert target_path.read_bytes() == source_payload
+    finally:
+        receiver.stop()
+
+
+def test_receiver_completed_transfers_has_single_entry_per_transfer(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-single-completed-entry"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(output_dir=receiver_dir, enable_feedback=True),
+    )
+    receiver.start()
+    try:
+        source_path = tmp_path / "source-single-entry.bin"
+        source_payload = b"single-entry-" * 5_000
+        source_path.write_bytes(source_payload)
+        sender = SpaceSyncSender(
+            config=SenderConfig(
+                chunk_size=256,
+                enable_feedback=True,
+                drop_every_nth_data=5,
+                max_repair_rounds=0,
+                max_feedback_idle_timeouts=30,
+                feedback_wait_s=0.2,
+            )
+        )
+        result = sender.send_file(source_path, "127.0.0.1", receiver.bind_port)
+        assert result.completed is True
+        assert _wait_for_file(receiver_dir / source_path.name, timeout_s=4.0)
+        assert _wait_for_predicate(
+            lambda: any(
+                item.transfer_id_hex == result.transfer_id_hex
+                for item in receiver.completed_transfers
+            ),
+            timeout_s=2.0,
+        )
+        completed = [
+            item
+            for item in receiver.completed_transfers
+            if item.transfer_id_hex == result.transfer_id_hex
+        ]
+        assert len(completed) == 1
+        assert completed[0].completed is True
+    finally:
+        receiver.stop()
+
+
+def test_hash_mismatch_removes_part_file(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-hash-mismatch"
+    bind_port = _free_udp_port()
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=bind_port,
+        config=ReceiverConfig(output_dir=receiver_dir, enable_feedback=True),
+    )
+    receiver.start()
+    try:
+        source_path = tmp_path / "source-hash-mismatch.bin"
+        payload = b"hash-mismatch-" * 2_000
+        source_path.write_bytes(payload)
+        manifest = TransferManifest.from_file(source_path, chunk_size=512)
+        chunks = [
+            payload[offset : offset + manifest.chunk_size]
+            for offset in range(0, len(payload), manifest.chunk_size)
+        ]
+        corrupt_index = min(1, len(chunks) - 1)
+        corrupted_chunk = bytearray(chunks[corrupt_index])
+        corrupted_chunk[0] ^= 0x01
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            destination = ("127.0.0.1", bind_port)
+            sock.sendto(encode_manifest(manifest), destination)
+            for chunk_index, chunk in enumerate(chunks):
+                if chunk_index == corrupt_index:
+                    sock.sendto(
+                        encode_data_chunk(
+                            manifest.transfer_id,
+                            chunk_index,
+                            bytes(corrupted_chunk),
+                        ),
+                        destination,
+                    )
+                else:
+                    sock.sendto(
+                        encode_data_chunk(manifest.transfer_id, chunk_index, chunk),
+                        destination,
+                    )
+            sock.sendto(encode_fin(manifest.transfer_id), destination)
+
+        assert _wait_for_predicate(lambda: bool(receiver.completed_transfers), timeout_s=3.0)
+        final_path = receiver_dir / source_path.name
+        assert not final_path.exists()
+        part_path = receiver_dir / f".{manifest.transfer_id.hex()}.part"
+        assert not part_path.exists()
+        statuses = [
+            item
+            for item in receiver.completed_transfers
+            if item.transfer_id_hex == manifest.transfer_id.hex()
+        ]
+        assert len(statuses) == 1
+        assert statuses[0].hash_mismatch is True
+    finally:
+        receiver.stop()
 

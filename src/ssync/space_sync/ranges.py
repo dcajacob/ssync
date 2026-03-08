@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import struct
+from bisect import bisect_left
 from dataclasses import dataclass, field
 
 from .types import Range
@@ -69,35 +70,100 @@ def decode_ranges(payload: bytes) -> list[Range]:
 @dataclass(slots=True)
 class ChunkTracker:
     total_chunks: int
-    _received: set[int] = field(default_factory=set)
+    _received_ranges: list[Range] = field(default_factory=list)
+    _received_count: int = 0
 
     def add(self, chunk_index: int) -> bool:
-        if 0 <= chunk_index < self.total_chunks:
-            if chunk_index in self._received:
+        if not (0 <= chunk_index < self.total_chunks):
+            return False
+        if self.total_chunks == 0:
+            return False
+
+        # Locate the insertion point by range start.
+        starts = [start for start, _ in self._received_ranges]
+        insert_at = bisect_left(starts, chunk_index)
+
+        # Already covered by previous range.
+        if insert_at > 0:
+            prev_start, prev_end = self._received_ranges[insert_at - 1]
+            if prev_start <= chunk_index < prev_end:
                 return False
-            self._received.add(chunk_index)
-            return True
-        return False
+
+        # Already covered by next range.
+        if insert_at < len(self._received_ranges):
+            next_start, next_end = self._received_ranges[insert_at]
+            if next_start <= chunk_index < next_end:
+                return False
+
+        new_start = chunk_index
+        new_end = chunk_index + 1
+
+        # Merge/extend previous adjacent range.
+        if insert_at > 0:
+            prev_start, prev_end = self._received_ranges[insert_at - 1]
+            if prev_end == chunk_index:
+                new_start = prev_start
+                insert_at -= 1
+                self._received_ranges.pop(insert_at)
+
+        # Merge/extend next adjacent range.
+        if insert_at < len(self._received_ranges):
+            next_start, next_end = self._received_ranges[insert_at]
+            if next_start == chunk_index + 1:
+                new_end = next_end
+                self._received_ranges.pop(insert_at)
+
+        self._received_ranges.insert(insert_at, (new_start, new_end))
+        self._received_count += 1
+        return True
 
     def is_complete(self) -> bool:
-        return len(self._received) == self.total_chunks
+        return self._received_count == self.total_chunks
+
+    def received_count(self) -> int:
+        return self._received_count
 
     def missing_indexes(self) -> list[int]:
-        if self.total_chunks == 0:
-            return []
-        return [index for index in range(self.total_chunks) if index not in self._received]
+        return expand_ranges(self.missing_ranges())
 
     def missing_ranges(self) -> list[Range]:
-        return ranges_from_indexes(self.missing_indexes())
+        return self._missing_ranges_between(0, self.total_chunks)
+
+    def missing_ranges_upto(self, end_exclusive: int) -> list[Range]:
+        bounded_end = max(0, min(end_exclusive, self.total_chunks))
+        return self._missing_ranges_between(0, bounded_end)
 
     def received_ranges(self) -> list[Range]:
-        return ranges_from_indexes(sorted(self._received))
+        return list(self._received_ranges)
+
+    def _missing_ranges_between(self, start: int, end_exclusive: int) -> list[Range]:
+        if end_exclusive <= start:
+            return []
+        cursor = start
+        missing: list[Range] = []
+        for recv_start, recv_end in self._received_ranges:
+            if recv_end <= cursor:
+                continue
+            if recv_start >= end_exclusive:
+                break
+            if recv_start > cursor:
+                missing.append((cursor, min(recv_start, end_exclusive)))
+            cursor = max(cursor, min(recv_end, end_exclusive))
+            if cursor >= end_exclusive:
+                break
+        if cursor < end_exclusive:
+            missing.append((cursor, end_exclusive))
+        return missing
 
     @classmethod
     def from_received_ranges(cls, total_chunks: int, received_ranges: list[Range]) -> ChunkTracker:
-        tracker = cls(total_chunks=total_chunks)
-        for start, end in received_ranges:
-            for chunk_index in range(start, end):
-                tracker._received.add(chunk_index)
+        normalized: list[Range] = []
+        for start, end in merge_ranges(received_ranges):
+            bounded_start = max(0, min(start, total_chunks))
+            bounded_end = max(0, min(end, total_chunks))
+            if bounded_start < bounded_end:
+                normalized.append((bounded_start, bounded_end))
+        tracker = cls(total_chunks=total_chunks, _received_ranges=normalized)
+        tracker._received_count = sum(end - start for start, end in normalized)
         return tracker
 

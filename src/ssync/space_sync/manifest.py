@@ -28,11 +28,27 @@ class TransferManifest:
         metadata: dict[int, bytes] | None = None,
     ) -> TransferManifest:
         raw = file_path.read_bytes()
+        return cls.from_bytes(
+            raw=raw,
+            file_name=remote_name or file_path.name,
+            chunk_size=chunk_size,
+            metadata=metadata,
+        )
+
+    @classmethod
+    def from_bytes(
+        cls,
+        *,
+        raw: bytes,
+        file_name: str,
+        chunk_size: int,
+        metadata: dict[int, bytes] | None = None,
+    ) -> TransferManifest:
         file_size = len(raw)
         total_chunks = math.ceil(file_size / chunk_size) if file_size else 0
         return cls(
             transfer_id=uuid.uuid4().bytes,
-            file_name=remote_name or file_path.name,
+            file_name=file_name,
             file_size=file_size,
             chunk_size=chunk_size,
             total_chunks=total_chunks,

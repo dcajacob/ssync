@@ -8,12 +8,14 @@ from ssync.space_sync.frames import (
     decode_manifest,
     decode_repair_request,
     decode_status,
+    decode_transfer_complete,
     encode_data_chunk,
     encode_file_info_request,
     encode_file_info_response,
     encode_manifest,
     encode_repair_request,
     encode_status,
+    encode_transfer_complete,
 )
 from ssync.space_sync.manifest import RepairRequest, TransferManifest
 from ssync.space_sync.types import FrameType, RemoteFileInfo, TransferState
@@ -116,4 +118,11 @@ def test_status_and_repair_round_trip() -> None:
     request_decoded = decode_repair_request(decode_frame(request_raw).payload)
     assert request_decoded.transfer_id == b"\xCC" * 16
     assert request_decoded.missing_ranges == [(1, 2), (6, 7)]
+
+
+def test_transfer_complete_round_trip() -> None:
+    raw = encode_transfer_complete(b"\xDD" * 16)
+    parsed = decode_frame(raw)
+    assert parsed.frame_type == FrameType.TRANSFER_COMPLETE
+    assert decode_transfer_complete(parsed.payload) == b"\xDD" * 16
 
