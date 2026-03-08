@@ -56,6 +56,27 @@ def summarize_ranges(ranges: list[Range]) -> str:
     return f"{len(ranges)} range(s): {preview}"
 
 
+def limit_ranges_to_chunk_budget(
+    missing_ranges: list[Range],
+    chunk_budget: int,
+) -> list[Range]:
+    if chunk_budget <= 0:
+        return []
+    remaining = chunk_budget
+    limited: list[Range] = []
+    for start, end in missing_ranges:
+        if remaining <= 0:
+            break
+        length = end - start
+        if length <= remaining:
+            limited.append((start, end))
+            remaining -= length
+            continue
+        limited.append((start, start + remaining))
+        break
+    return limited
+
+
 def encode_ranges(ranges: list[Range]) -> bytes:
     payload = bytearray()
     for start, end in merge_ranges(ranges):

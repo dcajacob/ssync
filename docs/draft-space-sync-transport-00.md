@@ -53,7 +53,8 @@ Terms:
 
 ### 3.1.  Frame Families
 
-`MANIFEST`, `DATA`, `FIN`, `STATUS`, `REPAIR_REQUEST`, and `REPAIR_DONE`.
+`MANIFEST`, `DATA`, `FIN`, `STATUS`, `REPAIR_REQUEST`, `REPAIR_DONE`,
+`FILE_INFO_REQUEST`, `FILE_INFO_RESPONSE`, `TRANSFER_COMPLETE`, and `BEACON`.
 
 ### 3.2.  High-Level Transfer Sequence
 
@@ -181,6 +182,37 @@ Receiver MUST discard `DATA` when:
 
 - `Transfer ID` (16 bytes)
 
+### 7.8.  `FILE_INFO_REQUEST`
+
+- `Include Checksum` (uint8, 0/1)
+- `Path Length` (uint16)
+- `Path` (UTF-8, non-empty)
+
+### 7.9.  `FILE_INFO_RESPONSE`
+
+- `Exists` (uint8, 0/1)
+- `Has SHA-256` (uint8, 0/1)
+- `Size` (uint64)
+- `Mtime (ns)` (uint64)
+- `SHA-256` (32 bytes, zeroed when `Has SHA-256 = 0`)
+- `Path Length` (uint16)
+- `Path` (UTF-8, non-empty)
+
+### 7.10.  `TRANSFER_COMPLETE`
+
+- `Transfer ID` (16 bytes)
+
+`TRANSFER_COMPLETE` is a compatibility completion hint. Implementations SHOULD
+use `STATUS(COMPLETE)` as the authoritative receiver completion signal.
+
+### 7.11.  `BEACON`
+
+- `Role` (uint8): `1=SENDER`, `2=RECEIVER`
+- `Transfer ID` (16 bytes)
+
+`BEACON` is an optional availability keepalive and does not directly advance
+transfer completion state.
+
 ## 8.  Missing Range Encoding
 
 Each range entry:
@@ -218,6 +250,8 @@ Terminal conditions:
 
 - On `STATUS(COMPLETE)`: sender marks transfer complete and stops.
 - On `STATUS(HASH_MISMATCH)`: sender marks transfer failed and stops.
+- On `TRANSFER_COMPLETE` with matching transfer ID: sender MAY stop early as a
+  compatibility fast-path.
 - On `REPAIR_REQUEST`: sender retransmits requested chunks, sends `REPAIR_DONE`,
   increments repair-round count.
 - On timer exhaustion without terminal status: sender marks transfer incomplete.
@@ -235,6 +269,12 @@ On `FIN`:
 - If incomplete and feedback disabled, receiver records incomplete state.
 
 On `REPAIR_DONE`, receiver reevaluates completeness and hash.
+
+Repeated `MANIFEST` optimization:
+
+- Receiver MAY advertise resumable state via `STATUS(INCOMPLETE)` when a repeated
+  manifest arrives for an active transfer.
+- Receiver MAY short-circuit already-complete files by sending `STATUS(COMPLETE)`.
 
 Feedback mode status:
 
@@ -301,6 +341,10 @@ Initial values:
 - 4 `STATUS`
 - 5 `REPAIR_REQUEST`
 - 6 `REPAIR_DONE`
+- 7 `FILE_INFO_REQUEST`
+- 8 `FILE_INFO_RESPONSE`
+- 9 `TRANSFER_COMPLETE`
+- 10 `BEACON`
 - 240-255 Private Use
 
 ### 15.2.  STATUS State Registry

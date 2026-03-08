@@ -21,7 +21,7 @@ from .frames import (
     encode_repair_done,
 )
 from .manifest import TransferManifest
-from .ranges import expand_ranges, summarize_ranges
+from .ranges import expand_ranges, limit_ranges_to_chunk_budget, summarize_ranges
 from .types import (
     BeaconRole,
     FrameType,
@@ -68,7 +68,7 @@ class SpaceSyncSender:
         destination = (destination_host, destination_port)
         repaired_chunks = 0
         repair_rounds = 0
-        completed = True
+        completed = False
         paced_start_s = time.monotonic()
         paced_data_bytes = 0
         transfer_id_hex = manifest.transfer_id.hex()
@@ -513,7 +513,7 @@ class SpaceSyncSender:
                 repair_ranges = (
                     status.missing_ranges
                     if max_chunks <= 0
-                    else self._limit_ranges_to_chunk_budget(
+                    else limit_ranges_to_chunk_budget(
                         status.missing_ranges,
                         remaining_chunks,
                     )
@@ -554,27 +554,6 @@ class SpaceSyncSender:
                 sock.sendto(encode_repair_done(manifest.transfer_id), response_addr)
             repair_rounds += 1
         return repaired_chunks, repair_rounds, paced_data_bytes, completed
-
-    def _limit_ranges_to_chunk_budget(
-        self,
-        missing_ranges: list[tuple[int, int]],
-        chunk_budget: int,
-    ) -> list[tuple[int, int]]:
-        if chunk_budget <= 0:
-            return []
-        remaining = chunk_budget
-        limited: list[tuple[int, int]] = []
-        for start, end in missing_ranges:
-            if remaining <= 0:
-                break
-            length = end - start
-            if length <= remaining:
-                limited.append((start, end))
-                remaining -= length
-                continue
-            limited.append((start, start + remaining))
-            break
-        return limited
 
     def _apply_rate_limit(
         self,

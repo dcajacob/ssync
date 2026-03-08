@@ -5,6 +5,9 @@ import socket
 import time
 from pathlib import Path
 
+import pytest
+
+from ssync.space_sync import receiver as receiver_module
 from ssync.space_sync.frames import (
     HEADER_STRUCT,
     decode_frame,
@@ -176,6 +179,64 @@ def test_receiver_advertises_incomplete_state_on_repeated_manifest(tmp_path: Pat
     assert status.missing_ranges
 
 
+def test_receiver_advertises_incomplete_until_hash_verified(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-state-complete-gating"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(output_dir=receiver_dir, enable_feedback=True),
+    )
+    payload = b"gate-complete" * 128
+    manifest = TransferManifest.from_bytes(raw=payload, file_name="resume/full.bin", chunk_size=128)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver_sock:
+        receiver_sock.bind(("127.0.0.1", 0))
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender_sock:
+            sender_sock.bind(("127.0.0.1", 0))
+            sender_sock.settimeout(1.0)
+            source_addr = sender_sock.getsockname()
+            receiver._prepare_transfer(receiver_sock, manifest, source_addr)
+            with receiver._lock:
+                transfer = receiver._transfers[manifest.transfer_id]
+                for idx in range(transfer.manifest.total_chunks):
+                    transfer.tracker.add(idx)
+                assert transfer.tracker.missing_ranges() == []
+                assert transfer.done is False
+            receiver._prepare_transfer(receiver_sock, manifest, source_addr)
+            response_raw, _ = sender_sock.recvfrom(65535)
+
+    parsed = decode_frame(response_raw)
+    assert parsed.frame_type == FrameType.STATUS
+    status = decode_status(parsed.payload)
+    assert status.transfer_id == manifest.transfer_id
+    assert status.state == TransferState.INCOMPLETE
+    assert status.missing_ranges == []
+
+
+def test_matching_completed_file_uses_cached_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(output_dir=tmp_path / "rx-cache", enable_feedback=True),
+    )
+    payload = b"cache-check" * 256
+    final_path = tmp_path / "rx-cache" / "done.bin"
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    final_path.write_bytes(payload)
+    manifest = TransferManifest.from_bytes(raw=payload, file_name="done.bin", chunk_size=128)
+
+    assert receiver._is_matching_completed_file(final_path, manifest) is True
+
+    def _fail_open(*args: object, **kwargs: object) -> object:
+        raise AssertionError("expected hash cache hit without reading file")
+
+    monkeypatch.setattr(Path, "open", _fail_open)
+    assert receiver._is_matching_completed_file(final_path, manifest) is True
+
+
 def test_receiver_beacon_updates_transfer_activity(tmp_path: Path) -> None:
     receiver_dir = tmp_path / "rx-beacon-activity"
     receiver = SpaceSyncReceiver(
@@ -204,6 +265,109 @@ def test_receiver_beacon_updates_transfer_activity(tmp_path: Path) -> None:
             updated = receiver._transfers[manifest.transfer_id]
             assert updated.last_activity_s > previous
             assert updated.source_addr == ("127.0.0.1", 45678)
+
+
+def test_receiver_ignores_beacon_for_unknown_transfer(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-beacon-ignore"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(output_dir=receiver_dir, enable_feedback=True),
+    )
+    payload = b"known-transfer" * 128
+    manifest = TransferManifest.from_bytes(
+        raw=payload,
+        file_name="beacon/known.bin",
+        chunk_size=128,
+    )
+    unknown_transfer_id = b"\x9A" * 16
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver_sock:
+        receiver_sock.bind(("127.0.0.1", 0))
+        source_addr = ("127.0.0.1", 20001)
+        receiver._prepare_transfer(receiver_sock, manifest, source_addr)
+        with receiver._lock:
+            before = receiver._transfers[manifest.transfer_id]
+            before_activity = before.last_activity_s
+            before_source = before.source_addr
+        time.sleep(0.01)
+        receiver._handle_frame(
+            receiver_sock,
+            FrameType.BEACON,
+            encode_beacon(BeaconRole.SENDER, unknown_transfer_id)[HEADER_STRUCT.size :],
+            ("127.0.0.1", 20002),
+        )
+        with receiver._lock:
+            after = receiver._transfers[manifest.transfer_id]
+            assert after.last_activity_s == before_activity
+            assert after.source_addr == before_source
+
+
+def test_receiver_maybe_send_beacon_respects_interval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(
+            output_dir=tmp_path / "rx-beacon-rate",
+            enable_feedback=True,
+            beacon_interval_s=1.0,
+        ),
+    )
+    transfer = TransferManifest.from_bytes(
+        raw=b"beacon-rate" * 64,
+        file_name="beacon/rate.bin",
+        chunk_size=64,
+    )
+    transfer_state = receiver_module._TransferStateData(
+        manifest=transfer,
+        part_path=tmp_path / "noop.part",
+        final_path=tmp_path / "noop.bin",
+        tracker=receiver_module.ChunkTracker(total_chunks=transfer.total_chunks),
+        source_addr=("127.0.0.1", 9100),
+        last_activity_s=0.0,
+    )
+    sent_count = 0
+
+    class FakeSocket:
+        def sendto(self, _payload: bytes, _dest: tuple[str, int]) -> int:
+            nonlocal sent_count
+            sent_count += 1
+            return 1
+
+    now_values = iter([5.0, 5.5, 6.2])
+    monkeypatch.setattr(receiver_module.time, "monotonic", lambda: next(now_values))
+    receiver._maybe_send_beacon(FakeSocket(), transfer_state)  # type: ignore[arg-type]
+    receiver._maybe_send_beacon(FakeSocket(), transfer_state)  # type: ignore[arg-type]
+    receiver._maybe_send_beacon(FakeSocket(), transfer_state)  # type: ignore[arg-type]
+    assert sent_count == 2
+
+
+def test_matching_completed_file_negative_scenarios(tmp_path: Path) -> None:
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(output_dir=tmp_path / "rx-matcher-negative", enable_feedback=True),
+    )
+    missing_path = tmp_path / "rx-matcher-negative" / "missing.bin"
+    manifest = TransferManifest.from_bytes(raw=b"abc123", file_name="missing.bin", chunk_size=3)
+    assert receiver._is_matching_completed_file(missing_path, manifest) is False
+
+    mismatch_size_path = tmp_path / "rx-matcher-negative" / "size.bin"
+    mismatch_size_path.parent.mkdir(parents=True, exist_ok=True)
+    mismatch_size_path.write_bytes(b"abcd")
+    assert receiver._is_matching_completed_file(mismatch_size_path, manifest) is False
+
+    hash_mismatch_path = tmp_path / "rx-matcher-negative" / "hash.bin"
+    hash_mismatch_path.write_bytes(b"abc123")
+    wrong_hash_manifest = TransferManifest.from_bytes(
+        raw=b"abc124",
+        file_name="hash.bin",
+        chunk_size=3,
+    )
+    assert receiver._is_matching_completed_file(hash_mismatch_path, wrong_hash_manifest) is False
 
 
 def test_feedback_repair_transfer(tmp_path: Path) -> None:

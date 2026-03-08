@@ -29,7 +29,7 @@ from .frames import (
     encode_transfer_complete,
 )
 from .manifest import RepairRequest, TransferManifest
-from .ranges import ChunkTracker, summarize_ranges
+from .ranges import ChunkTracker, limit_ranges_to_chunk_budget, summarize_ranges
 from .types import (
     DEFAULT_SOCKET_TIMEOUT,
     TRANSFER_ID_SIZE,
@@ -85,6 +85,7 @@ class SpaceSyncReceiver:
         self._maintenance_thread: threading.Thread | None = None
         self._journal_dirty = False
         self._last_journal_flush_s = 0.0
+        self._completed_hash_cache: dict[Path, tuple[int, int, bytes]] = {}
 
     @property
     def completed_transfers(self) -> list[ReceivedTransferInfo]:
@@ -316,11 +317,16 @@ class SpaceSyncReceiver:
             return
         missing_ranges = transfer.tracker.missing_ranges()
         requestable_ranges = self._limit_missing_ranges(missing_ranges)
+        state = (
+            TransferState.COMPLETE
+            if transfer.done and not missing_ranges
+            else TransferState.INCOMPLETE
+        )
         sock.sendto(
             encode_status(
                 TransferStatus(
                     transfer_id=transfer.manifest.transfer_id,
-                    state=TransferState.INCOMPLETE if missing_ranges else TransferState.COMPLETE,
+                    state=state,
                     missing_ranges=requestable_ranges,
                 )
             ),
@@ -334,15 +340,33 @@ class SpaceSyncReceiver:
 
     def _is_matching_completed_file(self, final_path: Path, manifest: TransferManifest) -> bool:
         if not final_path.exists() or not final_path.is_file():
+            self._completed_hash_cache.pop(final_path, None)
             return False
         try:
-            if final_path.stat().st_size != manifest.file_size:
+            stat_result = final_path.stat()
+            if stat_result.st_size != manifest.file_size:
                 return False
+            cached = self._completed_hash_cache.get(final_path)
+            if cached is not None:
+                cached_size, cached_mtime_ns, cached_sha = cached
+                if (
+                    cached_size == stat_result.st_size
+                    and cached_mtime_ns == stat_result.st_mtime_ns
+                    and cached_sha == manifest.sha256
+                ):
+                    return True
             digest = hashlib.sha256()
             with final_path.open("rb") as stream:
                 for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                     digest.update(chunk)
-            return digest.digest() == manifest.sha256
+            if digest.digest() != manifest.sha256:
+                return False
+            self._completed_hash_cache[final_path] = (
+                stat_result.st_size,
+                stat_result.st_mtime_ns,
+                manifest.sha256,
+            )
+            return True
         except OSError:
             return False
 
@@ -609,19 +633,7 @@ class SpaceSyncReceiver:
         limit = self.config.max_repair_chunks_per_request
         if limit <= 0:
             return missing_ranges
-        remaining = limit
-        limited: list[tuple[int, int]] = []
-        for start, end in missing_ranges:
-            if remaining <= 0:
-                break
-            length = end - start
-            if length <= remaining:
-                limited.append((start, end))
-                remaining -= length
-                continue
-            limited.append((start, start + remaining))
-            break
-        return limited
+        return limit_ranges_to_chunk_budget(missing_ranges, limit)
 
     def _maybe_finalize_stale_transfer(
         self,
@@ -651,6 +663,8 @@ class SpaceSyncReceiver:
         transfer: _TransferStateData,
         missing_ranges: list[tuple[int, int]],
     ) -> None:
+        is_owned = getattr(self._lock, "_is_owned", None)
+        assert is_owned is None or bool(is_owned())
         if transfer.finalized:
             return
         transfer.finalized = True
@@ -680,6 +694,15 @@ class SpaceSyncReceiver:
                 if source_mtime is not None and len(source_mtime) == 8:
                     mtime_ns = int.from_bytes(source_mtime, "big")
                     os.utime(transfer.final_path, ns=(mtime_ns, mtime_ns))
+                try:
+                    updated_stat = transfer.final_path.stat()
+                    self._completed_hash_cache[transfer.final_path] = (
+                        updated_stat.st_size,
+                        updated_stat.st_mtime_ns,
+                        transfer.manifest.sha256,
+                    )
+                except OSError:
+                    self._completed_hash_cache.pop(transfer.final_path, None)
             else:
                 hash_mismatch = True
                 state = TransferState.HASH_MISMATCH

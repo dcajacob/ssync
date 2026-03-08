@@ -114,6 +114,20 @@ uv run ssync send ./example.bin --dest-port 9000 --feedback \
   --feedback-wait-s 2.0 --max-feedback-idle-timeouts 2 --max-repair-rounds 2
 ```
 
+Availability beacons (default every second; `0` disables):
+
+```bash
+uv run ssyncd --bind-port 9000 --beacon-interval-s 1.0
+uv run ssync send ./example.bin --dest-port 9000 --feedback --beacon-interval-s 1.0
+```
+
+Receiver state advertisement:
+
+- On repeated `MANIFEST`, receiver may advertise current `STATUS(INCOMPLETE)` with
+  bounded missing ranges to help sender prioritize immediate repairs.
+- If destination already has a hash-matching completed file, receiver short-circuits
+  with `STATUS(COMPLETE)` and sender exits early.
+
 Simulate loss to exercise repair:
 
 ```bash
