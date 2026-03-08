@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import glob
 import json
 import logging
 import os
@@ -116,8 +117,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_server_args(ssyncd)
 
-    send = subparsers.add_parser("send", help="Send a file over Space Sync")
-    send.add_argument("file", type=Path)
+    send = subparsers.add_parser("send", help="Send file(s) over Space Sync")
+    send.add_argument("files", nargs="+")
     send.add_argument("--dest-host", default="127.0.0.1")
     send.add_argument("--dest-port", type=int, default=9000)
     send.add_argument("--chunk-size", type=int, default=1024)
@@ -271,8 +272,19 @@ def _add_server_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_sync_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("source", type=Path, help="Source file or directory")
-    parser.add_argument("destination", help="Destination in host:path form")
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        help="Source path(s) followed by destination in host:path form",
+    )
+    parser.add_argument(
+        "-D",
+        "--destination",
+        action="append",
+        default=[],
+        dest="destinations",
+        help="Additional destination in host:path form (repeatable)",
+    )
     parser.add_argument(
         "-r",
         "--recursive",
@@ -501,31 +513,72 @@ def _run_sender(args: argparse.Namespace) -> int:
             repair_duplicate_suppression_s=max(0.0, args.repair_duplicate_suppression_s),
         )
     )
-    result = sender.send_file(
-        file_path=args.file,
-        destination_host=args.dest_host,
-        destination_port=args.dest_port,
-    )
-    if args.json_output:
-        print(
-            json.dumps(
-                {
-                    "transfer_id": result.transfer_id_hex,
-                    "chunks": result.total_chunks,
-                    "repaired": result.repaired_chunks,
-                    "rounds": result.repair_rounds,
-                    "completed": result.completed,
-                }
+    try:
+        files = _expand_sync_sources(args.files)
+    except ValueError as exc:
+        print(f"send error: {exc}")
+        return 2
+    if not files:
+        print("send error: no files selected")
+        return 2
+
+    results: list[dict[str, object]] = []
+    failed = 0
+    for file_path in files:
+        if not file_path.is_file():
+            print(f"send error: not a file: {file_path}")
+            return 2
+        result = sender.send_file(
+            file_path=file_path,
+            destination_host=args.dest_host,
+            destination_port=args.dest_port,
+        )
+        if not result.completed:
+            failed += 1
+        entry = {
+            "source": str(file_path),
+            "transfer_id": result.transfer_id_hex,
+            "chunks": result.total_chunks,
+            "repaired": result.repaired_chunks,
+            "rounds": result.repair_rounds,
+            "completed": result.completed,
+        }
+        results.append(entry)
+        if not args.json_output:
+            print(
+                f"source={file_path} transfer_id={result.transfer_id_hex} "
+                f"chunks={result.total_chunks} repaired={result.repaired_chunks} "
+                f"rounds={result.repair_rounds} completed={result.completed}"
             )
-        )
-    else:
-        print(
-            "transfer_id="
-            f"{result.transfer_id_hex} chunks={result.total_chunks} "
-            f"repaired={result.repaired_chunks} rounds={result.repair_rounds} "
-            f"completed={result.completed}"
-        )
-    return 0 if result.completed else 1
+
+    if args.json_output:
+        if len(results) == 1:
+            single = results[0]
+            print(
+                json.dumps(
+                    {
+                        "transfer_id": single["transfer_id"],
+                        "chunks": single["chunks"],
+                        "repaired": single["repaired"],
+                        "rounds": single["rounds"],
+                        "completed": single["completed"],
+                    }
+                )
+            )
+        else:
+            print(
+                json.dumps(
+                    {
+                        "summary": {
+                            "files": len(results),
+                            "incomplete": failed,
+                            "success": failed == 0,
+                        },
+                        "results": results,
+                    }
+                )
+            )
+    return 0 if failed == 0 else 1
 
 
 def _parse_destination(destination: str) -> tuple[str, str]:
@@ -552,11 +605,14 @@ def _collect_sync_items(
     recursive: bool,
     includes: list[str],
     excludes: list[str],
+    source_prefix: str | None = None,
 ) -> list[tuple[Path, str]]:
     source = source.resolve()
     remote_root_path = PurePosixPath(remote_root)
     if source.is_file():
-        if remote_root.endswith("/"):
+        if source_prefix is not None:
+            remote_name = str(remote_root_path / source_prefix)
+        elif remote_root.endswith("/"):
             remote_name = str(remote_root_path / source.name)
         else:
             remote_name = str(remote_root_path)
@@ -572,10 +628,31 @@ def _collect_sync_items(
                 continue
             if excludes and _path_matches(relative, excludes):
                 continue
-            remote_name = str(remote_root_path / relative)
+            remote_base = remote_root_path / source_prefix if source_prefix else remote_root_path
+            remote_name = str(remote_base / relative)
             items.append((file_path, remote_name))
         return items
     raise ValueError(f"source not found: {source}")
+
+
+def _expand_sync_sources(source_args: list[str]) -> list[Path]:
+    expanded: list[Path] = []
+    seen: set[Path] = set()
+    for value in source_args:
+        matched_paths: list[Path]
+        if glob.has_magic(value):
+            matches = [Path(match).resolve() for match in glob.glob(value, recursive=True)]
+            if not matches:
+                raise ValueError(f"source pattern matched no paths: {value}")
+            matched_paths = sorted(matches)
+        else:
+            matched_paths = [Path(value).resolve()]
+        for matched in matched_paths:
+            if matched in seen:
+                continue
+            seen.add(matched)
+            expanded.append(matched)
+    return expanded
 
 
 def _is_unchanged(
@@ -662,15 +739,34 @@ def _order_items_for_open_loop(
 
 
 def _run_sync(args: argparse.Namespace) -> int:
+    if len(args.paths) < 2:
+        print("sync error: expected at least one source and one destination")
+        return 2
+    source_args = args.paths[:-1]
+    destination_args = [args.paths[-1], *args.destinations]
     try:
-        destination_host, remote_root = _parse_destination(args.destination)
-        items = _collect_sync_items(
-            args.source,
-            remote_root,
-            recursive=args.recursive,
-            includes=args.include,
-            excludes=args.exclude,
-        )
+        sources = _expand_sync_sources(source_args)
+        sync_plans: list[tuple[str, list[tuple[Path, str]]]] = []
+        for destination in destination_args:
+            destination_host, remote_root = _parse_destination(destination)
+            if len(sources) > 1 and not remote_root.endswith("/"):
+                raise ValueError(
+                    "destination must end with '/' when syncing multiple source paths"
+                )
+            destination_items: list[tuple[Path, str]] = []
+            for source in sources:
+                source_prefix = source.name if len(sources) > 1 else None
+                destination_items.extend(
+                    _collect_sync_items(
+                        source,
+                        remote_root,
+                        recursive=args.recursive,
+                        includes=args.include,
+                        excludes=args.exclude,
+                        source_prefix=source_prefix,
+                    )
+                )
+            sync_plans.append((destination_host, destination_items))
     except ValueError as exc:
         print(f"sync error: {exc}")
         return 2
@@ -680,7 +776,7 @@ def _run_sync(args: argparse.Namespace) -> int:
     if args.checksum and not args.skip_unchanged:
         print("sync error: --checksum requires --skip-unchanged")
         return 2
-    if not items:
+    if not sync_plans or not any(items for _, items in sync_plans):
         print("sync error: source directory contains no files")
         return 2
 
@@ -725,91 +821,95 @@ def _run_sync(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    item_results: list[dict[str, object]] = []
+    collect_item_results = (not open_loop_mode) or args.dry_run or args.open_loop_max_rounds > 0
+    item_results: list[dict[str, object]] | None = [] if collect_item_results else None
+    total_items = sum(len(items) for _, items in sync_plans)
     while True:
         round_index += 1
-        ordered_items = (
-            _order_items_for_open_loop(
-                items,
-                destination_host=destination_host,
-                destination_port=args.dest_port,
-                counts=open_loop_state,
-            )
-            if open_loop_mode
-            else items
-        )
-        for source_file, remote_name in ordered_items:
-            remote_info = None
-            if should_query_destination:
-                try:
-                    remote_info = sender.query_remote_file(
-                        destination_host=destination_host,
-                        destination_port=args.dest_port,
-                        remote_name=remote_name,
-                        include_checksum=args.checksum,
-                    )
-                except (TimeoutError, ValueError):
-                    remote_info = None
-
-            if args.skip_unchanged and _is_unchanged(
-                source_file,
-                remote_info,
-                checksum=args.checksum,
-            ):
-                status = "skipped"
-                skipped_count += 1
-                item_result = {
-                    "status": status,
-                    "source": str(source_file),
-                    "destination": f"{destination_host}:{remote_name}",
-                    "completed": True,
-                }
-            elif args.dry_run:
-                status = "would-send"
-                dry_run_count += 1
-                item_result = {
-                    "status": status,
-                    "source": str(source_file),
-                    "destination": f"{destination_host}:{remote_name}",
-                    "completed": True,
-                }
-            else:
-                result = sender.send_file(
-                    file_path=source_file,
+        for destination_host, items in sync_plans:
+            ordered_items = (
+                _order_items_for_open_loop(
+                    items,
                     destination_host=destination_host,
                     destination_port=args.dest_port,
-                    remote_name=remote_name,
+                    counts=open_loop_state,
                 )
-                status = "sent" if result.completed else "incomplete"
-                if not result.completed:
-                    failed += 1
+                if open_loop_mode
+                else items
+            )
+            for source_file, remote_name in ordered_items:
+                remote_info = None
+                if should_query_destination:
+                    try:
+                        remote_info = sender.query_remote_file(
+                            destination_host=destination_host,
+                            destination_port=args.dest_port,
+                            remote_name=remote_name,
+                            include_checksum=args.checksum,
+                        )
+                    except (TimeoutError, ValueError):
+                        remote_info = None
+
+                if args.skip_unchanged and _is_unchanged(
+                    source_file,
+                    remote_info,
+                    checksum=args.checksum,
+                ):
+                    status = "skipped"
+                    skipped_count += 1
+                    item_result = {
+                        "status": status,
+                        "source": str(source_file),
+                        "destination": f"{destination_host}:{remote_name}",
+                        "completed": True,
+                    }
+                elif args.dry_run:
+                    status = "would-send"
+                    dry_run_count += 1
+                    item_result = {
+                        "status": status,
+                        "source": str(source_file),
+                        "destination": f"{destination_host}:{remote_name}",
+                        "completed": True,
+                    }
                 else:
-                    sent_count += 1
-                item_result = {
-                    "status": status,
-                    "source": str(source_file),
-                    "destination": f"{destination_host}:{remote_name}",
-                    "transfer_id": result.transfer_id_hex,
-                    "chunks": result.total_chunks,
-                    "repaired": result.repaired_chunks,
-                    "rounds": result.repair_rounds,
-                    "completed": result.completed,
-                }
-                if open_loop_mode:
-                    key = _retransmission_key(
+                    result = sender.send_file(
+                        file_path=source_file,
                         destination_host=destination_host,
                         destination_port=args.dest_port,
                         remote_name=remote_name,
                     )
-                    open_loop_state[key] = open_loop_state.get(key, 0) + 1
-                    _save_open_loop_state(args.state_file, open_loop_state)
+                    status = "sent" if result.completed else "incomplete"
+                    if not result.completed:
+                        failed += 1
+                    else:
+                        sent_count += 1
+                    item_result = {
+                        "status": status,
+                        "source": str(source_file),
+                        "destination": f"{destination_host}:{remote_name}",
+                        "transfer_id": result.transfer_id_hex,
+                        "chunks": result.total_chunks,
+                        "repaired": result.repaired_chunks,
+                        "rounds": result.repair_rounds,
+                        "completed": result.completed,
+                    }
+                    if open_loop_mode:
+                        key = _retransmission_key(
+                            destination_host=destination_host,
+                            destination_port=args.dest_port,
+                            remote_name=remote_name,
+                        )
+                        open_loop_state[key] = open_loop_state.get(key, 0) + 1
+                        _save_open_loop_state(args.state_file, open_loop_state)
 
-            item_results.append(item_result)
-            if args.verbose and not args.json_output:
-                print(
-                    f"[{status}] {source_file} -> {destination_host}:{remote_name} "
-                    f"completed={item_result.get('completed', False)}"
-                )
+                if item_results is not None:
+                    item_results.append(item_result)
+                if args.verbose and not args.json_output:
+                    print(
+                        f"[{status}] {source_file} -> {destination_host}:{remote_name} "
+                        f"completed={item_result.get('completed', False)}"
+                    )
 
         if args.dry_run:
             break
@@ -826,14 +926,15 @@ def _run_sync(args: argparse.Namespace) -> int:
                 json.dumps(
                     {
                         "summary": {
-                            "files": len(items),
+                            "files": total_items,
                             "incomplete": failed,
                             "sent": sent_count,
                             "skipped": skipped_count,
                             "would_send": dry_run_count,
                             "success": False,
                         },
-                        "results": item_results,
+                        "results": item_results if item_results is not None else [],
+                        "results_limited": item_results is None,
                     }
                 )
             )
@@ -845,21 +946,22 @@ def _run_sync(args: argparse.Namespace) -> int:
             json.dumps(
                 {
                     "summary": {
-                        "files": len(items),
+                        "files": total_items,
                         "incomplete": 0,
                         "sent": sent_count,
                         "skipped": skipped_count,
                         "would_send": dry_run_count,
                         "success": True,
                     },
-                    "results": item_results,
+                    "results": item_results if item_results is not None else [],
+                    "results_limited": item_results is None,
                 }
             )
         )
     else:
         print(
             "sync complete: "
-            f"files={len(items)} sent={sent_count} skipped={skipped_count} "
+            f"files={total_items} sent={sent_count} skipped={skipped_count} "
             f"would_send={dry_run_count}"
         )
     return 0

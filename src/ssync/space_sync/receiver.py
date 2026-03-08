@@ -27,7 +27,7 @@ from .frames import (
     encode_transfer_complete,
 )
 from .manifest import RepairRequest, TransferManifest
-from .ranges import ChunkTracker
+from .ranges import ChunkTracker, summarize_ranges
 from .types import (
     DEFAULT_SOCKET_TIMEOUT,
     TRANSFER_ID_SIZE,
@@ -40,17 +40,6 @@ from .types import (
 )
 
 LOGGER = logging.getLogger(__name__)
-
-
-def _summarize_ranges(ranges: list[tuple[int, int]]) -> str:
-    if not ranges:
-        return "none"
-    preview = ", ".join(f"{start}-{end}" for start, end in ranges[:3])
-    if len(ranges) > 3:
-        preview += ", ..."
-    return f"{len(ranges)} range(s): {preview}"
-
-
 @dataclass(slots=True)
 class _TransferStateData:
     manifest: TransferManifest
@@ -59,6 +48,7 @@ class _TransferStateData:
     tracker: ChunkTracker
     source_addr: tuple[str, int]
     done: bool = False
+    finalized: bool = False
     hash_mismatch: bool = False
     fin_received: bool = False
     highest_chunk_seen: int = -1
@@ -84,7 +74,7 @@ class SpaceSyncReceiver:
         self.bind_port = bind_port
         self.config = config
         self._stop_event = threading.Event()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._transfers: dict[bytes, _TransferStateData] = {}
         self._completed: list[ReceivedTransferInfo] = []
         self._thread: threading.Thread | None = None
@@ -180,8 +170,8 @@ class SpaceSyncReceiver:
             with self._lock:
                 active_transfers = list(self._transfers.values())
                 self._flush_journal_locked(force=False)
-            for transfer in active_transfers:
-                self._flush_transfer_mmap(transfer, force=False)
+                for transfer in active_transfers:
+                    self._flush_transfer_mmap(transfer, force=False)
 
     def _handle_frame(
         self,
@@ -293,84 +283,83 @@ class SpaceSyncReceiver:
     ) -> None:
         with self._lock:
             transfer = self._transfers.get(transfer_id)
-        if transfer is None or transfer.done:
-            return
-        if chunk_index >= transfer.manifest.total_chunks:
-            return
-        chunk_start = chunk_index * transfer.manifest.chunk_size
-        if chunk_start + len(payload) > transfer.manifest.file_size:
-            return
-        if transfer.mapped_file is not None:
-            transfer.mapped_file[chunk_start : chunk_start + len(payload)] = payload
-            transfer.mmap_dirty = True
-        else:
-            with transfer.part_path.open("r+b") as stream:
-                stream.seek(chunk_start)
-                stream.write(payload)
-        changed = transfer.tracker.add(chunk_index)
-        transfer.last_activity_s = time.monotonic()
-        if chunk_index > transfer.highest_chunk_seen:
-            transfer.highest_chunk_seen = chunk_index
-        if chunk_index > 0 and chunk_index % 4096 == 0:
-            LOGGER.debug(
-                "transfer_id=%s receiver_chunk_progress=%d/%d",
-                transfer_id.hex(),
-                chunk_index + 1,
-                transfer.manifest.total_chunks,
-            )
-        self._maybe_send_periodic_repair_request(sock, transfer)
-        if changed:
-            with self._lock:
+            if transfer is None or transfer.done or transfer.finalized:
+                return
+            if chunk_index >= transfer.manifest.total_chunks:
+                return
+            chunk_start = chunk_index * transfer.manifest.chunk_size
+            if chunk_start + len(payload) > transfer.manifest.file_size:
+                return
+            if transfer.mapped_file is not None:
+                transfer.mapped_file[chunk_start : chunk_start + len(payload)] = payload
+                transfer.mmap_dirty = True
+            else:
+                with transfer.part_path.open("r+b") as stream:
+                    stream.seek(chunk_start)
+                    stream.write(payload)
+            changed = transfer.tracker.add(chunk_index)
+            transfer.last_activity_s = time.monotonic()
+            if chunk_index > transfer.highest_chunk_seen:
+                transfer.highest_chunk_seen = chunk_index
+            if chunk_index > 0 and chunk_index % 4096 == 0:
+                LOGGER.debug(
+                    "transfer_id=%s receiver_chunk_progress=%d/%d",
+                    transfer_id.hex(),
+                    chunk_index + 1,
+                    transfer.manifest.total_chunks,
+                )
+            self._maybe_send_periodic_repair_request(sock, transfer)
+            if changed:
                 self._mark_journal_dirty_locked()
 
     def _on_fin(self, sock: socket.socket, transfer_id: bytes) -> None:
         with self._lock:
             transfer = self._transfers.get(transfer_id)
-        if transfer is None:
-            return
-        transfer.fin_received = True
-        transfer.last_activity_s = time.monotonic()
-        missing_ranges = transfer.tracker.missing_ranges()
-        LOGGER.debug(
-            "transfer_id=%s received_fin missing=%s",
-            transfer_id.hex(),
-            _summarize_ranges(missing_ranges),
-        )
-        if missing_ranges and self.config.enable_feedback:
-            self._send_repair_request(sock, transfer, missing_ranges, periodic=False)
-            return
-        self._finalize_transfer(sock, transfer, missing_ranges)
+            if transfer is None or transfer.finalized:
+                return
+            transfer.fin_received = True
+            transfer.last_activity_s = time.monotonic()
+            missing_ranges = transfer.tracker.missing_ranges()
+            LOGGER.debug(
+                "transfer_id=%s received_fin missing=%s",
+                transfer_id.hex(),
+                summarize_ranges(missing_ranges),
+            )
+            if missing_ranges and self.config.enable_feedback:
+                self._send_repair_request(sock, transfer, missing_ranges, periodic=False)
+                return
+            self._finalize_transfer(sock, transfer, missing_ranges)
 
     def _on_repair_done(self, sock: socket.socket, transfer_id: bytes) -> None:
         with self._lock:
             transfer = self._transfers.get(transfer_id)
-        if transfer is None or transfer.done:
-            return
-        transfer.last_activity_s = time.monotonic()
-        transfer.last_repair_done_s = transfer.last_activity_s
-        transfer.repair_request_in_flight = False
-        missing_ranges = transfer.tracker.missing_ranges()
-        if missing_ranges and self.config.enable_feedback:
-            missing_count = sum(end - start for start, end in missing_ranges)
-            progress_delta = (
-                transfer.tracker.received_count() - transfer.received_count_at_last_request
-            )
-            LOGGER.debug(
-                (
-                    "transfer_id=%s received_repair_done still_missing=%s "
-                    "missing_chunks=%d progress_delta=%d received=%d/%d"
-                ),
-                transfer_id.hex(),
-                _summarize_ranges(missing_ranges),
-                missing_count,
-                progress_delta,
-                transfer.tracker.received_count(),
-                transfer.manifest.total_chunks,
-            )
-            if self._can_send_repair_request(transfer, transfer.last_activity_s):
-                self._send_repair_request(sock, transfer, missing_ranges, periodic=False)
-            return
-        self._finalize_transfer(sock, transfer, missing_ranges)
+            if transfer is None or transfer.done or transfer.finalized:
+                return
+            transfer.last_activity_s = time.monotonic()
+            transfer.last_repair_done_s = transfer.last_activity_s
+            transfer.repair_request_in_flight = False
+            missing_ranges = transfer.tracker.missing_ranges()
+            if missing_ranges and self.config.enable_feedback:
+                missing_count = sum(end - start for start, end in missing_ranges)
+                progress_delta = (
+                    transfer.tracker.received_count() - transfer.received_count_at_last_request
+                )
+                LOGGER.debug(
+                    (
+                        "transfer_id=%s received_repair_done still_missing=%s "
+                        "missing_chunks=%d progress_delta=%d received=%d/%d"
+                    ),
+                    transfer_id.hex(),
+                    summarize_ranges(missing_ranges),
+                    missing_count,
+                    progress_delta,
+                    transfer.tracker.received_count(),
+                    transfer.manifest.total_chunks,
+                )
+                if self._can_send_repair_request(transfer, transfer.last_activity_s):
+                    self._send_repair_request(sock, transfer, missing_ranges, periodic=False)
+                return
+            self._finalize_transfer(sock, transfer, missing_ranges)
 
     def _send_repair_request(
         self,
@@ -398,7 +387,7 @@ class SpaceSyncReceiver:
             ),
             transfer_id_hex,
             "periodic" if periodic else "on_demand",
-            _summarize_ranges(missing_ranges),
+            summarize_ranges(missing_ranges),
             transfer.received_count_at_last_request,
             transfer.manifest.total_chunks,
         )
@@ -464,11 +453,11 @@ class SpaceSyncReceiver:
             active_transfers = [
                 transfer for transfer in self._transfers.values() if not transfer.done
             ]
-        for transfer in active_transfers:
-            if self.config.enable_feedback and self.config.periodic_repair_request_s > 0:
-                self._maybe_send_periodic_repair_request(sock, transfer)
-            self._flush_transfer_mmap(transfer, force=False)
-            self._maybe_finalize_stale_transfer(sock, transfer)
+            for transfer in active_transfers:
+                if self.config.enable_feedback and self.config.periodic_repair_request_s > 0:
+                    self._maybe_send_periodic_repair_request(sock, transfer)
+                self._flush_transfer_mmap(transfer, force=False)
+                self._maybe_finalize_stale_transfer(sock, transfer)
 
     def _ensure_mapped_file_locked(self, transfer: _TransferStateData) -> None:
         if transfer.mapped_file is not None:
@@ -540,6 +529,8 @@ class SpaceSyncReceiver:
         sock: socket.socket,
         transfer: _TransferStateData,
     ) -> None:
+        if transfer.finalized:
+            return
         if not transfer.fin_received:
             return
         if self.config.transfer_inactivity_timeout_s <= 0:
@@ -551,7 +542,7 @@ class SpaceSyncReceiver:
             "transfer stale transfer_id=%s inactivity=%.2fs finalizing incomplete missing=%s",
             transfer.manifest.transfer_id.hex(),
             time.monotonic() - transfer.last_activity_s,
-            _summarize_ranges(missing_ranges),
+            summarize_ranges(missing_ranges),
         )
         self._finalize_transfer(sock, transfer, missing_ranges)
 
@@ -561,6 +552,9 @@ class SpaceSyncReceiver:
         transfer: _TransferStateData,
         missing_ranges: list[tuple[int, int]],
     ) -> None:
+        if transfer.finalized:
+            return
+        transfer.finalized = True
         state = TransferState.INCOMPLETE
         hash_mismatch = False
         self._close_transfer_mmap(transfer)
@@ -576,7 +570,10 @@ class SpaceSyncReceiver:
                             f"{transfer.manifest.transfer_id.hex()}.tmp"
                         )
                     )
-                    shutil.copyfile(transfer.part_path, temp_final_path)
+                    try:
+                        os.link(transfer.part_path, temp_final_path)
+                    except OSError:
+                        shutil.copyfile(transfer.part_path, temp_final_path)
                     temp_final_path.replace(transfer.final_path)
                 else:
                     transfer.part_path.replace(transfer.final_path)
@@ -600,7 +597,7 @@ class SpaceSyncReceiver:
             "transfer finalize transfer_id=%s state=%s missing=%s hash_mismatch=%s",
             transfer.manifest.transfer_id.hex(),
             state.name,
-            _summarize_ranges(missing_ranges),
+            summarize_ranges(missing_ranges),
             hash_mismatch,
         )
         if self.config.enable_feedback:
@@ -628,11 +625,10 @@ class SpaceSyncReceiver:
             missing_ranges=missing_ranges,
             hash_mismatch=hash_mismatch,
         )
-        with self._lock:
-            self._completed.append(info)
-            self._transfers.pop(transfer.manifest.transfer_id, None)
-            self._mark_journal_dirty_locked()
-            self._flush_journal_locked(force=True)
+        self._completed.append(info)
+        self._transfers.pop(transfer.manifest.transfer_id, None)
+        self._mark_journal_dirty_locked()
+        self._flush_journal_locked(force=True)
 
     def _journal_path(self) -> Path:
         return self.config.output_dir / ".ssync-journal.json"

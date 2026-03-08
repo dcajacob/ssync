@@ -45,11 +45,20 @@ def test_send_file_uses_single_read_for_manifest(tmp_path: Path) -> None:
     original_from_bytes = TransferManifest.from_bytes
     captured_raw: list[bytes] = []
 
-    def _wrapped_from_bytes(**kwargs: object) -> TransferManifest:
-        raw = kwargs["raw"]
-        assert isinstance(raw, bytes)
+    def _wrapped_from_bytes(
+        *,
+        raw: bytes,
+        file_name: str,
+        chunk_size: int,
+        metadata: dict[int, bytes] | None = None,
+    ) -> TransferManifest:
         captured_raw.append(raw)
-        return original_from_bytes(**kwargs)
+        return original_from_bytes(
+            raw=raw,
+            file_name=file_name,
+            chunk_size=chunk_size,
+            metadata=metadata,
+        )
 
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(sender_module.TransferManifest, "from_bytes", _wrapped_from_bytes)

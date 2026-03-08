@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import struct
-from bisect import bisect_left
 from dataclasses import dataclass, field
 
 from .types import Range
@@ -48,6 +47,15 @@ def expand_ranges(ranges: list[Range]) -> list[int]:
     return values
 
 
+def summarize_ranges(ranges: list[Range]) -> str:
+    if not ranges:
+        return "none"
+    preview = ", ".join(f"{start}-{end}" for start, end in ranges[:3])
+    if len(ranges) > 3:
+        preview += ", ..."
+    return f"{len(ranges)} range(s): {preview}"
+
+
 def encode_ranges(ranges: list[Range]) -> bytes:
     payload = bytearray()
     for start, end in merge_ranges(ranges):
@@ -80,8 +88,7 @@ class ChunkTracker:
             return False
 
         # Locate the insertion point by range start.
-        starts = [start for start, _ in self._received_ranges]
-        insert_at = bisect_left(starts, chunk_index)
+        insert_at = self._find_insert_at(chunk_index)
 
         # Already covered by previous range.
         if insert_at > 0:
@@ -116,6 +123,18 @@ class ChunkTracker:
         self._received_ranges.insert(insert_at, (new_start, new_end))
         self._received_count += 1
         return True
+
+    def _find_insert_at(self, chunk_index: int) -> int:
+        lo = 0
+        hi = len(self._received_ranges)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            mid_start, _ = self._received_ranges[mid]
+            if mid_start < chunk_index:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
 
     def is_complete(self) -> bool:
         return self._received_count == self.total_chunks

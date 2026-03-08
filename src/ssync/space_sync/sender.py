@@ -20,21 +20,10 @@ from .frames import (
     encode_repair_done,
 )
 from .manifest import TransferManifest
-from .ranges import expand_ranges
+from .ranges import expand_ranges, summarize_ranges
 from .types import FrameType, MetadataType, RemoteFileInfo, SenderConfig, SendResult, TransferState
 
 LOGGER = logging.getLogger(__name__)
-
-
-def _summarize_ranges(ranges: list[tuple[int, int]]) -> str:
-    if not ranges:
-        return "none"
-    preview = ", ".join(f"{start}-{end}" for start, end in ranges[:3])
-    if len(ranges) > 3:
-        preview += ", ..."
-    return f"{len(ranges)} range(s): {preview}"
-
-
 class SpaceSyncSender:
     def __init__(self, config: SenderConfig | None = None) -> None:
         self.config = config or SenderConfig()
@@ -232,7 +221,7 @@ class SpaceSyncSender:
                         "transfer_id=%s status=%s missing=%s",
                         transfer_id_hex,
                         status.state.name,
-                        _summarize_ranges(status.missing_ranges),
+                        summarize_ranges(status.missing_ranges),
                     )
                     if status.state == TransferState.COMPLETE:
                         completed = True
@@ -274,7 +263,7 @@ class SpaceSyncSender:
                 LOGGER.debug(
                     "transfer_id=%s post_fin_repair_request missing=%s",
                     transfer_id_hex,
-                    _summarize_ranges(request.missing_ranges),
+                    summarize_ranges(request.missing_ranges),
                 )
                 repaired_now, _, paced_data_bytes = self._send_requested_repairs(
                     sock=sock,
@@ -426,7 +415,7 @@ class SpaceSyncSender:
             LOGGER.debug(
                 "transfer_id=%s midstream_repair_request missing=%s",
                 manifest.transfer_id.hex(),
-                _summarize_ranges(request.missing_ranges),
+                summarize_ranges(request.missing_ranges),
             )
             repaired_now, _, paced_data_bytes = self._send_requested_repairs(
                 sock=sock,

@@ -186,6 +186,6 @@ uv run pytest -q
 
 - Prototype quality, not production hardened
 - no congestion control, cryptographic authentication, or FEC yet
-- no persistent recovery state across process restarts
+- receiver-side persistent recovery state is supported via journal replay
 - file transfer first; stream transport deferred
 

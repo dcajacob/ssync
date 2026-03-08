@@ -99,6 +99,7 @@ def test_send_and_sync_support_json_flag() -> None:
     sync_args = parser.parse_args(["sync", "src", "127.0.0.1:dst", "--json"])
     assert send_args.json_output is True
     assert sync_args.json_output is True
+    assert send_args.files == ["data.bin"]
 
 
 def test_parser_supports_ssyncd_alias_subcommand() -> None:
@@ -124,12 +125,12 @@ def test_top_level_rsync_parser_supports_options() -> None:
     assert args.dry_run is True
     assert args.skip_unchanged is True
     assert args.include == ["*.txt"]
+    assert args.paths == ["src", "127.0.0.1:dst"]
 
 
 def test_main_routes_top_level_to_sync(monkeypatch: pytest.MonkeyPatch) -> None:
     def _fake_run_sync(args: Namespace) -> int:
-        assert args.source.name == "src"
-        assert args.destination == "127.0.0.1:dst"
+        assert args.paths == ["src", "127.0.0.1:dst"]
         return 0
 
     monkeypatch.setattr(cli_module, "_run_sync", _fake_run_sync)
@@ -306,3 +307,166 @@ def test_run_sync_open_loop_uses_persistent_order(
     assert exit_code == 0
     assert send_order[0] == "b.bin"
     assert send_order[1] == "a.bin"
+
+
+def test_run_sync_supports_multiple_destinations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "payload"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "a.bin").write_bytes(b"a")
+
+    send_targets: list[str] = []
+
+    class FakeSender:
+        def __init__(self, config: object) -> None:
+            self.config = config
+
+        def send_file(
+            self,
+            file_path: Path,
+            destination_host: str,
+            destination_port: int,
+            remote_name: str | None = None,
+        ) -> SimpleNamespace:
+            send_targets.append(f"{destination_host}:{remote_name}")
+            return SimpleNamespace(
+                transfer_id_hex="id",
+                total_chunks=1,
+                repaired_chunks=0,
+                repair_rounds=0,
+                completed=True,
+            )
+
+        def query_remote_file(self, **kwargs: object) -> object:
+            raise AssertionError("query_remote_file should not be called without --skip-unchanged")
+
+    monkeypatch.setattr(cli_module, "SpaceSyncSender", FakeSender)
+    parser = _build_rsync_parser()
+    args = parser.parse_args(
+        [
+            "-r",
+            str(source_dir),
+            "127.0.0.1:./",
+            "--destination",
+            "127.0.0.2:./",
+        ]
+    )
+    exit_code = cli_module._run_sync(args)
+    assert exit_code == 0
+    assert sorted(send_targets) == ["127.0.0.1:a.bin", "127.0.0.2:a.bin"]
+
+
+def test_run_sync_expands_source_wildcards(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "a.bin").write_bytes(b"a")
+    (tmp_path / "b.bin").write_bytes(b"b")
+
+    parser = _build_rsync_parser()
+    args = parser.parse_args(
+        [
+            str(tmp_path / "*.bin"),
+            "127.0.0.1:incoming/",
+            "--dry-run",
+        ]
+    )
+    exit_code = cli_module._run_sync(args)
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "would_send=2" in captured.out
+
+
+def test_run_sender_expands_quoted_wildcard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "a.deb").write_bytes(b"a")
+    (tmp_path / "b.deb").write_bytes(b"b")
+    send_order: list[str] = []
+
+    class FakeSender:
+        def __init__(self, config: object) -> None:
+            self.config = config
+
+        def send_file(
+            self,
+            file_path: Path,
+            destination_host: str,
+            destination_port: int,
+            remote_name: str | None = None,
+        ) -> SimpleNamespace:
+            send_order.append(file_path.name)
+            return SimpleNamespace(
+                transfer_id_hex=file_path.name,
+                total_chunks=1,
+                repaired_chunks=0,
+                repair_rounds=0,
+                completed=True,
+            )
+
+    monkeypatch.setattr(cli_module, "SpaceSyncSender", FakeSender)
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "send",
+            str(tmp_path / "*.deb"),
+            "--dest-host",
+            "127.0.0.1",
+            "--dest-port",
+            "9000",
+        ]
+    )
+    exit_code = cli_module._run_sender(args)
+    assert exit_code == 0
+    assert send_order == ["a.deb", "b.deb"]
+
+
+def test_run_sender_accepts_multiple_expanded_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a = tmp_path / "a.deb"
+    b = tmp_path / "b.deb"
+    a.write_bytes(b"a")
+    b.write_bytes(b"b")
+    send_order: list[str] = []
+
+    class FakeSender:
+        def __init__(self, config: object) -> None:
+            self.config = config
+
+        def send_file(
+            self,
+            file_path: Path,
+            destination_host: str,
+            destination_port: int,
+            remote_name: str | None = None,
+        ) -> SimpleNamespace:
+            send_order.append(file_path.name)
+            return SimpleNamespace(
+                transfer_id_hex=file_path.name,
+                total_chunks=1,
+                repaired_chunks=0,
+                repair_rounds=0,
+                completed=True,
+            )
+
+    monkeypatch.setattr(cli_module, "SpaceSyncSender", FakeSender)
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "send",
+            str(a),
+            str(b),
+            "--dest-host",
+            "127.0.0.1",
+            "--dest-port",
+            "9000",
+        ]
+    )
+    exit_code = cli_module._run_sender(args)
+    assert exit_code == 0
+    assert send_order == ["a.deb", "b.deb"]
