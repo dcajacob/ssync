@@ -104,6 +104,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.5,
         help="Receiver journal flush interval in seconds (0 flushes every update)",
     )
+    recv.add_argument(
+        "--beacon-interval-s",
+        type=float,
+        default=1.0,
+        help="Receiver beacon interval in seconds (0 disables beacons)",
+    )
     _add_log_level_arg(recv)
 
     server = subparsers.add_parser(
@@ -162,6 +168,12 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.2,
         help="Suppress servicing identical repair requests within this interval",
+    )
+    send.add_argument(
+        "--beacon-interval-s",
+        type=float,
+        default=1.0,
+        help="Sender beacon interval in seconds (0 disables beacons)",
     )
     send.add_argument("--json", action="store_true", dest="json_output")
     _add_log_level_arg(send)
@@ -267,6 +279,12 @@ def _add_server_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=0.5,
         help="Receiver journal flush interval in seconds (0 flushes every update)",
+    )
+    parser.add_argument(
+        "--beacon-interval-s",
+        type=float,
+        default=1.0,
+        help="Receiver beacon interval in seconds (0 disables beacons)",
     )
     _add_log_level_arg(parser)
 
@@ -380,6 +398,12 @@ def _add_sync_args(parser: argparse.ArgumentParser) -> None:
         help="Suppress servicing identical repair requests within this interval",
     )
     parser.add_argument(
+        "--beacon-interval-s",
+        type=float,
+        default=1.0,
+        help="Sender beacon interval in seconds (0 disables beacons)",
+    )
+    parser.add_argument(
         "--state-file",
         type=Path,
         default=Path(".ssync-open-loop-state.json"),
@@ -410,6 +434,7 @@ def _run_receiver_common(
     transfer_inactivity_timeout_s: float,
     socket_rcvbuf_bytes: int,
     journal_flush_interval_s: float,
+    beacon_interval_s: float,
     banner: str,
 ) -> int:
     receiver = SpaceSyncReceiver(
@@ -428,6 +453,7 @@ def _run_receiver_common(
             transfer_inactivity_timeout_s=max(0.0, transfer_inactivity_timeout_s),
             socket_rcvbuf_bytes=max(0, socket_rcvbuf_bytes),
             journal_flush_interval_s=max(0.0, journal_flush_interval_s),
+            beacon_interval_s=max(0.0, beacon_interval_s),
         ),
     )
     receiver.start()
@@ -465,6 +491,7 @@ def _run_receiver(args: argparse.Namespace) -> int:
         transfer_inactivity_timeout_s=args.transfer_inactivity_timeout_s,
         socket_rcvbuf_bytes=args.socket_rcvbuf_bytes,
         journal_flush_interval_s=args.journal_flush_interval_s,
+        beacon_interval_s=args.beacon_interval_s,
         banner=f"Space Sync receiver listening on {args.bind_host}:{args.bind_port}",
     )
 
@@ -485,6 +512,7 @@ def _run_server(args: argparse.Namespace) -> int:
         transfer_inactivity_timeout_s=args.transfer_inactivity_timeout_s,
         socket_rcvbuf_bytes=args.socket_rcvbuf_bytes,
         journal_flush_interval_s=args.journal_flush_interval_s,
+        beacon_interval_s=args.beacon_interval_s,
         banner=(
             "Space Sync server listening on "
             f"{args.bind_host}:{args.bind_port} root={args.root_dir}"
@@ -511,6 +539,7 @@ def _run_sender(args: argparse.Namespace) -> int:
                 0, args.midstream_repair_max_chunks_per_poll
             ),
             repair_duplicate_suppression_s=max(0.0, args.repair_duplicate_suppression_s),
+            beacon_interval_s=max(0.0, args.beacon_interval_s),
         )
     )
     try:
@@ -798,6 +827,7 @@ def _run_sync(args: argparse.Namespace) -> int:
                 0, args.midstream_repair_max_chunks_per_poll
             ),
             repair_duplicate_suppression_s=max(0.0, args.repair_duplicate_suppression_s),
+            beacon_interval_s=max(0.0, args.beacon_interval_s),
         )
     )
 

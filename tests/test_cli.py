@@ -95,11 +95,15 @@ def test_collect_sync_items_directory(tmp_path: Path) -> None:
 
 def test_send_and_sync_support_json_flag() -> None:
     parser = _build_parser()
-    send_args = parser.parse_args(["send", "data.bin", "--json"])
-    sync_args = parser.parse_args(["sync", "src", "127.0.0.1:dst", "--json"])
+    send_args = parser.parse_args(["send", "data.bin", "--json", "--beacon-interval-s", "2.5"])
+    sync_args = parser.parse_args(
+        ["sync", "src", "127.0.0.1:dst", "--json", "--beacon-interval-s", "0"]
+    )
     assert send_args.json_output is True
     assert sync_args.json_output is True
     assert send_args.files == ["data.bin"]
+    assert send_args.beacon_interval_s == pytest.approx(2.5)
+    assert sync_args.beacon_interval_s == pytest.approx(0.0)
 
 
 def test_parser_supports_ssyncd_alias_subcommand() -> None:

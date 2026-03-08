@@ -15,12 +15,14 @@ from typing import BinaryIO
 
 from .frames import (
     TransferStatus,
+    decode_beacon,
     decode_data_chunk,
     decode_file_info_request,
     decode_fin,
     decode_frame,
     decode_manifest,
     decode_repair_done,
+    encode_beacon,
     encode_file_info_response,
     encode_repair_request,
     encode_status,
@@ -31,6 +33,7 @@ from .ranges import ChunkTracker, summarize_ranges
 from .types import (
     DEFAULT_SOCKET_TIMEOUT,
     TRANSFER_ID_SIZE,
+    BeaconRole,
     FrameType,
     MetadataType,
     ReceivedTransferInfo,
@@ -61,6 +64,7 @@ class _TransferStateData:
     mapped_file: mmap.mmap | None = None
     mmap_dirty: bool = False
     last_mmap_flush_s: float = 0.0
+    last_beacon_s: float = 0.0
 
 
 class SpaceSyncReceiver:
@@ -185,7 +189,7 @@ class SpaceSyncReceiver:
                 manifest = decode_manifest(payload)
             except ValueError:
                 return
-            self._prepare_transfer(manifest, source_addr)
+            self._prepare_transfer(sock, manifest, source_addr)
             return
         if frame_type == FrameType.DATA:
             try:
@@ -223,12 +227,49 @@ class SpaceSyncReceiver:
                 include_checksum=include_checksum,
             )
             sock.sendto(encode_file_info_response(info), source_addr)
+            return
+        if frame_type == FrameType.BEACON:
+            try:
+                _role, transfer_id = decode_beacon(payload)
+            except ValueError:
+                return
+            with self._lock:
+                transfer = self._transfers.get(transfer_id)
+                if transfer is None or transfer.finalized:
+                    return
+                transfer.source_addr = source_addr
+                transfer.last_activity_s = time.monotonic()
+            return
 
-    def _prepare_transfer(self, manifest: TransferManifest, source_addr: tuple[str, int]) -> None:
+    def _prepare_transfer(
+        self,
+        sock: socket.socket,
+        manifest: TransferManifest,
+        source_addr: tuple[str, int],
+    ) -> None:
         final_path = self._safe_destination_path(manifest.file_name)
         if final_path is None:
             return
         final_path.parent.mkdir(parents=True, exist_ok=True)
+        if self._is_matching_completed_file(final_path, manifest):
+            if self.config.enable_feedback:
+                sock.sendto(
+                    encode_status(
+                        TransferStatus(
+                            transfer_id=manifest.transfer_id,
+                            state=TransferState.COMPLETE,
+                            missing_ranges=[],
+                        )
+                    ),
+                    source_addr,
+                )
+            sock.sendto(encode_transfer_complete(manifest.transfer_id), source_addr)
+            LOGGER.debug(
+                "transfer_id=%s short_circuit_existing_complete_file=%s",
+                manifest.transfer_id.hex(),
+                final_path,
+            )
+            return
         part_path = self.config.output_dir / f".{manifest.transfer_id.hex()}.part"
         with self._lock:
             existing = self._transfers.get(manifest.transfer_id)
@@ -240,6 +281,7 @@ class SpaceSyncReceiver:
                     # Collision policy: ignore conflicting manifest for same transfer ID.
                     return
                 existing.source_addr = source_addr
+                self._maybe_advertise_receiver_state(sock, existing)
                 return
             if not part_path.exists():
                 with part_path.open("wb") as stream:
@@ -262,6 +304,47 @@ class SpaceSyncReceiver:
             source_addr[0],
             source_addr[1],
         )
+
+    def _maybe_advertise_receiver_state(
+        self,
+        sock: socket.socket,
+        transfer: _TransferStateData,
+    ) -> None:
+        if not self.config.enable_feedback:
+            return
+        if transfer.tracker.received_count() <= 0:
+            return
+        missing_ranges = transfer.tracker.missing_ranges()
+        requestable_ranges = self._limit_missing_ranges(missing_ranges)
+        sock.sendto(
+            encode_status(
+                TransferStatus(
+                    transfer_id=transfer.manifest.transfer_id,
+                    state=TransferState.INCOMPLETE if missing_ranges else TransferState.COMPLETE,
+                    missing_ranges=requestable_ranges,
+                )
+            ),
+            transfer.source_addr,
+        )
+        LOGGER.debug(
+            "transfer_id=%s advertised_receiver_state missing=%s",
+            transfer.manifest.transfer_id.hex(),
+            summarize_ranges(requestable_ranges),
+        )
+
+    def _is_matching_completed_file(self, final_path: Path, manifest: TransferManifest) -> bool:
+        if not final_path.exists() or not final_path.is_file():
+            return False
+        try:
+            if final_path.stat().st_size != manifest.file_size:
+                return False
+            digest = hashlib.sha256()
+            with final_path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.digest() == manifest.sha256
+        except OSError:
+            return False
 
     def _safe_destination_path(self, file_name: str) -> Path | None:
         relative_path = Path(file_name)
@@ -454,10 +537,26 @@ class SpaceSyncReceiver:
                 transfer for transfer in self._transfers.values() if not transfer.done
             ]
             for transfer in active_transfers:
+                self._maybe_send_beacon(sock, transfer)
                 if self.config.enable_feedback and self.config.periodic_repair_request_s > 0:
                     self._maybe_send_periodic_repair_request(sock, transfer)
                 self._flush_transfer_mmap(transfer, force=False)
                 self._maybe_finalize_stale_transfer(sock, transfer)
+
+    def _maybe_send_beacon(self, sock: socket.socket, transfer: _TransferStateData) -> None:
+        if self.config.beacon_interval_s <= 0:
+            return
+        now = time.monotonic()
+        if (
+            transfer.last_beacon_s > 0
+            and now - transfer.last_beacon_s < self.config.beacon_interval_s
+        ):
+            return
+        sock.sendto(
+            encode_beacon(BeaconRole.RECEIVER, transfer.manifest.transfer_id),
+            transfer.source_addr,
+        )
+        transfer.last_beacon_s = now
 
     def _ensure_mapped_file_locked(self, transfer: _TransferStateData) -> None:
         if transfer.mapped_file is not None:

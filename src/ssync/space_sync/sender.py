@@ -13,6 +13,7 @@ from .frames import (
     decode_repair_request,
     decode_status,
     decode_transfer_complete,
+    encode_beacon,
     encode_data_chunk,
     encode_file_info_request,
     encode_fin,
@@ -21,7 +22,15 @@ from .frames import (
 )
 from .manifest import TransferManifest
 from .ranges import expand_ranges, summarize_ranges
-from .types import FrameType, MetadataType, RemoteFileInfo, SenderConfig, SendResult, TransferState
+from .types import (
+    BeaconRole,
+    FrameType,
+    MetadataType,
+    RemoteFileInfo,
+    SenderConfig,
+    SendResult,
+    TransferState,
+)
 
 LOGGER = logging.getLogger(__name__)
 class SpaceSyncSender:
@@ -83,17 +92,36 @@ class SpaceSyncSender:
 
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.settimeout(self.config.feedback_wait_s)
+            last_beacon_s = 0.0
             for _ in range(self.config.manifest_repeats):
                 sock.sendto(encode_manifest(manifest), destination)
+                last_beacon_s = self._maybe_send_beacon(
+                    sock=sock,
+                    destination=destination,
+                    transfer_id=manifest.transfer_id,
+                    last_beacon_s=last_beacon_s,
+                )
                 if self.config.inter_packet_delay_s > 0:
                     time.sleep(self.config.inter_packet_delay_s)
 
             dropped = 0
             if self.config.enable_feedback:
                 sock.setblocking(False)
+            completed_by_receiver_signal = False
             for chunk_index, chunk_payload in enumerate(chunks):
+                last_beacon_s = self._maybe_send_beacon(
+                    sock=sock,
+                    destination=destination,
+                    transfer_id=manifest.transfer_id,
+                    last_beacon_s=last_beacon_s,
+                )
                 if self.config.enable_feedback:
-                    repaired_now, rounds_now, paced_data_bytes = self._drain_repair_requests(
+                    (
+                        repaired_now,
+                        rounds_now,
+                        paced_data_bytes,
+                        completed_now,
+                    ) = self._drain_repair_requests(
                         sock=sock,
                         manifest=manifest,
                         chunks=chunks,
@@ -106,6 +134,14 @@ class SpaceSyncSender:
                     )
                     repaired_chunks += repaired_now
                     repair_rounds += rounds_now
+                    if completed_now:
+                        completed = True
+                        completed_by_receiver_signal = True
+                        LOGGER.debug(
+                            "transfer_id=%s midstream_transfer_complete_short_circuit",
+                            transfer_id_hex,
+                        )
+                        break
                     if rounds_now:
                         LOGGER.debug(
                             "transfer_id=%s serviced_midstream_repairs rounds=%d chunks=%d",
@@ -139,8 +175,19 @@ class SpaceSyncSender:
                         len(chunks),
                     )
 
-            if self.config.enable_feedback:
-                repaired_now, rounds_now, paced_data_bytes = self._drain_repair_requests(
+            if self.config.enable_feedback and not completed_by_receiver_signal:
+                last_beacon_s = self._maybe_send_beacon(
+                    sock=sock,
+                    destination=destination,
+                    transfer_id=manifest.transfer_id,
+                    last_beacon_s=last_beacon_s,
+                )
+                (
+                    repaired_now,
+                    rounds_now,
+                    paced_data_bytes,
+                    completed_now,
+                ) = self._drain_repair_requests(
                     sock=sock,
                     manifest=manifest,
                     chunks=chunks,
@@ -153,6 +200,9 @@ class SpaceSyncSender:
                 )
                 repaired_chunks += repaired_now
                 repair_rounds += rounds_now
+                if completed_now:
+                    completed = True
+                    completed_by_receiver_signal = True
                 if rounds_now:
                     LOGGER.debug(
                         "transfer_id=%s serviced_pre_fin_repairs rounds=%d chunks=%d",
@@ -160,8 +210,11 @@ class SpaceSyncSender:
                         rounds_now,
                         repaired_now,
                     )
-            sock.sendto(encode_fin(manifest.transfer_id), destination)
-            LOGGER.debug("transfer_id=%s sent_fin", transfer_id_hex)
+            if not completed_by_receiver_signal:
+                sock.sendto(encode_fin(manifest.transfer_id), destination)
+                LOGGER.debug("transfer_id=%s sent_fin", transfer_id_hex)
+            else:
+                LOGGER.debug("transfer_id=%s skipping_fin_after_transfer_complete", transfer_id_hex)
 
             if not self.config.enable_feedback:
                 LOGGER.info(
@@ -179,16 +232,31 @@ class SpaceSyncSender:
                 )
 
             post_fin_repair_rounds = 0
-            completed = False
+            if not completed_by_receiver_signal:
+                completed = False
             idle_timeouts = 0
             suppressed_duplicate_repairs = 0
             last_post_fin_signature: tuple[tuple[int, int], ...] | None = None
             last_post_fin_service_s = 0.0
+            if completed_by_receiver_signal:
+                return SendResult(
+                    transfer_id_hex=manifest.transfer_id.hex(),
+                    total_chunks=math.ceil(len(raw) / self.config.chunk_size) if raw else 0,
+                    repaired_chunks=repaired_chunks,
+                    repair_rounds=repair_rounds,
+                    completed=True,
+                )
             sock.setblocking(True)
             sock.settimeout(self.config.feedback_wait_s)
             while self.config.max_repair_rounds <= 0 or (
                 post_fin_repair_rounds < self.config.max_repair_rounds
             ):
+                last_beacon_s = self._maybe_send_beacon(
+                    sock=sock,
+                    destination=destination,
+                    transfer_id=manifest.transfer_id,
+                    last_beacon_s=last_beacon_s,
+                )
                 try:
                     response_raw, response_addr = sock.recvfrom(65535)
                 except TimeoutError:
@@ -316,6 +384,22 @@ class SpaceSyncSender:
             completed=completed,
         )
 
+    def _maybe_send_beacon(
+        self,
+        *,
+        sock: socket.socket,
+        destination: tuple[str, int],
+        transfer_id: bytes,
+        last_beacon_s: float,
+    ) -> float:
+        if self.config.beacon_interval_s <= 0:
+            return last_beacon_s
+        now = time.monotonic()
+        if last_beacon_s > 0 and now - last_beacon_s < self.config.beacon_interval_s:
+            return last_beacon_s
+        sock.sendto(encode_beacon(BeaconRole.SENDER, transfer_id), destination)
+        return now
+
     def query_remote_file(
         self,
         *,
@@ -391,9 +475,10 @@ class SpaceSyncSender:
         paced_data_bytes: int,
         max_rounds: int,
         max_chunks: int,
-    ) -> tuple[int, int, int]:
+    ) -> tuple[int, int, int, bool]:
         repaired_chunks = 0
         repair_rounds = 0
+        completed = False
         while True:
             if max_rounds > 0 and repair_rounds >= max_rounds:
                 break
@@ -406,6 +491,44 @@ class SpaceSyncSender:
             try:
                 parsed = decode_frame(response_raw)
             except ValueError:
+                continue
+            if parsed.frame_type == FrameType.TRANSFER_COMPLETE:
+                complete_transfer_id = decode_transfer_complete(parsed.payload)
+                if complete_transfer_id != manifest.transfer_id:
+                    continue
+                completed = True
+                break
+            if parsed.frame_type == FrameType.STATUS:
+                status = decode_status(parsed.payload)
+                if status.transfer_id != manifest.transfer_id:
+                    continue
+                if status.state == TransferState.COMPLETE:
+                    completed = True
+                    break
+                if status.state != TransferState.INCOMPLETE or not status.missing_ranges:
+                    continue
+                remaining_chunks = 0 if max_chunks <= 0 else max_chunks - repaired_chunks
+                if max_chunks > 0 and remaining_chunks <= 0:
+                    break
+                repair_ranges = (
+                    status.missing_ranges
+                    if max_chunks <= 0
+                    else self._limit_ranges_to_chunk_budget(
+                        status.missing_ranges,
+                        remaining_chunks,
+                    )
+                )
+                repaired_now, _, paced_data_bytes = self._send_requested_repairs(
+                    sock=sock,
+                    manifest=manifest,
+                    chunks=chunks,
+                    destination=destination,
+                    missing_ranges=repair_ranges,
+                    paced_start_s=paced_start_s,
+                    paced_data_bytes=paced_data_bytes,
+                )
+                repaired_chunks += repaired_now
+                repair_rounds += 1
                 continue
             if parsed.frame_type != FrameType.REPAIR_REQUEST:
                 continue
@@ -430,7 +553,28 @@ class SpaceSyncSender:
             if send_repair_done:
                 sock.sendto(encode_repair_done(manifest.transfer_id), response_addr)
             repair_rounds += 1
-        return repaired_chunks, repair_rounds, paced_data_bytes
+        return repaired_chunks, repair_rounds, paced_data_bytes, completed
+
+    def _limit_ranges_to_chunk_budget(
+        self,
+        missing_ranges: list[tuple[int, int]],
+        chunk_budget: int,
+    ) -> list[tuple[int, int]]:
+        if chunk_budget <= 0:
+            return []
+        remaining = chunk_budget
+        limited: list[tuple[int, int]] = []
+        for start, end in missing_ranges:
+            if remaining <= 0:
+                break
+            length = end - start
+            if length <= remaining:
+                limited.append((start, end))
+                remaining -= length
+                continue
+            limited.append((start, start + remaining))
+            break
+        return limited
 
     def _apply_rate_limit(
         self,

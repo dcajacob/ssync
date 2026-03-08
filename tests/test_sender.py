@@ -8,10 +8,15 @@ from pathlib import Path
 import pytest
 
 from ssync.space_sync import sender as sender_module
-from ssync.space_sync.frames import encode_file_info_response
+from ssync.space_sync.frames import (
+    TransferStatus,
+    encode_file_info_response,
+    encode_status,
+    encode_transfer_complete,
+)
 from ssync.space_sync.manifest import TransferManifest
 from ssync.space_sync.sender import SpaceSyncSender
-from ssync.space_sync.types import RemoteFileInfo, SenderConfig
+from ssync.space_sync.types import RemoteFileInfo, SenderConfig, TransferState
 
 
 def test_apply_rate_limit_treats_bps_as_bits_per_second(
@@ -102,3 +107,119 @@ def test_query_remote_file_times_out_on_non_matching_responses() -> None:
     stop_event.set()
     worker.join(timeout=1.0)
     assert elapsed < 1.0
+
+
+def test_drain_repair_requests_stops_on_transfer_complete_signal() -> None:
+    sender = SpaceSyncSender(SenderConfig(enable_feedback=True))
+    manifest = TransferManifest.from_bytes(raw=b"abcdef", file_name="sample.bin", chunk_size=2)
+    transfer_complete_frame = encode_transfer_complete(manifest.transfer_id)
+
+    class FakeSocket:
+        def __init__(self) -> None:
+            self._reads = 0
+
+        def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+            if self._reads == 0:
+                self._reads += 1
+                return transfer_complete_frame, ("127.0.0.1", 9000)
+            raise BlockingIOError
+
+        def sendto(self, _payload: bytes, _destination: tuple[str, int]) -> int:
+            return 0
+
+    repaired, rounds, paced, completed = sender._drain_repair_requests(
+        sock=FakeSocket(),  # type: ignore[arg-type]
+        manifest=manifest,
+        chunks=[b"ab", b"cd", b"ef"],
+        destination=("127.0.0.1", 9000),
+        send_repair_done=False,
+        paced_start_s=time.monotonic(),
+        paced_data_bytes=0,
+        max_rounds=1,
+        max_chunks=1,
+    )
+
+    assert repaired == 0
+    assert rounds == 0
+    assert paced == 0
+    assert completed is True
+
+
+def test_drain_repair_requests_services_incomplete_status_ranges() -> None:
+    sender = SpaceSyncSender(SenderConfig(enable_feedback=True))
+    manifest = TransferManifest.from_bytes(raw=b"abcdef", file_name="sample.bin", chunk_size=2)
+    status_frame = encode_status(
+        TransferStatus(
+            transfer_id=manifest.transfer_id,
+            state=TransferState.INCOMPLETE,
+            missing_ranges=[(1, 2)],
+        )
+    )
+    sent_payloads: list[bytes] = []
+
+    class FakeSocket:
+        def __init__(self) -> None:
+            self._reads = 0
+
+        def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+            if self._reads == 0:
+                self._reads += 1
+                return status_frame, ("127.0.0.1", 9000)
+            raise BlockingIOError
+
+        def sendto(self, payload: bytes, _destination: tuple[str, int]) -> int:
+            sent_payloads.append(payload)
+            return len(payload)
+
+    repaired, rounds, paced, completed = sender._drain_repair_requests(
+        sock=FakeSocket(),  # type: ignore[arg-type]
+        manifest=manifest,
+        chunks=[b"ab", b"cd", b"ef"],
+        destination=("127.0.0.1", 9000),
+        send_repair_done=False,
+        paced_start_s=time.monotonic(),
+        paced_data_bytes=0,
+        max_rounds=1,
+        max_chunks=2,
+    )
+
+    assert repaired == 1
+    assert rounds == 1
+    assert paced == 2
+    assert completed is False
+    assert sent_payloads
+
+
+def test_maybe_send_beacon_respects_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    sender = SpaceSyncSender(SenderConfig(enable_feedback=True, beacon_interval_s=1.0))
+    sent_count = 0
+
+    class FakeSocket:
+        def sendto(self, _payload: bytes, _destination: tuple[str, int]) -> int:
+            nonlocal sent_count
+            sent_count += 1
+            return 1
+
+    now_values = iter([10.0, 10.5, 11.1])
+    monkeypatch.setattr(sender_module.time, "monotonic", lambda: next(now_values))
+    last = 0.0
+    last = sender._maybe_send_beacon(
+        sock=FakeSocket(),  # type: ignore[arg-type]
+        destination=("127.0.0.1", 9000),
+        transfer_id=b"\x01" * 16,
+        last_beacon_s=last,
+    )
+    last = sender._maybe_send_beacon(
+        sock=FakeSocket(),  # type: ignore[arg-type]
+        destination=("127.0.0.1", 9000),
+        transfer_id=b"\x01" * 16,
+        last_beacon_s=last,
+    )
+    last = sender._maybe_send_beacon(
+        sock=FakeSocket(),  # type: ignore[arg-type]
+        destination=("127.0.0.1", 9000),
+        transfer_id=b"\x01" * 16,
+        last_beacon_s=last,
+    )
+    assert last == pytest.approx(11.1)
+    assert sent_count == 2

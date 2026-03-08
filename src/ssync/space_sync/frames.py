@@ -15,6 +15,7 @@ from .types import (
     PROTOCOL_VERSION,
     SHA256_SIZE,
     TRANSFER_ID_SIZE,
+    BeaconRole,
     FrameType,
     RemoteFileInfo,
     TransferState,
@@ -28,6 +29,7 @@ STATUS_FIXED_STRUCT = struct.Struct(f"!{TRANSFER_ID_SIZE}sBH")
 TLV_HEADER_STRUCT = struct.Struct("!BH")
 FILE_INFO_REQUEST_FIXED_STRUCT = struct.Struct("!BH")
 FILE_INFO_RESPONSE_FIXED_STRUCT = struct.Struct(f"!BBQQ{SHA256_SIZE}sH")
+BEACON_STRUCT = struct.Struct(f"!B{TRANSFER_ID_SIZE}s")
 KNOWN_FRAME_TYPE_VALUES = {item.value for item in FrameType}
 
 
@@ -285,6 +287,19 @@ def encode_transfer_complete(transfer_id: bytes) -> bytes:
 
 def decode_transfer_complete(payload: bytes) -> bytes:
     return decode_fin(payload)
+
+
+def encode_beacon(role: BeaconRole, transfer_id: bytes) -> bytes:
+    if len(transfer_id) != TRANSFER_ID_SIZE:
+        raise ValueError("Beacon transfer_id size mismatch")
+    return encode_frame(FrameType.BEACON, BEACON_STRUCT.pack(int(role), transfer_id))
+
+
+def decode_beacon(payload: bytes) -> tuple[BeaconRole, bytes]:
+    if len(payload) != BEACON_STRUCT.size:
+        raise ValueError("Beacon payload size mismatch")
+    raw_role, transfer_id = BEACON_STRUCT.unpack(payload)
+    return BeaconRole(raw_role), transfer_id
 
 
 def encode_file_info_request(path: str, include_checksum: bool) -> bytes:

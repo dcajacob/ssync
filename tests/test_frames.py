@@ -1,6 +1,7 @@
 from ssync.space_sync.frames import (
     HEADER_STRUCT,
     TransferStatus,
+    decode_beacon,
     decode_data_chunk,
     decode_file_info_request,
     decode_file_info_response,
@@ -9,6 +10,7 @@ from ssync.space_sync.frames import (
     decode_repair_request,
     decode_status,
     decode_transfer_complete,
+    encode_beacon,
     encode_data_chunk,
     encode_file_info_request,
     encode_file_info_response,
@@ -18,7 +20,7 @@ from ssync.space_sync.frames import (
     encode_transfer_complete,
 )
 from ssync.space_sync.manifest import RepairRequest, TransferManifest
-from ssync.space_sync.types import FrameType, RemoteFileInfo, TransferState
+from ssync.space_sync.types import BeaconRole, FrameType, RemoteFileInfo, TransferState
 
 
 def test_manifest_frame_round_trip() -> None:
@@ -125,4 +127,13 @@ def test_transfer_complete_round_trip() -> None:
     parsed = decode_frame(raw)
     assert parsed.frame_type == FrameType.TRANSFER_COMPLETE
     assert decode_transfer_complete(parsed.payload) == b"\xDD" * 16
+
+
+def test_beacon_round_trip() -> None:
+    raw = encode_beacon(BeaconRole.SENDER, b"\xEE" * 16)
+    parsed = decode_frame(raw)
+    assert parsed.frame_type == FrameType.BEACON
+    role, transfer_id = decode_beacon(parsed.payload)
+    assert role == BeaconRole.SENDER
+    assert transfer_id == b"\xEE" * 16
 

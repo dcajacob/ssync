@@ -6,6 +6,11 @@ import time
 from pathlib import Path
 
 from ssync.space_sync.frames import (
+    HEADER_STRUCT,
+    decode_frame,
+    decode_status,
+    decode_transfer_complete,
+    encode_beacon,
     encode_data_chunk,
     encode_fin,
     encode_manifest,
@@ -14,7 +19,13 @@ from ssync.space_sync.frames import (
 from ssync.space_sync.manifest import TransferManifest
 from ssync.space_sync.receiver import SpaceSyncReceiver
 from ssync.space_sync.sender import SpaceSyncSender
-from ssync.space_sync.types import ReceiverConfig, SenderConfig
+from ssync.space_sync.types import (
+    BeaconRole,
+    FrameType,
+    ReceiverConfig,
+    SenderConfig,
+    TransferState,
+)
 
 
 def _free_udp_port() -> int:
@@ -100,6 +111,99 @@ def test_receiver_can_keep_part_file_on_success(tmp_path: Path) -> None:
         assert part_path.read_bytes() == source_payload
     finally:
         receiver.stop()
+
+
+def test_receiver_short_circuits_existing_complete_file(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-short-circuit"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(output_dir=receiver_dir, enable_feedback=True),
+    )
+    payload = b"already-there" * 512
+    remote_name = "existing/data.bin"
+    final_path = receiver_dir / remote_name
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    final_path.write_bytes(payload)
+    manifest = TransferManifest.from_bytes(raw=payload, file_name=remote_name, chunk_size=256)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver_sock:
+        receiver_sock.bind(("127.0.0.1", 0))
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender_sock:
+            sender_sock.bind(("127.0.0.1", 0))
+            sender_sock.settimeout(1.0)
+            source_addr = sender_sock.getsockname()
+            receiver._prepare_transfer(receiver_sock, manifest, source_addr)
+            first_raw, _ = sender_sock.recvfrom(65535)
+            second_raw, _ = sender_sock.recvfrom(65535)
+
+    first = decode_frame(first_raw)
+    second = decode_frame(second_raw)
+    assert first.frame_type == FrameType.STATUS
+    assert second.frame_type == FrameType.TRANSFER_COMPLETE
+    assert decode_transfer_complete(second.payload) == manifest.transfer_id
+    assert manifest.transfer_id not in receiver._transfers
+
+
+def test_receiver_advertises_incomplete_state_on_repeated_manifest(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-state-advertisement"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(output_dir=receiver_dir, enable_feedback=True),
+    )
+    payload = b"state-ad" * 256
+    manifest = TransferManifest.from_bytes(raw=payload, file_name="resume/data.bin", chunk_size=128)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver_sock:
+        receiver_sock.bind(("127.0.0.1", 0))
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender_sock:
+            sender_sock.bind(("127.0.0.1", 0))
+            sender_sock.settimeout(1.0)
+            source_addr = sender_sock.getsockname()
+            receiver._prepare_transfer(receiver_sock, manifest, source_addr)
+            with receiver._lock:
+                transfer = receiver._transfers[manifest.transfer_id]
+                transfer.tracker.add(0)
+            receiver._prepare_transfer(receiver_sock, manifest, source_addr)
+            response_raw, _ = sender_sock.recvfrom(65535)
+
+    parsed = decode_frame(response_raw)
+    assert parsed.frame_type == FrameType.STATUS
+    status = decode_status(parsed.payload)
+    assert status.transfer_id == manifest.transfer_id
+    assert status.state == TransferState.INCOMPLETE
+    assert status.missing_ranges
+
+
+def test_receiver_beacon_updates_transfer_activity(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-beacon-activity"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(output_dir=receiver_dir, enable_feedback=True),
+    )
+    payload = b"activity" * 128
+    manifest = TransferManifest.from_bytes(raw=payload, file_name="beacon/data.bin", chunk_size=128)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver_sock:
+        receiver_sock.bind(("127.0.0.1", 0))
+        source_addr = ("127.0.0.1", 34567)
+        receiver._prepare_transfer(receiver_sock, manifest, source_addr)
+        with receiver._lock:
+            transfer = receiver._transfers[manifest.transfer_id]
+            previous = transfer.last_activity_s
+        time.sleep(0.01)
+        receiver._handle_frame(
+            receiver_sock,
+            FrameType.BEACON,
+            encode_beacon(BeaconRole.SENDER, manifest.transfer_id)[HEADER_STRUCT.size :],
+            ("127.0.0.1", 45678),
+        )
+        with receiver._lock:
+            updated = receiver._transfers[manifest.transfer_id]
+            assert updated.last_activity_s > previous
+            assert updated.source_addr == ("127.0.0.1", 45678)
 
 
 def test_feedback_repair_transfer(tmp_path: Path) -> None:

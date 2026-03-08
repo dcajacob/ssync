@@ -27,6 +27,12 @@ class FrameType(IntEnum):
     FILE_INFO_REQUEST = 7
     FILE_INFO_RESPONSE = 8
     TRANSFER_COMPLETE = 9
+    BEACON = 10
+
+
+class BeaconRole(IntEnum):
+    SENDER = 1
+    RECEIVER = 2
 
 
 class TransferState(IntEnum):
@@ -58,6 +64,7 @@ class SenderConfig:
     midstream_repair_max_rounds_per_poll: int = 1
     midstream_repair_max_chunks_per_poll: int = 512
     repair_duplicate_suppression_s: float = 0.2
+    beacon_interval_s: float = 1.0
 
 
 @dataclass(slots=True)
@@ -74,6 +81,7 @@ class ReceiverConfig:
     journal_flush_interval_s: float = 0.5
     repair_request_cooldown_s: float = 0.2
     repair_request_inflight_timeout_s: float = 1.5
+    beacon_interval_s: float = 1.0
 
 
 @dataclass(slots=True)
