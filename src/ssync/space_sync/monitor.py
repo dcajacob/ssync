@@ -23,6 +23,7 @@ _TermiosAttrs = list[int | list[bytes | int]]
 _RATE_WINDOW_S = 3.0
 _DETAIL_MAP_WIDTH = 96
 _DETAIL_MAP_HEIGHT = 18
+_COMPLETED_SCAN_INTERVAL_S = 2.0
 
 
 @dataclass(slots=True)
@@ -263,8 +264,9 @@ def _render_monitor(
     snapshots: list[TransferSnapshot],
     throughput_bps: dict[str, float],
     selected_index: int,
+    completed_count: int,
+    completed_size: int,
 ) -> Group:
-    completed_count, completed_size = _count_completed_files(output_dir)
     summary = Text()
     summary.append("active=", style="bold")
     summary.append(str(len(snapshots)), style="cyan")
@@ -375,13 +377,17 @@ class _KeyReader:
             return None
         if value == b"\x1b":
             sequence = b""
+            deadline = time.monotonic() + 0.05
             while True:
-                more_ready, _, _ = select.select([self._fd], [], [], 0.0)
+                timeout_s = max(0.0, deadline - time.monotonic())
+                more_ready, _, _ = select.select([self._fd], [], [], timeout_s)
                 if not more_ready:
                     break
                 try:
                     sequence += os.read(self._fd, 1)
                 except OSError:
+                    break
+                if len(sequence) >= 2:
                     break
             if sequence.startswith(b"[A"):
                 return "up"
@@ -403,6 +409,9 @@ def run_monitor_tui(output_dir: Path, refresh_interval_s: float) -> int:
     refresh_interval_s = max(0.1, refresh_interval_s)
     transfer_history: dict[str, deque[tuple[float, int]]] = {}
     throughput_bps: dict[str, float] = {}
+    completed_count = 0
+    completed_size = 0
+    last_completed_scan_s = 0.0
     selected_index = 0
     with _KeyReader() as keys:
         with Live(auto_refresh=False, screen=True) as live:
@@ -415,6 +424,12 @@ def run_monitor_tui(output_dir: Path, refresh_interval_s: float) -> int:
                 elif key == "down":
                     selected_index += 1
                 now = time.monotonic()
+                if (
+                    last_completed_scan_s <= 0
+                    or now - last_completed_scan_s >= _COMPLETED_SCAN_INTERVAL_S
+                ):
+                    completed_count, completed_size = _count_completed_files(output_dir)
+                    last_completed_scan_s = now
                 snapshots = _read_transfer_snapshots(output_dir)
                 if snapshots:
                     selected_index = max(0, min(selected_index, len(snapshots) - 1))
@@ -448,6 +463,8 @@ def run_monitor_tui(output_dir: Path, refresh_interval_s: float) -> int:
                         snapshots=snapshots,
                         throughput_bps=throughput_bps,
                         selected_index=selected_index,
+                        completed_count=completed_count,
+                        completed_size=completed_size,
                     ),
                     refresh=True,
                 )

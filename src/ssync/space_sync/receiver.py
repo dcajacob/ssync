@@ -919,28 +919,11 @@ class SpaceSyncReceiver:
             if not isinstance(source_addr_raw, list) or len(source_addr_raw) != 2:
                 return None
             source_addr = (str(source_addr_raw[0]), int(source_addr_raw[1]))
-            highest_chunk_seen_raw = raw.get("highest_chunk_seen", -1)
-            if isinstance(highest_chunk_seen_raw, bool):
-                highest_chunk_seen = -1
-            elif isinstance(highest_chunk_seen_raw, int):
-                highest_chunk_seen = highest_chunk_seen_raw
-            elif isinstance(highest_chunk_seen_raw, float):
-                highest_chunk_seen = int(highest_chunk_seen_raw)
-            elif isinstance(highest_chunk_seen_raw, str):
-                highest_chunk_seen = int(highest_chunk_seen_raw)
-            else:
-                highest_chunk_seen = -1
-            last_chunk_seen_raw = raw.get("last_chunk_seen", highest_chunk_seen)
-            if isinstance(last_chunk_seen_raw, bool):
-                last_chunk_seen = highest_chunk_seen
-            elif isinstance(last_chunk_seen_raw, int):
-                last_chunk_seen = last_chunk_seen_raw
-            elif isinstance(last_chunk_seen_raw, float):
-                last_chunk_seen = int(last_chunk_seen_raw)
-            elif isinstance(last_chunk_seen_raw, str):
-                last_chunk_seen = int(last_chunk_seen_raw)
-            else:
-                last_chunk_seen = highest_chunk_seen
+            highest_chunk_seen = self._coerce_optional_int(raw.get("highest_chunk_seen", -1), -1)
+            last_chunk_seen = self._coerce_optional_int(
+                raw.get("last_chunk_seen", highest_chunk_seen),
+                highest_chunk_seen,
+            )
             received_ranges_raw = raw.get("received_ranges", [])
             if not isinstance(received_ranges_raw, list):
                 return None
@@ -993,6 +976,18 @@ class SpaceSyncReceiver:
             mtime_ns=stat.st_mtime_ns,
             sha256=file_hash,
         )
+
+    @staticmethod
+    def _coerce_optional_int(value: object, default: int) -> int:
+        if isinstance(value, bool):
+            return default
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str):
+            return int(value)
+        return default
 
     def _sendto_best_effort(
         self,

@@ -291,6 +291,7 @@ def test_run_sync_open_loop_uses_persistent_order(
             destination_host: str,
             destination_port: int,
             remote_name: str | None = None,
+            stop_requested: object | None = None,
         ) -> SimpleNamespace:
             send_order.append(remote_name or file_path.name)
             return SimpleNamespace(
@@ -344,6 +345,7 @@ def test_run_sync_supports_multiple_destinations(
             destination_host: str,
             destination_port: int,
             remote_name: str | None = None,
+            stop_requested: object | None = None,
         ) -> SimpleNamespace:
             send_targets.append(f"{destination_host}:{remote_name}")
             return SimpleNamespace(
@@ -412,6 +414,7 @@ def test_run_sender_expands_quoted_wildcard(
             destination_host: str,
             destination_port: int,
             remote_name: str | None = None,
+            stop_requested: object | None = None,
         ) -> SimpleNamespace:
             send_order.append(file_path.name)
             return SimpleNamespace(
@@ -459,6 +462,7 @@ def test_run_sender_accepts_multiple_expanded_paths(
             destination_host: str,
             destination_port: int,
             remote_name: str | None = None,
+            stop_requested: object | None = None,
         ) -> SimpleNamespace:
             send_order.append(file_path.name)
             return SimpleNamespace(

@@ -309,3 +309,39 @@ def test_send_file_honors_stop_requested(tmp_path: Path) -> None:
 
     assert result.completed is False
     assert sendto_calls >= 3
+
+
+def test_send_file_open_loop_raises_on_send_timeout_without_stop_callback(tmp_path: Path) -> None:
+    source_path = tmp_path / "payload-timeout.bin"
+    source_path.write_bytes(b"x" * 1024)
+    sender = SpaceSyncSender(
+        SenderConfig(
+            enable_feedback=False,
+            chunk_size=256,
+            manifest_repeats=1,
+        )
+    )
+
+    class FakeSocket:
+        def __enter__(self) -> FakeSocket:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def settimeout(self, _value: float | None) -> None:
+            return None
+
+        def setblocking(self, _flag: bool) -> None:
+            return None
+
+        def sendto(self, _payload: bytes, _destination: tuple[str, int]) -> int:
+            raise TimeoutError
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    try:
+        with pytest.raises(TimeoutError):
+            sender.send_file(source_path, "127.0.0.1", 9000)
+    finally:
+        monkeypatch.undo()

@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import glob
-import inspect
 import json
 import logging
 import os
@@ -581,27 +580,18 @@ def _run_sender(args: argparse.Namespace) -> int:
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
-    send_file_params = inspect.signature(sender.send_file).parameters
-    supports_stop_requested = "stop_requested" in send_file_params
     for file_path in files:
         if should_stop:
             break
         if not file_path.is_file():
             print(f"send error: not a file: {file_path}")
             return 2
-        if supports_stop_requested:
-            result = sender.send_file(
-                file_path=file_path,
-                destination_host=args.dest_host,
-                destination_port=args.dest_port,
-                stop_requested=lambda: should_stop,
-            )
-        else:
-            result = sender.send_file(
-                file_path=file_path,
-                destination_host=args.dest_host,
-                destination_port=args.dest_port,
-            )
+        result = sender.send_file(
+            file_path=file_path,
+            destination_host=args.dest_host,
+            destination_port=args.dest_port,
+            stop_requested=lambda: should_stop,
+        )
         if not result.completed:
             failed += 1
         entry = {
@@ -877,8 +867,6 @@ def _run_sync(args: argparse.Namespace) -> int:
     dry_run_count = 0
     should_query_destination = bool(args.skip_unchanged)
     open_loop_mode = not args.feedback
-    send_file_params = inspect.signature(sender.send_file).parameters
-    supports_stop_requested = "stop_requested" in send_file_params
     if args.open_loop_max_rounds < 0:
         print("sync error: --open-loop-max-rounds must be >= 0")
         return 2
@@ -945,21 +933,13 @@ def _run_sync(args: argparse.Namespace) -> int:
                         "completed": True,
                     }
                 else:
-                    if supports_stop_requested:
-                        result = sender.send_file(
-                            file_path=source_file,
-                            destination_host=destination_host,
-                            destination_port=args.dest_port,
-                            remote_name=remote_name,
-                            stop_requested=lambda: should_stop,
-                        )
-                    else:
-                        result = sender.send_file(
-                            file_path=source_file,
-                            destination_host=destination_host,
-                            destination_port=args.dest_port,
-                            remote_name=remote_name,
-                        )
+                    result = sender.send_file(
+                        file_path=source_file,
+                        destination_host=destination_host,
+                        destination_port=args.dest_port,
+                        remote_name=remote_name,
+                        stop_requested=lambda: should_stop,
+                    )
                     status = "sent" if result.completed else "incomplete"
                     if not result.completed:
                         failed += 1

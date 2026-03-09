@@ -443,6 +443,10 @@ class SpaceSyncSender:
                     return False
                 if self.config.enable_feedback:
                     raise
+                if stop_requested is None:
+                    # Avoid spinning forever for direct callers that do not provide
+                    # cooperative cancellation in open-loop mode.
+                    raise
 
     def _maybe_send_beacon(
         self,
