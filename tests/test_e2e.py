@@ -179,6 +179,60 @@ def test_receiver_advertises_incomplete_state_on_repeated_manifest(tmp_path: Pat
     assert status.missing_ranges
 
 
+def test_receiver_reuses_partial_state_across_transfer_ids(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-resume-xfer-id"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(output_dir=receiver_dir, enable_feedback=False),
+    )
+    payload = (b"resume-across-transfer-id-" * 32) + b"tail"
+    manifest1 = TransferManifest.from_bytes(
+        raw=payload,
+        file_name="resume/chained.bin",
+        chunk_size=64,
+    )
+    manifest2 = TransferManifest.from_bytes(
+        raw=payload,
+        file_name="resume/chained.bin",
+        chunk_size=64,
+    )
+    assert manifest1.transfer_id != manifest2.transfer_id
+    first_chunk = payload[: manifest1.chunk_size]
+    remaining_chunks = [
+        payload[offset : offset + manifest1.chunk_size]
+        for offset in range(manifest1.chunk_size, len(payload), manifest1.chunk_size)
+    ]
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver_sock:
+        receiver_sock.bind(("127.0.0.1", 0))
+        source_addr = ("127.0.0.1", 20000)
+        receiver._prepare_transfer(receiver_sock, manifest1, source_addr)
+        with receiver._lock:
+            original_part = receiver._transfers[manifest1.transfer_id].part_path
+        receiver._accept_data(receiver_sock, manifest1.transfer_id, 0, first_chunk)
+        receiver._prepare_transfer(receiver_sock, manifest2, source_addr)
+        with receiver._lock:
+            assert manifest1.transfer_id not in receiver._transfers
+            resumed = receiver._transfers[manifest2.transfer_id]
+            assert resumed.part_path == original_part
+            assert resumed.tracker.received_count() == 1
+        for index, chunk in enumerate(remaining_chunks, start=1):
+            receiver._accept_data(receiver_sock, manifest2.transfer_id, index, chunk)
+        receiver._on_fin(receiver_sock, manifest2.transfer_id)
+
+    target = receiver_dir / "resume" / "chained.bin"
+    assert target.exists()
+    assert target.read_bytes() == payload
+    completed = [
+        item
+        for item in receiver.completed_transfers
+        if item.transfer_id_hex == manifest2.transfer_id.hex()
+    ]
+    assert len(completed) == 1
+    assert completed[0].completed is True
+
+
 def test_receiver_advertises_incomplete_until_hash_verified(tmp_path: Path) -> None:
     receiver_dir = tmp_path / "rx-state-complete-gating"
     receiver = SpaceSyncReceiver(

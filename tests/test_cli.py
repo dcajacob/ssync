@@ -113,6 +113,17 @@ def test_parser_supports_ssyncd_alias_subcommand() -> None:
     assert args.bind_port == 9010
 
 
+def test_parser_supports_monitor_subcommand() -> None:
+    parser = _build_parser()
+    args = parser.parse_args(
+        ["monitor", "--output-dir", "./received", "--refresh-interval-s", "0.2"]
+    )
+    assert args.command == "monitor"
+    assert args.output_dir == Path("./received")
+    assert args.refresh_interval_s == pytest.approx(0.2)
+    assert args.log_level == "WARNING"
+
+
 def test_ssyncd_parser_accepts_server_args() -> None:
     parser = _build_ssyncd_parser()
     args = parser.parse_args(["--bind-port", "9011", "--root-dir", "./rx"])

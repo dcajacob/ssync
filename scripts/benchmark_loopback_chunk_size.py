@@ -26,7 +26,7 @@ from ssync.space_sync.types import ReceiverConfig, SendResult, SenderConfig
 
 @dataclass(slots=True)
 class TrialResult:
-    rate_bps: int
+    chunk_size: int
     trial_index: int
     success: bool
     duration_s: float
@@ -43,59 +43,48 @@ class TrialResult:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark loopback transfer rate by sweeping sender max-data-rate-bps "
-            "and reporting the highest stable value"
+            "Benchmark loopback chunk size by sweeping sender chunk-size and "
+            "reporting the largest stable value"
         )
     )
     parser.add_argument(
-        "--rates-bps",
-        help="Comma-separated exact rates to test in bits/sec instead of auto search",
+        "--chunk-sizes",
+        help="Comma-separated exact chunk sizes in bytes (e.g. 1200,1400,2048,4096)",
     )
     parser.add_argument(
-        "--start-bps",
+        "--min-chunk-size",
         type=int,
-        default=1_000_000,
-        help="Initial auto-search rate in bits/sec",
+        default=1200,
+        help="Smallest auto-generated chunk size in bytes",
     )
     parser.add_argument(
-        "--max-bps",
+        "--max-chunk-size",
         type=int,
-        default=100_000_000,
-        help="Maximum auto-search rate in bits/sec",
+        default=16384,
+        help="Largest auto-generated chunk size in bytes",
     )
     parser.add_argument(
         "--growth-factor",
         type=float,
         default=2.0,
-        help="Auto-search multiplier while rates keep passing",
+        help="Auto-search multiplier while sizes keep passing",
     )
     parser.add_argument(
-        "--refine-steps",
+        "--round-bytes",
         type=int,
-        default=6,
-        help="Binary-search refinement steps after the first failure",
+        default=16,
+        help="Round auto-generated chunk sizes to this many bytes",
     )
+    parser.add_argument("--trials", type=int, default=1, help="Trials per tested chunk size")
+    parser.add_argument("--file-size-mib", type=int, default=64, help="Payload size in MiB")
     parser.add_argument(
-        "--round-bps",
+        "--max-data-rate-bps",
         type=int,
-        default=250_000,
-        help="Round auto-generated candidate rates to this many bits/sec",
+        default=20_000_000,
+        help="Sender max data rate used for all chunk-size trials",
     )
-    parser.add_argument(
-        "--trials",
-        type=int,
-        default=1,
-        help="Trials per tested rate; all must pass for the rate to count as stable",
-    )
-    parser.add_argument(
-        "--file-size-mib",
-        type=int,
-        default=64,
-        help="Benchmark payload size in MiB",
-    )
-    parser.add_argument("--chunk-size", type=int, default=1024)
     parser.add_argument("--manifest-repeats", type=int, default=3)
-    parser.add_argument("--inter-packet-delay-s", type=float, default=0.0002)
+    parser.add_argument("--inter-packet-delay-s", type=float, default=0.0)
     parser.add_argument(
         "--feedback",
         action="store_true",
@@ -194,11 +183,11 @@ def _format_bps(rate_bps: int) -> str:
     return f"{rate_bps} bps"
 
 
-def _round_rate(candidate_bps: int, round_bps: int) -> int:
-    if round_bps <= 0:
-        return candidate_bps
-    rounded = int(round(candidate_bps / round_bps) * round_bps)
-    return max(round_bps, rounded)
+def _round_chunk_size(candidate: int, round_bytes: int) -> int:
+    if round_bytes <= 0:
+        return candidate
+    rounded = int(round(candidate / round_bytes) * round_bytes)
+    return max(round_bytes, rounded)
 
 
 def _default_temp_root() -> str | None:
@@ -270,7 +259,7 @@ def _send_with_progress(
     source: Path,
     receiver_dir: Path,
     port: int,
-    rate_bps: int,
+    chunk_size: int,
     trial_index: int,
     args: argparse.Namespace,
 ) -> SendResult:
@@ -286,7 +275,7 @@ def _send_with_progress(
         total=total_bytes,
         unit="B",
         unit_scale=True,
-        desc=f"{_format_bps(rate_bps)} trial {trial_index}",
+        desc=f"chunk={chunk_size} trial {trial_index}",
         leave=False,
         disable=args.no_progress,
     )
@@ -323,11 +312,11 @@ def _run_trial(
     work_dir: Path,
     source: Path,
     source_hash: str,
-    rate_bps: int,
+    chunk_size: int,
     trial_index: int,
     args: argparse.Namespace,
 ) -> TrialResult:
-    receiver_dir = work_dir / f"rx-{rate_bps}-{trial_index}"
+    receiver_dir = work_dir / f"rx-{chunk_size}-{trial_index}"
     receiver_dir.mkdir(parents=True, exist_ok=True)
     port = _free_udp_port()
     receiver = SpaceSyncReceiver(
@@ -351,7 +340,7 @@ def _run_trial(
     time.sleep(0.15)
     sender = SpaceSyncSender(
         config=SenderConfig(
-            chunk_size=args.chunk_size,
+            chunk_size=chunk_size,
             manifest_repeats=args.manifest_repeats,
             inter_packet_delay_s=args.inter_packet_delay_s,
             enable_feedback=args.feedback,
@@ -359,7 +348,7 @@ def _run_trial(
             max_repair_rounds=args.max_repair_rounds,
             max_feedback_idle_timeouts=args.max_feedback_idle_timeouts,
             drop_every_nth_data=args.drop_every_nth_data,
-            max_data_rate_bps=rate_bps,
+            max_data_rate_bps=args.max_data_rate_bps,
             midstream_repair_max_rounds_per_poll=args.midstream_repair_max_rounds_per_poll,
             midstream_repair_max_chunks_per_poll=args.midstream_repair_max_chunks_per_poll,
             repair_duplicate_suppression_s=args.repair_duplicate_suppression_s,
@@ -372,7 +361,7 @@ def _run_trial(
             source=source,
             receiver_dir=receiver_dir,
             port=port,
-            rate_bps=rate_bps,
+            chunk_size=chunk_size,
             trial_index=trial_index,
             args=args,
         )
@@ -380,7 +369,7 @@ def _run_trial(
         target = receiver_dir / source.name
         output_present = _wait_for_file(
             target,
-            timeout_s=_expected_timeout_s(source.stat().st_size, rate_bps),
+            timeout_s=_expected_timeout_s(source.stat().st_size, args.max_data_rate_bps),
         )
         hash_match = output_present and _sha256(target) == source_hash
         success = bool(send_result.completed and output_present and hash_match)
@@ -395,7 +384,7 @@ def _run_trial(
         if duration_s > 0:
             achieved_bps = (source.stat().st_size * 8) / duration_s
         return TrialResult(
-            rate_bps=rate_bps,
+            chunk_size=chunk_size,
             trial_index=trial_index,
             success=success,
             duration_s=duration_s,
@@ -412,22 +401,22 @@ def _run_trial(
         receiver.stop()
 
 
-def _run_rate(
+def _run_chunk_size(
     *,
     work_dir: Path,
     source: Path,
     source_hash: str,
-    rate_bps: int,
+    chunk_size: int,
     args: argparse.Namespace,
 ) -> list[TrialResult]:
     results: list[TrialResult] = []
-    _write_line(args, f"Testing {rate_bps} bps ({_format_bps(rate_bps)})...")
+    _write_line(args, f"Testing chunk_size={chunk_size} bytes...")
     for trial_index in range(1, args.trials + 1):
         result = _run_trial(
             work_dir=work_dir,
             source=source,
             source_hash=source_hash,
-            rate_bps=rate_bps,
+            chunk_size=chunk_size,
             trial_index=trial_index,
             args=args,
         )
@@ -444,24 +433,24 @@ def _run_rate(
     return results
 
 
-def _auto_rates(args: argparse.Namespace) -> list[int]:
-    if args.rates_bps:
-        values = [int(part.strip()) for part in args.rates_bps.split(",") if part.strip()]
+def _candidate_chunk_sizes(args: argparse.Namespace) -> list[int]:
+    if args.chunk_sizes:
+        values = [int(part.strip()) for part in args.chunk_sizes.split(",") if part.strip()]
         return sorted({value for value in values if value > 0})
 
     tested: list[int] = []
-    current = _round_rate(max(1, args.start_bps), args.round_bps)
-    while current <= args.max_bps:
+    current = _round_chunk_size(max(1, args.min_chunk_size), args.round_bytes)
+    while current <= args.max_chunk_size:
         if current not in tested:
             tested.append(current)
-        next_rate = _round_rate(int(current * args.growth_factor), args.round_bps)
-        if next_rate <= current:
-            next_rate = current + max(1, args.round_bps)
-        current = next_rate
+        next_size = _round_chunk_size(int(current * args.growth_factor), args.round_bytes)
+        if next_size <= current:
+            next_size = current + max(1, args.round_bytes)
+        current = next_size
     return tested
 
 
-def _search_rates(
+def _search_chunk_sizes(
     *,
     work_dir: Path,
     source: Path,
@@ -469,52 +458,24 @@ def _search_rates(
     args: argparse.Namespace,
 ) -> tuple[list[TrialResult], int | None]:
     all_results: list[TrialResult] = []
-    exact_rates = _auto_rates(args)
-    tried_rates: dict[int, bool] = {}
-    last_good: int | None = None
-    first_bad: int | None = None
+    candidates = _candidate_chunk_sizes(args)
+    best_stable: int | None = None
 
-    for rate_bps in exact_rates:
-        rate_results = _run_rate(
+    for chunk_size in candidates:
+        trial_results = _run_chunk_size(
             work_dir=work_dir,
             source=source,
             source_hash=source_hash,
-            rate_bps=rate_bps,
+            chunk_size=chunk_size,
             args=args,
         )
-        all_results.extend(rate_results)
-        rate_ok = all(result.success for result in rate_results)
-        tried_rates[rate_bps] = rate_ok
-        if rate_ok:
-            last_good = rate_bps
+        all_results.extend(trial_results)
+        chunk_ok = all(result.success for result in trial_results)
+        if chunk_ok:
+            best_stable = chunk_size
             continue
-        first_bad = rate_bps
         break
-
-    if args.rates_bps or last_good is None or first_bad is None:
-        return all_results, last_good
-
-    low = last_good
-    high = first_bad
-    for _ in range(max(0, args.refine_steps)):
-        candidate = _round_rate((low + high) // 2, args.round_bps)
-        if candidate <= low or candidate >= high or candidate in tried_rates:
-            break
-        rate_results = _run_rate(
-            work_dir=work_dir,
-            source=source,
-            source_hash=source_hash,
-            rate_bps=candidate,
-            args=args,
-        )
-        all_results.extend(rate_results)
-        rate_ok = all(result.success for result in rate_results)
-        tried_rates[candidate] = rate_ok
-        if rate_ok:
-            low = candidate
-        else:
-            high = candidate
-    return all_results, low
+    return all_results, best_stable
 
 
 def _successful_results(results: list[TrialResult]) -> list[TrialResult]:
@@ -526,30 +487,6 @@ def _best_achieved_result(results: list[TrialResult]) -> TrialResult | None:
     if not successful:
         return None
     return max(successful, key=lambda result: result.achieved_bps)
-
-
-def _detect_saturation_note(results: list[TrialResult]) -> str | None:
-    successful = sorted(_successful_results(results), key=lambda result: result.rate_bps)
-    if len(successful) < 2:
-        return None
-
-    highest = successful[-1]
-    previous = successful[-2]
-    if previous.achieved_bps <= 0:
-        return None
-
-    configured_ratio = highest.rate_bps / previous.rate_bps
-    achieved_ratio = highest.achieved_bps / previous.achieved_bps
-    utilization = highest.achieved_bps / highest.rate_bps if highest.rate_bps > 0 else 0.0
-
-    if configured_ratio >= 1.5 and achieved_ratio <= 1.1 and utilization < 0.9:
-        return (
-            "Saturation detected: increasing the configured cap from "
-            f"{_format_bps(previous.rate_bps)} to {_format_bps(highest.rate_bps)} only raised "
-            f"achieved throughput from {_format_bps(int(previous.achieved_bps))} to "
-            f"{_format_bps(int(highest.achieved_bps))}."
-        )
-    return None
 
 
 def main() -> int:
@@ -569,7 +506,7 @@ def main() -> int:
     )
 
     with tempfile.TemporaryDirectory(
-        prefix="ssync-benchmark-",
+        prefix="ssync-benchmark-chunk-",
         dir=str(chosen_root) if chosen_root is not None else None,
     ) as temp_root:
         work_dir = Path(temp_root)
@@ -578,7 +515,7 @@ def main() -> int:
         _write_payload(source, file_size_bytes)
         source_hash = _sha256(source)
 
-        all_results, best_rate = _search_rates(
+        all_results, best_chunk_size = _search_chunk_sizes(
             work_dir=work_dir,
             source=source,
             source_hash=source_hash,
@@ -586,22 +523,20 @@ def main() -> int:
         )
 
     print()
-    print("Space Sync loopback benchmark summary")
-    print("=" * 36)
-    if best_rate is None:
-        print("No stable rate found in the tested range.")
+    print("Space Sync loopback chunk-size benchmark summary")
+    print("=" * 44)
+    print(f"Configured send cap: {_format_bps(args.max_data_rate_bps)}")
+    if best_chunk_size is None:
+        print("No stable chunk size found in the tested range.")
     else:
-        print(f"Best stable rate: {best_rate} bps ({_format_bps(best_rate)})")
+        print(f"Best stable chunk size: {best_chunk_size} bytes")
     best_achieved = _best_achieved_result(all_results)
     if best_achieved is not None:
         print(
             "Best achieved throughput: "
             f"{_format_bps(int(best_achieved.achieved_bps))} "
-            f"at configured {_format_bps(best_achieved.rate_bps)}"
+            f"at chunk_size={best_achieved.chunk_size}"
         )
-    saturation_note = _detect_saturation_note(all_results)
-    if saturation_note is not None:
-        print(saturation_note)
 
     if all_results:
         print()
@@ -610,23 +545,23 @@ def main() -> int:
             achieved = _format_bps(int(result.achieved_bps))
             print(
                 "  "
-                f"rate={result.rate_bps} trial={result.trial_index} success={result.success} "
-                f"completed={result.send_completed} hash_match={result.hash_match} "
-                f"duration={result.duration_s:.2f}s achieved={achieved} "
-                f"repaired={result.repaired_chunks} "
+                f"chunk_size={result.chunk_size} trial={result.trial_index} "
+                f"success={result.success} completed={result.send_completed} "
+                f"hash_match={result.hash_match} duration={result.duration_s:.2f}s "
+                f"achieved={achieved} repaired={result.repaired_chunks} "
                 f"rounds={result.repair_rounds} note={result.note}"
             )
 
     if args.output_json:
         payload = {
-            "best_stable_rate_bps": best_rate,
+            "best_stable_chunk_size": best_chunk_size,
             "best_achieved_throughput_bps": (
                 int(best_achieved.achieved_bps) if best_achieved is not None else None
             ),
-            "best_achieved_configured_rate_bps": (
-                best_achieved.rate_bps if best_achieved is not None else None
+            "best_achieved_chunk_size": (
+                best_achieved.chunk_size if best_achieved is not None else None
             ),
-            "saturation_note": saturation_note,
+            "max_data_rate_bps": args.max_data_rate_bps,
             "file_size_mib": args.file_size_mib,
             "feedback": args.feedback,
             "results": [asdict(result) for result in all_results],
@@ -634,7 +569,7 @@ def main() -> int:
         print()
         print(json.dumps(payload, indent=2))
 
-    return 0 if best_rate is not None else 1
+    return 0 if best_chunk_size is not None else 1
 
 
 if __name__ == "__main__":

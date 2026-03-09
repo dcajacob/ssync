@@ -14,7 +14,7 @@ This repository includes:
 ## Python and environment
 
 - Python `>=3.13`
-- dependency-light, standard library implementation
+- dependency-light runtime (uses `rich` for monitor TUI)
 - tooling is `uv`-friendly
 
 ## Quick start
@@ -158,6 +158,14 @@ Or test exact candidate rates:
 uv run python scripts/benchmark_loopback_rate.py --rates-bps 5000000,10000000,20000000
 ```
 
+Probe the largest stable chunk size at a fixed send cap:
+
+```bash
+uv run python scripts/benchmark_loopback_chunk_size.py \
+  --max-data-rate-bps 20000000 \
+  --chunk-sizes 1200,1400,2048,4096,8192,12000,16384
+```
+
 Debug with tcpdump:
 
 ```bash
@@ -165,6 +173,17 @@ bash ./scripts/run_tcpdump_debug.sh
 ```
 
 See detailed guidance in `docs/tcpdump-debugging.md`.
+
+Monitor active receiver transfers in a TUI:
+
+```bash
+uv run ssync monitor --output-dir ./received --refresh-interval-s 0.5
+```
+
+The monitor reads receiver journal state and shows active transfer progress,
+range counts, smoothed receive throughput, and a 2D hole map for the selected
+transfer (`█` full, `▒` partial, `·` missing). Use up/down (or `j`/`k`) to
+change selection and `q` to quit.
 
 Traffic emulation with `tc`/`netem`:
 

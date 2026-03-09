@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import glob
+import inspect
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ import sys
 import time
 from pathlib import Path, PurePosixPath
 
+from .monitor import run_monitor_tui
 from .receiver import SpaceSyncReceiver
 from .sender import SpaceSyncSender
 from .types import ReceiverConfig, RemoteFileInfo, SenderConfig
@@ -184,6 +186,24 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_sync_args(sync)
     _add_log_level_arg(sync)
+
+    monitor = subparsers.add_parser(
+        "monitor",
+        help="Run a TUI monitor for receiver transfer progress",
+    )
+    monitor.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("./received"),
+        help="Receiver output directory containing .ssync-journal.json",
+    )
+    monitor.add_argument(
+        "--refresh-interval-s",
+        type=float,
+        default=0.5,
+        help="TUI refresh interval in seconds",
+    )
+    _add_log_level_arg(monitor)
     return parser
 
 
@@ -553,15 +573,35 @@ def _run_sender(args: argparse.Namespace) -> int:
 
     results: list[dict[str, object]] = []
     failed = 0
+    should_stop = False
+
+    def _handle_signal(_signum: int, _frame: object) -> None:
+        nonlocal should_stop
+        should_stop = True
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    send_file_params = inspect.signature(sender.send_file).parameters
+    supports_stop_requested = "stop_requested" in send_file_params
     for file_path in files:
+        if should_stop:
+            break
         if not file_path.is_file():
             print(f"send error: not a file: {file_path}")
             return 2
-        result = sender.send_file(
-            file_path=file_path,
-            destination_host=args.dest_host,
-            destination_port=args.dest_port,
-        )
+        if supports_stop_requested:
+            result = sender.send_file(
+                file_path=file_path,
+                destination_host=args.dest_host,
+                destination_port=args.dest_port,
+                stop_requested=lambda: should_stop,
+            )
+        else:
+            result = sender.send_file(
+                file_path=file_path,
+                destination_host=args.dest_host,
+                destination_port=args.dest_port,
+            )
         if not result.completed:
             failed += 1
         entry = {
@@ -837,6 +877,8 @@ def _run_sync(args: argparse.Namespace) -> int:
     dry_run_count = 0
     should_query_destination = bool(args.skip_unchanged)
     open_loop_mode = not args.feedback
+    send_file_params = inspect.signature(sender.send_file).parameters
+    supports_stop_requested = "stop_requested" in send_file_params
     if args.open_loop_max_rounds < 0:
         print("sync error: --open-loop-max-rounds must be >= 0")
         return 2
@@ -903,12 +945,21 @@ def _run_sync(args: argparse.Namespace) -> int:
                         "completed": True,
                     }
                 else:
-                    result = sender.send_file(
-                        file_path=source_file,
-                        destination_host=destination_host,
-                        destination_port=args.dest_port,
-                        remote_name=remote_name,
-                    )
+                    if supports_stop_requested:
+                        result = sender.send_file(
+                            file_path=source_file,
+                            destination_host=destination_host,
+                            destination_port=args.dest_port,
+                            remote_name=remote_name,
+                            stop_requested=lambda: should_stop,
+                        )
+                    else:
+                        result = sender.send_file(
+                            file_path=source_file,
+                            destination_host=destination_host,
+                            destination_port=args.dest_port,
+                            remote_name=remote_name,
+                        )
                     status = "sent" if result.completed else "incomplete"
                     if not result.completed:
                         failed += 1
@@ -997,9 +1048,19 @@ def _run_sync(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_monitor(args: argparse.Namespace) -> int:
+    try:
+        return run_monitor_tui(
+            output_dir=args.output_dir,
+            refresh_interval_s=args.refresh_interval_s,
+        )
+    except KeyboardInterrupt:
+        return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
-    subcommands = {"receive", "server", "ssyncd", "send", "sync"}
+    subcommands = {"receive", "server", "ssyncd", "send", "sync", "monitor"}
     if argv and argv[0] in subcommands:
         parser = _build_parser()
         args = parser.parse_args(argv)
@@ -1016,6 +1077,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_sender(args)
     if args.command == "sync":
         return _run_sync(args)
+    if args.command == "monitor":
+        return _run_monitor(args)
     parser.print_help()
     return 1
 

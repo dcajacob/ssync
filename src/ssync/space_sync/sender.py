@@ -4,6 +4,7 @@ import logging
 import math
 import socket
 import time
+from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
 
@@ -51,6 +52,7 @@ class SpaceSyncSender:
         destination_host: str,
         destination_port: int,
         remote_name: str | None = None,
+        stop_requested: Callable[[], bool] | None = None,
     ) -> SendResult:
         file_path = file_path.resolve()
         raw = file_path.read_bytes()
@@ -91,10 +93,23 @@ class SpaceSyncSender:
             )
 
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.settimeout(self.config.feedback_wait_s)
+            if self.config.enable_feedback:
+                sock.settimeout(self.config.feedback_wait_s)
+            else:
+                sock.setblocking(True)
+                # Use finite timeout so Ctrl-C/stop checks can break blocked sends.
+                sock.settimeout(0.5)
             last_beacon_s = 0.0
             for _ in range(self.config.manifest_repeats):
-                sock.sendto(encode_manifest(manifest), destination)
+                if self._should_stop(stop_requested):
+                    return self._aborted_result(manifest.transfer_id.hex(), len(chunks))
+                if not self._sendto_with_interrupt(
+                    sock=sock,
+                    payload=encode_manifest(manifest),
+                    destination=destination,
+                    stop_requested=stop_requested,
+                ):
+                    return self._aborted_result(manifest.transfer_id.hex(), len(chunks))
                 last_beacon_s = self._maybe_send_beacon(
                     sock=sock,
                     destination=destination,
@@ -109,6 +124,8 @@ class SpaceSyncSender:
                 sock.setblocking(False)
             completed_by_receiver_signal = False
             for chunk_index, chunk_payload in enumerate(chunks):
+                if self._should_stop(stop_requested):
+                    return self._aborted_result(manifest.transfer_id.hex(), len(chunks))
                 last_beacon_s = self._maybe_send_beacon(
                     sock=sock,
                     destination=destination,
@@ -156,10 +173,13 @@ class SpaceSyncSender:
                 if should_drop:
                     dropped += 1
                     continue
-                sock.sendto(
-                    encode_data_chunk(manifest.transfer_id, chunk_index, chunk_payload),
-                    destination,
-                )
+                if not self._sendto_with_interrupt(
+                    sock=sock,
+                    payload=encode_data_chunk(manifest.transfer_id, chunk_index, chunk_payload),
+                    destination=destination,
+                    stop_requested=stop_requested,
+                ):
+                    return self._aborted_result(manifest.transfer_id.hex(), len(chunks))
                 paced_data_bytes = self._apply_rate_limit(
                     paced_start_s=paced_start_s,
                     paced_data_bytes=paced_data_bytes,
@@ -211,7 +231,13 @@ class SpaceSyncSender:
                         repaired_now,
                     )
             if not completed_by_receiver_signal:
-                sock.sendto(encode_fin(manifest.transfer_id), destination)
+                if not self._sendto_with_interrupt(
+                    sock=sock,
+                    payload=encode_fin(manifest.transfer_id),
+                    destination=destination,
+                    stop_requested=stop_requested,
+                ):
+                    return self._aborted_result(manifest.transfer_id.hex(), len(chunks))
                 LOGGER.debug("transfer_id=%s sent_fin", transfer_id_hex)
             else:
                 LOGGER.debug("transfer_id=%s skipping_fin_after_transfer_complete", transfer_id_hex)
@@ -251,6 +277,8 @@ class SpaceSyncSender:
             while self.config.max_repair_rounds <= 0 or (
                 post_fin_repair_rounds < self.config.max_repair_rounds
             ):
+                if self._should_stop(stop_requested):
+                    return self._aborted_result(manifest.transfer_id.hex(), len(chunks))
                 last_beacon_s = self._maybe_send_beacon(
                     sock=sock,
                     destination=destination,
@@ -383,6 +411,38 @@ class SpaceSyncSender:
             repair_rounds=repair_rounds,
             completed=completed,
         )
+
+    @staticmethod
+    def _should_stop(stop_requested: Callable[[], bool] | None) -> bool:
+        return bool(stop_requested is not None and stop_requested())
+
+    def _aborted_result(self, transfer_id_hex: str, total_chunks: int) -> SendResult:
+        LOGGER.warning("send aborted transfer_id=%s", transfer_id_hex)
+        return SendResult(
+            transfer_id_hex=transfer_id_hex,
+            total_chunks=total_chunks,
+            repaired_chunks=0,
+            repair_rounds=0,
+            completed=False,
+        )
+
+    def _sendto_with_interrupt(
+        self,
+        *,
+        sock: socket.socket,
+        payload: bytes,
+        destination: tuple[str, int],
+        stop_requested: Callable[[], bool] | None,
+    ) -> bool:
+        while True:
+            try:
+                sock.sendto(payload, destination)
+                return True
+            except TimeoutError:
+                if self._should_stop(stop_requested):
+                    return False
+                if self.config.enable_feedback:
+                    raise
 
     def _maybe_send_beacon(
         self,

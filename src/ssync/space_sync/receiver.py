@@ -55,6 +55,7 @@ class _TransferStateData:
     hash_mismatch: bool = False
     fin_received: bool = False
     highest_chunk_seen: int = -1
+    last_chunk_seen: int = -1
     last_periodic_repair_request_s: float = 0.0
     last_repair_done_s: float = 0.0
     repair_request_in_flight: bool = False
@@ -227,7 +228,12 @@ class SpaceSyncReceiver:
                 remote_path=remote_path,
                 include_checksum=include_checksum,
             )
-            sock.sendto(encode_file_info_response(info), source_addr)
+            self._sendto_best_effort(
+                sock,
+                encode_file_info_response(info),
+                source_addr,
+                reason="file_info_response",
+            )
             return
         if frame_type == FrameType.BEACON:
             try:
@@ -254,7 +260,8 @@ class SpaceSyncReceiver:
         final_path.parent.mkdir(parents=True, exist_ok=True)
         if self._is_matching_completed_file(final_path, manifest):
             if self.config.enable_feedback:
-                sock.sendto(
+                self._sendto_best_effort(
+                    sock,
                     encode_status(
                         TransferStatus(
                             transfer_id=manifest.transfer_id,
@@ -263,8 +270,14 @@ class SpaceSyncReceiver:
                         )
                     ),
                     source_addr,
+                    reason="short_circuit_status_complete",
                 )
-            sock.sendto(encode_transfer_complete(manifest.transfer_id), source_addr)
+            self._sendto_best_effort(
+                sock,
+                encode_transfer_complete(manifest.transfer_id),
+                source_addr,
+                reason="short_circuit_transfer_complete",
+            )
             LOGGER.debug(
                 "transfer_id=%s short_circuit_existing_complete_file=%s",
                 manifest.transfer_id.hex(),
@@ -283,6 +296,28 @@ class SpaceSyncReceiver:
                     return
                 existing.source_addr = source_addr
                 self._maybe_advertise_receiver_state(sock, existing)
+                return
+            resumed = self._find_transfer_by_manifest_locked(manifest)
+            if resumed is not None:
+                previous_transfer_id, transfer = resumed
+                if previous_transfer_id != manifest.transfer_id:
+                    self._transfers.pop(previous_transfer_id, None)
+                    transfer.manifest = manifest
+                    self._transfers[manifest.transfer_id] = transfer
+                    self._mark_journal_dirty_locked()
+                    LOGGER.debug(
+                        (
+                            "transfer_id=%s resumed_from_transfer_id=%s "
+                            "file=%s received=%d/%d"
+                        ),
+                        manifest.transfer_id.hex(),
+                        previous_transfer_id.hex(),
+                        manifest.file_name,
+                        transfer.tracker.received_count(),
+                        manifest.total_chunks,
+                    )
+                transfer.source_addr = source_addr
+                self._maybe_advertise_receiver_state(sock, transfer)
                 return
             if not part_path.exists():
                 with part_path.open("wb") as stream:
@@ -322,7 +357,8 @@ class SpaceSyncReceiver:
             if transfer.done and not missing_ranges
             else TransferState.INCOMPLETE
         )
-        sock.sendto(
+        self._sendto_best_effort(
+            sock,
             encode_status(
                 TransferStatus(
                     transfer_id=transfer.manifest.transfer_id,
@@ -331,12 +367,23 @@ class SpaceSyncReceiver:
                 )
             ),
             transfer.source_addr,
+            reason="advertise_receiver_state",
         )
         LOGGER.debug(
             "transfer_id=%s advertised_receiver_state missing=%s",
             transfer.manifest.transfer_id.hex(),
             summarize_ranges(requestable_ranges),
         )
+
+    def _find_transfer_by_manifest_locked(
+        self,
+        manifest: TransferManifest,
+    ) -> tuple[bytes, _TransferStateData] | None:
+        signature = self._manifest_signature(manifest)
+        for transfer_id, transfer in self._transfers.items():
+            if self._manifest_signature(transfer.manifest) == signature:
+                return transfer_id, transfer
+        return None
 
     def _is_matching_completed_file(self, final_path: Path, manifest: TransferManifest) -> bool:
         if not final_path.exists() or not final_path.is_file():
@@ -408,6 +455,7 @@ class SpaceSyncReceiver:
             transfer.last_activity_s = time.monotonic()
             if chunk_index > transfer.highest_chunk_seen:
                 transfer.highest_chunk_seen = chunk_index
+            transfer.last_chunk_seen = chunk_index
             if chunk_index > 0 and chunk_index % 4096 == 0:
                 LOGGER.debug(
                     "transfer_id=%s receiver_chunk_progress=%d/%d",
@@ -483,7 +531,14 @@ class SpaceSyncReceiver:
             transfer_id=transfer.manifest.transfer_id,
             missing_ranges=self._limit_missing_ranges(missing_ranges),
         )
-        sock.sendto(encode_repair_request(request), transfer.source_addr)
+        sent = self._sendto_best_effort(
+            sock,
+            encode_repair_request(request),
+            transfer.source_addr,
+            reason="repair_request",
+        )
+        if not sent:
+            return
         transfer_id_hex = transfer.manifest.transfer_id.hex()
         transfer.repair_request_in_flight = True
         transfer.received_count_at_last_request = transfer.tracker.received_count()
@@ -576,11 +631,14 @@ class SpaceSyncReceiver:
             and now - transfer.last_beacon_s < self.config.beacon_interval_s
         ):
             return
-        sock.sendto(
+        sent = self._sendto_best_effort(
+            sock,
             encode_beacon(BeaconRole.RECEIVER, transfer.manifest.transfer_id),
             transfer.source_addr,
+            reason="receiver_beacon",
         )
-        transfer.last_beacon_s = now
+        if sent:
+            transfer.last_beacon_s = now
 
     def _ensure_mapped_file_locked(self, transfer: _TransferStateData) -> None:
         if transfer.mapped_file is not None:
@@ -724,7 +782,8 @@ class SpaceSyncReceiver:
         )
         if self.config.enable_feedback:
             for _ in range(self.config.status_repeat):
-                sock.sendto(
+                self._sendto_best_effort(
+                    sock,
                     encode_status(
                         TransferStatus(
                             transfer_id=transfer.manifest.transfer_id,
@@ -733,12 +792,15 @@ class SpaceSyncReceiver:
                         )
                     ),
                     transfer.source_addr,
+                    reason="final_status",
                 )
             if state == TransferState.COMPLETE:
                 for _ in range(self.config.status_repeat):
-                    sock.sendto(
+                    self._sendto_best_effort(
+                        sock,
                         encode_transfer_complete(transfer.manifest.transfer_id),
                         transfer.source_addr,
+                        reason="final_transfer_complete",
                     )
         info = ReceivedTransferInfo(
             transfer_id_hex=transfer.manifest.transfer_id.hex(),
@@ -783,6 +845,8 @@ class SpaceSyncReceiver:
                     "part_path": str(transfer.part_path.relative_to(self.config.output_dir)),
                     "final_path": str(transfer.final_path.relative_to(self.config.output_dir)),
                     "received_ranges": [list(item) for item in transfer.tracker.received_ranges()],
+                    "highest_chunk_seen": transfer.highest_chunk_seen,
+                    "last_chunk_seen": transfer.last_chunk_seen,
                     "source_addr": [transfer.source_addr[0], transfer.source_addr[1]],
                 }
             )
@@ -855,6 +919,28 @@ class SpaceSyncReceiver:
             if not isinstance(source_addr_raw, list) or len(source_addr_raw) != 2:
                 return None
             source_addr = (str(source_addr_raw[0]), int(source_addr_raw[1]))
+            highest_chunk_seen_raw = raw.get("highest_chunk_seen", -1)
+            if isinstance(highest_chunk_seen_raw, bool):
+                highest_chunk_seen = -1
+            elif isinstance(highest_chunk_seen_raw, int):
+                highest_chunk_seen = highest_chunk_seen_raw
+            elif isinstance(highest_chunk_seen_raw, float):
+                highest_chunk_seen = int(highest_chunk_seen_raw)
+            elif isinstance(highest_chunk_seen_raw, str):
+                highest_chunk_seen = int(highest_chunk_seen_raw)
+            else:
+                highest_chunk_seen = -1
+            last_chunk_seen_raw = raw.get("last_chunk_seen", highest_chunk_seen)
+            if isinstance(last_chunk_seen_raw, bool):
+                last_chunk_seen = highest_chunk_seen
+            elif isinstance(last_chunk_seen_raw, int):
+                last_chunk_seen = last_chunk_seen_raw
+            elif isinstance(last_chunk_seen_raw, float):
+                last_chunk_seen = int(last_chunk_seen_raw)
+            elif isinstance(last_chunk_seen_raw, str):
+                last_chunk_seen = int(last_chunk_seen_raw)
+            else:
+                last_chunk_seen = highest_chunk_seen
             received_ranges_raw = raw.get("received_ranges", [])
             if not isinstance(received_ranges_raw, list):
                 return None
@@ -888,6 +974,8 @@ class SpaceSyncReceiver:
             tracker=tracker,
             source_addr=source_addr,
             last_activity_s=time.monotonic(),
+            highest_chunk_seen=max(-1, highest_chunk_seen),
+            last_chunk_seen=max(-1, last_chunk_seen),
         )
         self._ensure_mapped_file_locked(transfer)
         return transfer
@@ -905,4 +993,25 @@ class SpaceSyncReceiver:
             mtime_ns=stat.st_mtime_ns,
             sha256=file_hash,
         )
+
+    def _sendto_best_effort(
+        self,
+        sock: socket.socket,
+        payload: bytes,
+        destination: tuple[str, int],
+        *,
+        reason: str,
+    ) -> bool:
+        try:
+            sock.sendto(payload, destination)
+        except OSError as exc:
+            LOGGER.debug(
+                "sendto_failed reason=%s dest=%s:%d error=%s",
+                reason,
+                destination[0],
+                destination[1],
+                exc,
+            )
+            return False
+        return True
 

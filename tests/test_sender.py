@@ -223,3 +223,89 @@ def test_maybe_send_beacon_respects_interval(monkeypatch: pytest.MonkeyPatch) ->
     )
     assert last == pytest.approx(11.1)
     assert sent_count == 2
+
+
+def test_send_file_open_loop_uses_blocking_socket(tmp_path: Path) -> None:
+    source_path = tmp_path / "payload.bin"
+    source_path.write_bytes(b"blocking-socket-check")
+    sender = SpaceSyncSender(
+        SenderConfig(
+            enable_feedback=False,
+            manifest_repeats=1,
+            drop_every_nth_data=1,
+        )
+    )
+    timeout_values: list[float | None] = []
+    blocking_values: list[bool] = []
+
+    class FakeSocket:
+        def __enter__(self) -> FakeSocket:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def settimeout(self, value: float | None) -> None:
+            timeout_values.append(value)
+
+        def setblocking(self, flag: bool) -> None:
+            blocking_values.append(flag)
+
+        def sendto(self, _payload: bytes, _destination: tuple[str, int]) -> int:
+            return 1
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    try:
+        sender.send_file(source_path, "127.0.0.1", 9000)
+    finally:
+        monkeypatch.undo()
+
+    assert blocking_values and blocking_values[0] is True
+    assert timeout_values and timeout_values[0] == pytest.approx(0.5)
+
+
+def test_send_file_honors_stop_requested(tmp_path: Path) -> None:
+    source_path = tmp_path / "payload-stop.bin"
+    source_path.write_bytes(b"x" * 4096)
+    sender = SpaceSyncSender(
+        SenderConfig(
+            enable_feedback=False,
+            chunk_size=256,
+            manifest_repeats=1,
+        )
+    )
+    sendto_calls = 0
+
+    class FakeSocket:
+        def __enter__(self) -> FakeSocket:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def settimeout(self, _value: float | None) -> None:
+            return None
+
+        def setblocking(self, _flag: bool) -> None:
+            return None
+
+        def sendto(self, _payload: bytes, _destination: tuple[str, int]) -> int:
+            nonlocal sendto_calls
+            sendto_calls += 1
+            return 1
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    try:
+        result = sender.send_file(
+            source_path,
+            "127.0.0.1",
+            9000,
+            stop_requested=lambda: sendto_calls >= 3,
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert result.completed is False
+    assert sendto_calls >= 3
