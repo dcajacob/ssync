@@ -106,6 +106,81 @@ def test_send_and_sync_support_json_flag() -> None:
     assert sync_args.beacon_interval_s == pytest.approx(0.0)
 
 
+def test_parser_supports_metadata_alias_flags() -> None:
+    parser = _build_parser()
+    send_args = parser.parse_args(
+        [
+            "send",
+            "data.bin",
+            "--metadata-repeats",
+            "5",
+            "--periodic-metadata-interval-s",
+            "1.5",
+            "--periodic-metadata-every-n-chunks",
+            "100",
+        ]
+    )
+    receive_args = parser.parse_args(
+        [
+            "receive",
+            "--pre-metadata-max-pending-bytes",
+            "123456",
+            "--pre-metadata-max-pending-bytes-per-transfer",
+            "2048",
+            "--pre-metadata-max-pending-transfers",
+            "16",
+            "--pre-metadata-ttl-s",
+            "12.5",
+        ]
+    )
+    assert send_args.manifest_repeats == 5
+    assert send_args.periodic_metadata_interval_s == pytest.approx(1.5)
+    assert send_args.periodic_metadata_every_n_chunks == 100
+    assert receive_args.pre_metadata_max_pending_bytes == 123456
+    assert receive_args.pre_metadata_max_pending_bytes_per_transfer == 2048
+    assert receive_args.pre_metadata_max_pending_transfers == 16
+    assert receive_args.pre_metadata_ttl_s == pytest.approx(12.5)
+
+
+def test_parser_supports_adaptive_leading_hole_repair_flags() -> None:
+    parser = _build_parser()
+    receive_args = parser.parse_args(
+        [
+            "receive",
+            "--adaptive-leading-hole-boost",
+            "--leading-hole-start-threshold-chunks",
+            "128",
+            "--leading-hole-min-span-chunks",
+            "4096",
+            "--leading-hole-boost-multiplier",
+            "6",
+            "--leading-hole-max-repair-chunks-per-request",
+            "8192",
+        ]
+    )
+    assert receive_args.adaptive_leading_hole_boost is True
+    assert receive_args.leading_hole_start_threshold_chunks == 128
+    assert receive_args.leading_hole_min_span_chunks == 4096
+    assert receive_args.leading_hole_boost_multiplier == 6
+    assert receive_args.leading_hole_max_repair_chunks_per_request == 8192
+
+
+def test_periodic_metadata_default_is_enabled() -> None:
+    parser = _build_parser()
+    send_args = parser.parse_args(["send", "data.bin"])
+    sync_args = parser.parse_args(["sync", "src", "127.0.0.1:dst"])
+    assert send_args.periodic_metadata_interval_s == pytest.approx(10.0)
+    assert sync_args.periodic_metadata_interval_s == pytest.approx(10.0)
+    assert send_args.revisit_incomplete_passes == 2
+    assert send_args.revisit_max_rounds_per_pass == 8
+    assert send_args.primary_feedback_max_rounds == 0
+    assert send_args.primary_feedback_max_seconds == pytest.approx(0.0)
+    assert sync_args.revisit_incomplete_passes == 2
+    assert sync_args.revisit_max_rounds_per_pass == 8
+    assert sync_args.primary_feedback_max_rounds == 64
+    assert sync_args.primary_feedback_max_seconds == pytest.approx(8.0)
+
+
 def test_parser_supports_ssyncd_alias_subcommand() -> None:
     parser = _build_parser()
     args = parser.parse_args(["ssyncd", "--bind-port", "9010"])
@@ -292,6 +367,7 @@ def test_run_sync_open_loop_uses_persistent_order(
             destination_port: int,
             remote_name: str | None = None,
             stop_requested: object | None = None,
+            **_kwargs: object,
         ) -> SimpleNamespace:
             send_order.append(remote_name or file_path.name)
             return SimpleNamespace(
@@ -346,6 +422,7 @@ def test_run_sync_supports_multiple_destinations(
             destination_port: int,
             remote_name: str | None = None,
             stop_requested: object | None = None,
+            **_kwargs: object,
         ) -> SimpleNamespace:
             send_targets.append(f"{destination_host}:{remote_name}")
             return SimpleNamespace(
@@ -373,6 +450,90 @@ def test_run_sync_supports_multiple_destinations(
     exit_code = cli_module._run_sync(args)
     assert exit_code == 0
     assert sorted(send_targets) == ["127.0.0.1:a.bin", "127.0.0.2:a.bin"]
+
+
+def test_run_sync_feedback_revisits_incomplete_transfers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "payload"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "a.bin").write_bytes(b"a" * 1024)
+    (source_dir / "b.bin").write_bytes(b"b" * 1024)
+
+    calls: list[dict[str, object]] = []
+
+    class FakeSender:
+        def __init__(self, config: object) -> None:
+            self.config = config
+
+        def send_file(
+            self,
+            file_path: Path,
+            destination_host: str,
+            destination_port: int,
+            remote_name: str | None = None,
+            stop_requested: object | None = None,
+            transfer_id: bytes | None = None,
+            send_initial_data: bool = True,
+            max_repair_rounds_override: int | None = None,
+            max_feedback_seconds_override: float | None = None,
+            max_feedback_total_rounds_override: int | None = None,
+        ) -> SimpleNamespace:
+            calls.append(
+                {
+                    "remote_name": remote_name,
+                    "transfer_id": transfer_id,
+                    "send_initial_data": send_initial_data,
+                    "max_repair_rounds_override": max_repair_rounds_override,
+                    "max_feedback_seconds_override": max_feedback_seconds_override,
+                    "max_feedback_total_rounds_override": max_feedback_total_rounds_override,
+                }
+            )
+            if send_initial_data and remote_name == "a.bin":
+                return SimpleNamespace(
+                    transfer_id_hex="11" * 16,
+                    total_chunks=10,
+                    repaired_chunks=2,
+                    repair_rounds=1,
+                    completed=False,
+                )
+            return SimpleNamespace(
+                transfer_id_hex=("11" * 16) if remote_name == "a.bin" else ("22" * 16),
+                total_chunks=10,
+                repaired_chunks=4,
+                repair_rounds=2,
+                completed=True,
+            )
+
+        def query_remote_file(self, **kwargs: object) -> object:
+            raise AssertionError("query_remote_file should not be called without --skip-unchanged")
+
+    monkeypatch.setattr(cli_module, "SpaceSyncSender", FakeSender)
+    parser = _build_rsync_parser()
+    args = parser.parse_args(
+        [
+            "-r",
+            str(source_dir),
+            "127.0.0.1:./",
+            "--revisit-incomplete-passes",
+            "2",
+            "--revisit-max-rounds-per-pass",
+            "3",
+        ]
+    )
+    exit_code = cli_module._run_sync(args)
+    assert exit_code == 0
+    revisit_calls = [call for call in calls if call["send_initial_data"] is False]
+    primary_calls = [call for call in calls if call["send_initial_data"] is True]
+    assert primary_calls
+    assert primary_calls[0]["max_feedback_seconds_override"] == pytest.approx(8.0)
+    assert primary_calls[0]["max_feedback_total_rounds_override"] == 64
+    assert len(revisit_calls) >= 1
+    assert revisit_calls[0]["transfer_id"] == bytes.fromhex("11" * 16)
+    assert revisit_calls[0]["max_repair_rounds_override"] == 3
+    assert revisit_calls[0]["max_feedback_seconds_override"] == pytest.approx(0.0)
+    assert revisit_calls[0]["max_feedback_total_rounds_override"] == 0
 
 
 def test_run_sync_expands_source_wildcards(
@@ -415,6 +576,7 @@ def test_run_sender_expands_quoted_wildcard(
             destination_port: int,
             remote_name: str | None = None,
             stop_requested: object | None = None,
+            **_kwargs: object,
         ) -> SimpleNamespace:
             send_order.append(file_path.name)
             return SimpleNamespace(
@@ -463,6 +625,7 @@ def test_run_sender_accepts_multiple_expanded_paths(
             destination_port: int,
             remote_name: str | None = None,
             stop_requested: object | None = None,
+            **_kwargs: object,
         ) -> SimpleNamespace:
             send_order.append(file_path.name)
             return SimpleNamespace(

@@ -14,19 +14,14 @@ MAX_FILE_NAME_BYTES = 4096
 MAX_RANGES_PER_FRAME = 2048
 DEFAULT_CHUNK_SIZE = 1024
 DEFAULT_MANIFEST_REPEATS = 3
+DEFAULT_METADATA_REPEATS = DEFAULT_MANIFEST_REPEATS
 DEFAULT_SOCKET_TIMEOUT = 0.5
 
 
 class FrameType(IntEnum):
-    MANIFEST = 1
+    METADATA = 1
     DATA = 2
-    FIN = 3
     STATUS = 4
-    REPAIR_REQUEST = 5
-    REPAIR_DONE = 6
-    FILE_INFO_REQUEST = 7
-    FILE_INFO_RESPONSE = 8
-    TRANSFER_COMPLETE = 9
     BEACON = 10
 
 
@@ -39,12 +34,22 @@ class TransferState(IntEnum):
     INCOMPLETE = 0
     COMPLETE = 1
     HASH_MISMATCH = 2
+    PENDING_METADATA = 3
+    KEEPALIVE = 4
+
+
+class StatusKind(IntEnum):
+    TRANSFER = 0
+    FILE_INFO_RESPONSE = 1
 
 
 class MetadataType(IntEnum):
     MISSION_TAG = 1
     USER_NOTE = 2
     SOURCE_MTIME_NS = 3
+    FILE_INFO_QUERY_PATH = 100
+    FILE_INFO_QUERY_INCLUDE_CHECKSUM = 101
+    FILE_INFO_QUERY_TOKEN = 102
 
 
 Range = tuple[int, int]
@@ -65,6 +70,16 @@ class SenderConfig:
     midstream_repair_max_chunks_per_poll: int = 512
     repair_duplicate_suppression_s: float = 0.2
     beacon_interval_s: float = 1.0
+    periodic_metadata_interval_s: float = 10.0
+    periodic_metadata_every_n_chunks: int = 0
+    revisit_incomplete_passes: int = 2
+    revisit_max_rounds_per_pass: int = 8
+    primary_feedback_max_rounds: int = 0
+    primary_feedback_max_seconds: float = 0.0
+
+    @property
+    def metadata_repeats(self) -> int:
+        return self.manifest_repeats
 
 
 @dataclass(slots=True)
@@ -76,12 +91,21 @@ class ReceiverConfig:
     periodic_repair_request_s: float = 0.5
     periodic_repair_min_seen_chunks: int = 32
     max_repair_chunks_per_request: int = 256
+    adaptive_leading_hole_boost: bool = True
+    leading_hole_start_threshold_chunks: int = 512
+    leading_hole_min_span_chunks: int = 2048
+    leading_hole_boost_multiplier: int = 4
+    leading_hole_max_repair_chunks_per_request: int = 2048
     transfer_inactivity_timeout_s: float = 10.0
     socket_rcvbuf_bytes: int = 8 * 1024 * 1024
     journal_flush_interval_s: float = 0.5
     repair_request_cooldown_s: float = 0.2
     repair_request_inflight_timeout_s: float = 1.5
     beacon_interval_s: float = 1.0
+    pre_metadata_max_pending_bytes: int = 8 * 1024 * 1024
+    pre_metadata_max_pending_bytes_per_transfer: int = 512 * 1024
+    pre_metadata_max_pending_transfers: int = 128
+    pre_metadata_ttl_s: float = 30.0
 
 
 @dataclass(slots=True)

@@ -13,15 +13,17 @@ from ssync.space_sync.frames import (
     decode_data_chunk,
     decode_frame,
     decode_manifest,
-    decode_repair_done,
-    encode_file_info_response,
-    encode_repair_request,
     encode_status,
-    encode_transfer_complete,
 )
-from ssync.space_sync.manifest import RepairRequest, TransferManifest
+from ssync.space_sync.manifest import TransferManifest
 from ssync.space_sync.sender import SpaceSyncSender
-from ssync.space_sync.types import FrameType, RemoteFileInfo, SenderConfig, TransferState
+from ssync.space_sync.types import (
+    FrameType,
+    RemoteFileInfo,
+    SenderConfig,
+    StatusKind,
+    TransferState,
+)
 
 
 def test_apply_rate_limit_treats_bps_as_bits_per_second(
@@ -46,38 +48,22 @@ def test_apply_rate_limit_treats_bps_as_bits_per_second(
     assert sleeps == [pytest.approx(0.75)]
 
 
-def test_send_file_uses_single_read_for_manifest(tmp_path: Path) -> None:
+def test_send_file_builds_manifest_without_from_bytes(tmp_path: Path) -> None:
     source_path = tmp_path / "payload.bin"
     source_payload = b"single-read-check" * 256
     source_path.write_bytes(source_payload)
     sender = SpaceSyncSender(SenderConfig(enable_feedback=False))
 
-    original_from_bytes = TransferManifest.from_bytes
-    captured_raw: list[bytes] = []
-
-    def _wrapped_from_bytes(
-        *,
-        raw: bytes,
-        file_name: str,
-        chunk_size: int,
-        metadata: dict[int, bytes] | None = None,
-    ) -> TransferManifest:
-        captured_raw.append(raw)
-        return original_from_bytes(
-            raw=raw,
-            file_name=file_name,
-            chunk_size=chunk_size,
-            metadata=metadata,
-        )
-
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(sender_module.TransferManifest, "from_bytes", _wrapped_from_bytes)
+    monkeypatch.setattr(
+        sender_module.TransferManifest,
+        "from_bytes",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("from_bytes not expected")),
+    )
     try:
         sender.send_file(source_path, "127.0.0.1", 9_999)
     finally:
         monkeypatch.undo()
-
-    assert captured_raw == [source_payload]
 
 
 def test_query_remote_file_times_out_on_non_matching_responses() -> None:
@@ -90,7 +76,16 @@ def test_query_remote_file_times_out_on_non_matching_responses() -> None:
         try:
             request_raw, addr = server.recvfrom(65535)
             assert request_raw
-            wrong = encode_file_info_response(RemoteFileInfo(path="wrong-name.bin", exists=False))
+            wrong = encode_status(
+                TransferStatus(
+                    transfer_id=b"\x00" * 16,
+                    kind=StatusKind.FILE_INFO_RESPONSE,
+                    state=TransferState.INCOMPLETE,
+                    missing_ranges=[],
+                    file_info=RemoteFileInfo(path="wrong-name.bin", exists=False),
+                    query_token=b"wrong",
+                )
+            )
             while not stop_event.is_set():
                 server.sendto(wrong, addr)
                 time.sleep(0.01)
@@ -117,7 +112,14 @@ def test_query_remote_file_times_out_on_non_matching_responses() -> None:
 def test_drain_repair_requests_stops_on_transfer_complete_signal() -> None:
     sender = SpaceSyncSender(SenderConfig(enable_feedback=True))
     manifest = TransferManifest.from_bytes(raw=b"abcdef", file_name="sample.bin", chunk_size=2)
-    transfer_complete_frame = encode_transfer_complete(manifest.transfer_id)
+    complete_status_frame = encode_status(
+        TransferStatus(
+            transfer_id=manifest.transfer_id,
+            kind=StatusKind.TRANSFER,
+            state=TransferState.COMPLETE,
+            missing_ranges=[],
+        )
+    )
 
     class FakeSocket:
         def __init__(self) -> None:
@@ -126,7 +128,7 @@ def test_drain_repair_requests_stops_on_transfer_complete_signal() -> None:
         def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
             if self._reads == 0:
                 self._reads += 1
-                return transfer_complete_frame, ("127.0.0.1", 9000)
+                return complete_status_frame, ("127.0.0.1", 9000)
             raise BlockingIOError
 
         def sendto(self, _payload: bytes, _destination: tuple[str, int]) -> int:
@@ -135,9 +137,9 @@ def test_drain_repair_requests_stops_on_transfer_complete_signal() -> None:
     repaired, rounds, paced, completed = sender._drain_repair_requests(
         sock=FakeSocket(),  # type: ignore[arg-type]
         manifest=manifest,
-        chunks=[b"ab", b"cd", b"ef"],
+        total_chunks=3,
+        chunk_reader=lambda index: [b"ab", b"cd", b"ef"][index],
         destination=("127.0.0.1", 9000),
-        send_repair_done=False,
         paced_start_s=time.monotonic(),
         paced_data_bytes=0,
         max_rounds=1,
@@ -156,6 +158,7 @@ def test_drain_repair_requests_services_incomplete_status_ranges() -> None:
     status_frame = encode_status(
         TransferStatus(
             transfer_id=manifest.transfer_id,
+            kind=StatusKind.TRANSFER,
             state=TransferState.INCOMPLETE,
             missing_ranges=[(1, 2)],
         )
@@ -179,9 +182,9 @@ def test_drain_repair_requests_services_incomplete_status_ranges() -> None:
     repaired, rounds, paced, completed = sender._drain_repair_requests(
         sock=FakeSocket(),  # type: ignore[arg-type]
         manifest=manifest,
-        chunks=[b"ab", b"cd", b"ef"],
+        total_chunks=3,
+        chunk_reader=lambda index: [b"ab", b"cd", b"ef"][index],
         destination=("127.0.0.1", 9000),
-        send_repair_done=False,
         paced_start_s=time.monotonic(),
         paced_data_bytes=0,
         max_rounds=1,
@@ -230,6 +233,47 @@ def test_maybe_send_beacon_respects_interval(monkeypatch: pytest.MonkeyPatch) ->
     assert sent_count == 2
 
 
+def test_maybe_send_periodic_metadata_respects_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    sender = SpaceSyncSender(
+        SenderConfig(
+            enable_feedback=False,
+            periodic_metadata_interval_s=1.0,
+            periodic_metadata_every_n_chunks=0,
+        )
+    )
+    manifest = TransferManifest.from_bytes(raw=b"abcdef", file_name="sample.bin", chunk_size=2)
+    sent_count = 0
+
+    class FakeSocket:
+        def sendto(self, _payload: bytes, _destination: tuple[str, int]) -> int:
+            nonlocal sent_count
+            sent_count += 1
+            return 1
+
+    now_values = iter([10.5, 11.2, 11.2])
+    monkeypatch.setattr(sender_module.time, "monotonic", lambda: next(now_values))
+    last_s, since = sender._maybe_send_periodic_metadata(
+        sock=FakeSocket(),  # type: ignore[arg-type]
+        destination=("127.0.0.1", 9000),
+        manifest=manifest,
+        last_metadata_s=10.0,
+        chunks_since_metadata=1,
+    )
+    assert sent_count == 0
+    assert last_s == pytest.approx(10.0)
+    assert since == 1
+    last_s, since = sender._maybe_send_periodic_metadata(
+        sock=FakeSocket(),  # type: ignore[arg-type]
+        destination=("127.0.0.1", 9000),
+        manifest=manifest,
+        last_metadata_s=last_s,
+        chunks_since_metadata=2,
+    )
+    assert sent_count == 1
+    assert last_s == pytest.approx(11.2)
+    assert since == 0
+
+
 def test_send_file_open_loop_uses_blocking_socket(tmp_path: Path) -> None:
     source_path = tmp_path / "payload.bin"
     source_path.write_bytes(b"blocking-socket-check")
@@ -268,6 +312,268 @@ def test_send_file_open_loop_uses_blocking_socket(tmp_path: Path) -> None:
 
     assert blocking_values and blocking_values[0] is True
     assert timeout_values and timeout_values[0] == pytest.approx(0.5)
+
+
+def test_send_file_revisit_mode_repairs_without_initial_data(tmp_path: Path) -> None:
+    source_path = tmp_path / "payload-revisit.bin"
+    source_path.write_bytes(b"abcdefgh")
+    sender = SpaceSyncSender(
+        SenderConfig(
+            chunk_size=4,
+            enable_feedback=True,
+            manifest_repeats=1,
+            feedback_wait_s=0.05,
+            max_repair_rounds=1,
+        )
+    )
+    sent_data_indexes: list[int] = []
+
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.transfer_id: bytes | None = None
+            self._reads = 0
+
+        def __enter__(self) -> FakeSocket:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def settimeout(self, _value: float | None) -> None:
+            return None
+
+        def setblocking(self, _flag: bool) -> None:
+            return None
+
+        def sendto(self, payload: bytes, _destination: tuple[str, int]) -> int:
+            frame = decode_frame(payload)
+            if frame.frame_type == FrameType.METADATA:
+                self.transfer_id = decode_manifest(frame.payload).transfer_id
+            elif frame.frame_type == FrameType.DATA:
+                data_chunk = decode_data_chunk(frame.payload)
+                sent_data_indexes.append(data_chunk.chunk_index)
+            return len(payload)
+
+        def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+            if self.transfer_id is None:
+                raise TimeoutError
+            if self._reads == 0:
+                self._reads += 1
+                return (
+                    encode_status(
+                        TransferStatus(
+                            transfer_id=self.transfer_id,
+                            kind=StatusKind.TRANSFER,
+                            state=TransferState.INCOMPLETE,
+                            missing_ranges=[(0, 1)],
+                        )
+                    ),
+                    ("127.0.0.1", 9000),
+                )
+            if self._reads == 1:
+                self._reads += 1
+                return (
+                    encode_status(
+                        TransferStatus(
+                            transfer_id=self.transfer_id,
+                            kind=StatusKind.TRANSFER,
+                            state=TransferState.COMPLETE,
+                            missing_ranges=[],
+                        )
+                    ),
+                    ("127.0.0.1", 9000),
+                )
+            raise TimeoutError
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    try:
+        result = sender.send_file(
+            source_path,
+            "127.0.0.1",
+            9000,
+            transfer_id=b"\xAB" * 16,
+            send_initial_data=False,
+            max_repair_rounds_override=2,
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert result.completed is True
+    assert sent_data_indexes == [0]
+
+
+def test_send_file_zero_chunk_fast_path_skips_feedback_wait(tmp_path: Path) -> None:
+    source_path = tmp_path / "empty.bin"
+    source_path.write_bytes(b"")
+    sender = SpaceSyncSender(
+        SenderConfig(
+            enable_feedback=True,
+            manifest_repeats=1,
+            feedback_wait_s=0.2,
+        )
+    )
+    sent_frame_types: list[FrameType] = []
+
+    class FakeSocket:
+        def __enter__(self) -> FakeSocket:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def settimeout(self, _value: float | None) -> None:
+            return None
+
+        def setblocking(self, _flag: bool) -> None:
+            return None
+
+        def sendto(self, payload: bytes, _destination: tuple[str, int]) -> int:
+            parsed = decode_frame(payload)
+            assert parsed.frame_type is not None
+            sent_frame_types.append(parsed.frame_type)
+            return len(payload)
+
+        def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+            raise AssertionError("zero-chunk fast path must not enter feedback recv loop")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    try:
+        result = sender.send_file(source_path, "127.0.0.1", 9000)
+    finally:
+        monkeypatch.undo()
+
+    assert result.completed is True
+    assert result.total_chunks == 0
+    assert sent_frame_types.count(FrameType.METADATA) == 1
+    assert FrameType.DATA not in sent_frame_types
+
+
+def test_send_file_feedback_round_budget_stops_primary_attempt(tmp_path: Path) -> None:
+    source_path = tmp_path / "budgeted.bin"
+    source_path.write_bytes(b"abcdefgh")
+    sender = SpaceSyncSender(
+        SenderConfig(
+            chunk_size=4,
+            enable_feedback=True,
+            manifest_repeats=1,
+            feedback_wait_s=0.05,
+            max_repair_rounds=0,
+        )
+    )
+    sent_data_indexes: list[int] = []
+
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.transfer_id: bytes | None = None
+
+        def __enter__(self) -> FakeSocket:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def settimeout(self, _value: float | None) -> None:
+            return None
+
+        def setblocking(self, _flag: bool) -> None:
+            return None
+
+        def sendto(self, payload: bytes, _destination: tuple[str, int]) -> int:
+            frame = decode_frame(payload)
+            if frame.frame_type == FrameType.METADATA:
+                self.transfer_id = decode_manifest(frame.payload).transfer_id
+            elif frame.frame_type == FrameType.DATA:
+                data_chunk = decode_data_chunk(frame.payload)
+                sent_data_indexes.append(data_chunk.chunk_index)
+            return len(payload)
+
+        def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+            assert self.transfer_id is not None
+            return (
+                encode_status(
+                    TransferStatus(
+                        transfer_id=self.transfer_id,
+                        kind=StatusKind.TRANSFER,
+                        state=TransferState.INCOMPLETE,
+                        missing_ranges=[(0, 1)],
+                    )
+                ),
+                ("127.0.0.1", 9000),
+            )
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    try:
+        result = sender.send_file(
+            source_path,
+            "127.0.0.1",
+            9000,
+            send_initial_data=False,
+            transfer_id=b"\xCC" * 16,
+            max_feedback_total_rounds_override=1,
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert result.completed is False
+    assert result.repair_rounds == 1
+    assert result.repaired_chunks == 1
+    assert sent_data_indexes == [0]
+
+
+def test_send_file_budget_does_not_interrupt_initial_data_pass(tmp_path: Path) -> None:
+    source_path = tmp_path / "initial-pass.bin"
+    source_path.write_bytes(b"x" * 2048)
+    sender = SpaceSyncSender(
+        SenderConfig(
+            chunk_size=256,
+            enable_feedback=True,
+            manifest_repeats=1,
+            feedback_wait_s=0.01,
+        )
+    )
+    sent_data_indexes: list[int] = []
+
+    class FakeSocket:
+        def __enter__(self) -> FakeSocket:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def settimeout(self, _value: float | None) -> None:
+            return None
+
+        def setblocking(self, _flag: bool) -> None:
+            return None
+
+        def sendto(self, payload: bytes, _destination: tuple[str, int]) -> int:
+            frame = decode_frame(payload)
+            if frame.frame_type == FrameType.DATA:
+                data_chunk = decode_data_chunk(frame.payload)
+                sent_data_indexes.append(data_chunk.chunk_index)
+            return len(payload)
+
+        def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+            raise AssertionError("budgeted primary pass should not enter feedback recv")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    try:
+        result = sender.send_file(
+            source_path,
+            "127.0.0.1",
+            9000,
+            max_feedback_seconds_override=0.0001,
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert result.completed is False
+    assert len(sent_data_indexes) == 8
+    assert sent_data_indexes == list(range(8))
 
 
 def test_send_file_honors_stop_requested(tmp_path: Path) -> None:
@@ -395,14 +701,14 @@ def test_send_file_resends_manifest_and_fin_on_post_fin_timeout(tmp_path: Path) 
         monkeypatch.undo()
 
     assert result.completed is False
-    # Initial send + two timeout retries.
-    assert sent_frame_types.count(FrameType.FIN) == 3
-    # Initial manifest + two timeout retries.
-    assert sent_frame_types.count(FrameType.MANIFEST) == 3
+    # Initial METADATA + two timeout retries.
+    assert sent_frame_types.count(FrameType.METADATA) == 3
+    # Four-frame mode uses STATUS-only control for completion/repair.
+    assert FrameType.STATUS not in sent_frame_types
 
 
-def test_post_fin_duplicate_repair_request_not_acknowledged_without_data(tmp_path: Path) -> None:
-    source_path = tmp_path / "payload-dup-repair.bin"
+def test_post_fin_status_incomplete_triggers_repairs(tmp_path: Path) -> None:
+    source_path = tmp_path / "payload-status-post-fin.bin"
     source_path.write_bytes(b"x" * 2048)
     sender = SpaceSyncSender(
         SenderConfig(
@@ -411,13 +717,11 @@ def test_post_fin_duplicate_repair_request_not_acknowledged_without_data(tmp_pat
             chunk_size=1024,
             feedback_wait_s=0.01,
             max_feedback_idle_timeouts=1,
-            repair_duplicate_suppression_s=5.0,
         )
     )
-    repair_done_count = 0
-    repair_data_chunks_sent: list[int] = []
     transfer_id: bytes | None = None
-    fin_sent = False
+    data_seen = False
+    repaired_chunks_sent: list[int] = []
 
     class FakeSocket:
         def __init__(self) -> None:
@@ -436,40 +740,42 @@ def test_post_fin_duplicate_repair_request_not_acknowledged_without_data(tmp_pat
             return None
 
         def sendto(self, payload: bytes, _destination: tuple[str, int]) -> int:
-            nonlocal fin_sent, repair_done_count, transfer_id
+            nonlocal data_seen, transfer_id
             parsed = decode_frame(payload)
             assert parsed.frame_type is not None
-            if parsed.frame_type == FrameType.MANIFEST:
+            if parsed.frame_type == FrameType.METADATA:
                 transfer_id = decode_manifest(parsed.payload).transfer_id
-            elif parsed.frame_type == FrameType.FIN:
-                fin_sent = True
             elif parsed.frame_type == FrameType.DATA:
                 chunk = decode_data_chunk(parsed.payload)
-                repair_data_chunks_sent.append(chunk.chunk_index)
-            elif parsed.frame_type == FrameType.REPAIR_DONE:
-                _ = decode_repair_done(parsed.payload)
-                repair_done_count += 1
+                repaired_chunks_sent.append(chunk.chunk_index)
+                data_seen = True
             return len(payload)
 
         def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
-            if not fin_sent:
+            if not data_seen:
                 raise BlockingIOError
-            if self._responses_served < 2:
+            if self._responses_served == 0:
                 assert transfer_id is not None
                 self._responses_served += 1
-                request = encode_repair_request(
-                    RepairRequest(transfer_id=transfer_id, missing_ranges=[(0, 1)])
+                return (
+                    encode_status(
+                        TransferStatus(
+                            transfer_id=transfer_id,
+                            kind=StatusKind.TRANSFER,
+                            state=TransferState.INCOMPLETE,
+                            missing_ranges=[(0, 1)],
+                        )
+                    ),
+                    ("127.0.0.1", 9000),
                 )
-                return request, ("127.0.0.1", 9000)
             raise TimeoutError
 
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
     try:
-        _ = sender.send_file(source_path, "127.0.0.1", 9000)
+        result = sender.send_file(source_path, "127.0.0.1", 9000)
     finally:
         monkeypatch.undo()
 
-    # First request is serviced; duplicate should be suppressed without done ack.
-    assert repair_done_count == 1
-    assert repair_data_chunks_sent.count(0) >= 1
+    assert result.completed is False
+    assert 0 in repaired_chunks_sent

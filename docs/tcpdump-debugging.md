@@ -108,7 +108,7 @@ For namespace-based asymmetric link emulation and `tc -s` stats capture, see
   - Receiver may not be in feedback mode or not receiving frames.
   - Check server bind host/port and local firewall rules.
 - Sender appears stuck after `sent_fin`
-  - Capture both directions and verify whether receiver emits `REPAIR_REQUEST`,
-    `STATUS(COMPLETE)`, or `TRANSFER_COMPLETE`.
+  - Capture both directions and verify whether receiver emits
+    `STATUS(INCOMPLETE)` with missing ranges, then terminal `STATUS(COMPLETE)`.
   - If return-link impairment is high, increase sender tolerance:
     `--feedback-wait-s 3 --max-feedback-idle-timeouts 10`.

@@ -53,17 +53,15 @@ Terms:
 
 ### 3.1.  Frame Families
 
-`MANIFEST`, `DATA`, `FIN`, `STATUS`, `REPAIR_REQUEST`, `REPAIR_DONE`,
-`FILE_INFO_REQUEST`, `FILE_INFO_RESPONSE`, `TRANSFER_COMPLETE`, and `BEACON`.
+`METADATA`, `DATA`, `STATUS`, and `BEACON`.
 
 ### 3.2.  High-Level Transfer Sequence
 
-1. Sender transmits `MANIFEST` one or more times.
+1. Sender transmits `METADATA` one or more times.
 2. Sender transmits `DATA` chunks.
-3. Sender transmits `FIN`.
-4. Receiver either finalizes (complete) or sends `REPAIR_REQUEST`.
-5. Sender retransmits requested ranges and transmits `REPAIR_DONE`.
-6. Receiver verifies whole-file hash and emits final `STATUS` in feedback mode.
+3. Receiver emits `STATUS(INCOMPLETE)` with missing ranges when repair is needed.
+4. Sender retransmits missing ranges as `DATA`.
+5. Receiver verifies whole-file hash and emits final `STATUS` in feedback mode.
 
 ## 4.  UDP Encapsulation
 
@@ -110,7 +108,7 @@ Receiver behavior:
 
 All numeric fields are network byte order.
 
-### 7.1.  `MANIFEST`
+### 7.1.  `METADATA`
 
 Fields:
 
@@ -161,49 +159,14 @@ Receiver MUST discard `DATA` when:
 - `Chunk Index >= Total Chunks`;
 - byte placement exceeds declared `File Size`.
 
-### 7.4.  `FIN`
-
-- `Transfer ID` (16 bytes)
-
 ### 7.5.  `STATUS`
 
 - `Transfer ID` (16 bytes)
-- `State` (uint8): `0=INCOMPLETE`, `1=COMPLETE`, `2=HASH_MISMATCH`
+- `Kind` (uint8): `0=TRANSFER`, `1=FILE_INFO_RESPONSE`
+- `State` (uint8): `0=INCOMPLETE`, `1=COMPLETE`, `2=HASH_MISMATCH`, plus private/extension values
 - `Range Count` (uint16)
-- Missing ranges (`Range Count * 8` bytes)
-
-### 7.6.  `REPAIR_REQUEST`
-
-- `Transfer ID` (16 bytes)
-- `Range Count` (uint16)
-- Missing ranges (`Range Count * 8` bytes)
-
-### 7.7.  `REPAIR_DONE`
-
-- `Transfer ID` (16 bytes)
-
-### 7.8.  `FILE_INFO_REQUEST`
-
-- `Include Checksum` (uint8, 0/1)
-- `Path Length` (uint16)
-- `Path` (UTF-8, non-empty)
-
-### 7.9.  `FILE_INFO_RESPONSE`
-
-- `Exists` (uint8, 0/1)
-- `Has SHA-256` (uint8, 0/1)
-- `Size` (uint64)
-- `Mtime (ns)` (uint64)
-- `SHA-256` (32 bytes, zeroed when `Has SHA-256 = 0`)
-- `Path Length` (uint16)
-- `Path` (UTF-8, non-empty)
-
-### 7.10.  `TRANSFER_COMPLETE`
-
-- `Transfer ID` (16 bytes)
-
-`TRANSFER_COMPLETE` is a compatibility completion hint. Implementations SHOULD
-use `STATUS(COMPLETE)` as the authoritative receiver completion signal.
+- For `TRANSFER` kind: Missing ranges (`Range Count * 8` bytes)
+- For `FILE_INFO_RESPONSE` kind: optional query token and embedded file-info payload
 
 ### 7.11.  `BEACON`
 
@@ -233,50 +196,43 @@ Rules:
 
 Sender behavior:
 
-1. Transmit `MANIFEST` at least once; repetition is RECOMMENDED.
+1. Transmit `METADATA` at least once; repetition is RECOMMENDED.
 2. Transmit all `DATA` chunks.
-3. Transmit `FIN`.
-4. Transfer result is complete if no intentional local test-drop was configured.
+3. Transfer result is complete if no intentional local test-drop was configured.
 
 ### 9.2.  Feedback Mode
 
-After `FIN`, sender waits for receiver feedback:
+After initial data transmission, sender waits for receiver feedback:
 
 - `feedback_wait_s` timer per receive wait (default 2.0s in reference implementation).
 - `max_feedback_idle_timeouts` consecutive wait expirations before termination (default 2).
 - `max_repair_rounds` maximum repair request loops (default 32).
+- `periodic_metadata_interval_s` cadence for re-sending metadata during transfer
+  (default 10.0s, `0` disables).
 
 If no relevant transfer progress is observed for one feedback wait window, sender
-SHOULD re-send `MANIFEST` and `FIN` to recover from control-frame loss.
+SHOULD re-send `METADATA` to recover from control-context loss.
 
 Terminal conditions:
 
 - On `STATUS(COMPLETE)`: sender marks transfer complete and stops.
 - On `STATUS(HASH_MISMATCH)`: sender marks transfer failed and stops.
-- On `TRANSFER_COMPLETE` with matching transfer ID: sender MAY stop early as a
-  compatibility fast-path.
-- On `REPAIR_REQUEST`: sender retransmits requested chunks, sends `REPAIR_DONE`,
-  increments repair-round count.
+- On `STATUS(INCOMPLETE)` with missing ranges: sender retransmits requested chunks
+  as `DATA` and increments repair-round count.
 - On timer exhaustion without terminal status: sender marks transfer incomplete.
 
 ## 10.  Receiver State Machine
 
-On `MANIFEST`, receiver allocates transfer staging and tracking state.
+On `METADATA`, receiver allocates transfer staging and tracking state.
+Receiver MAY buffer bounded pre-manifest data keyed by transfer ID and replay those
+chunks when metadata arrives.
 
 On `DATA`, receiver writes payload and marks chunk received.
 
-On `FIN`:
-
-- If complete, receiver verifies SHA-256 and finalizes.
-- If incomplete and feedback enabled, receiver sends `REPAIR_REQUEST`.
-- If incomplete and feedback disabled, receiver records incomplete state.
-
-On `REPAIR_DONE`, receiver reevaluates completeness and hash.
-
-Repeated `MANIFEST` optimization:
+Repeated `METADATA` optimization:
 
 - Receiver MAY advertise resumable state via `STATUS(INCOMPLETE)` when a repeated
-  manifest arrives for an active transfer.
+  metadata arrives for an active transfer.
 - Receiver MAY short-circuit already-complete files by sending `STATUS(COMPLETE)`.
 
 Feedback mode status:
@@ -294,7 +250,7 @@ Receiver implementations SHOULD persist transfer journals containing at least:
 - received chunk coverage (for example received ranges).
 
 On restart, receiver SHOULD restore incomplete transfers from journal and allow
-completion from subsequent `DATA` and `REPAIR_DONE` frames.
+completion from subsequent `DATA` and `STATUS` feedback cycles.
 
 ## 12.  Transfer ID Uniqueness and Replay Handling
 
@@ -338,15 +294,9 @@ Policy: Specification Required.
 
 Initial values:
 
-- 1 `MANIFEST`
+- 1 `METADATA` (legacy alias: `MANIFEST`)
 - 2 `DATA`
-- 3 `FIN`
 - 4 `STATUS`
-- 5 `REPAIR_REQUEST`
-- 6 `REPAIR_DONE`
-- 7 `FILE_INFO_REQUEST`
-- 8 `FILE_INFO_RESPONSE`
-- 9 `TRANSFER_COMPLETE`
 - 10 `BEACON`
 - 240-255 Private Use
 

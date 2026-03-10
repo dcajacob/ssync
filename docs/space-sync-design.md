@@ -18,26 +18,18 @@ frame-specific payloads.
 
 ### Frame Types
 
-- `MANIFEST`: transfer identity and file metadata (size, chunk size, hash, file name, TLVs)
+- `METADATA` (`MANIFEST` legacy alias): transfer identity and file metadata
 - `DATA`: indexed file chunk
-- `FIN`: end of sender pass
 - `STATUS`: receiver summary (`INCOMPLETE`, `COMPLETE`, `HASH_MISMATCH`) and missing ranges
-- `REPAIR_REQUEST`: receiver request for missing chunk ranges
-- `REPAIR_DONE`: sender signal that requested repair pass has ended
-- `FILE_INFO_REQUEST` / `FILE_INFO_RESPONSE`: optional remote file query for sync decisions
-- `TRANSFER_COMPLETE`: compatibility completion hint
 - `BEACON`: optional availability keepalive
 
 ### Transfer Model
 
-1. Sender emits `MANIFEST` one or more times for robustness.
+1. Sender emits `METADATA` one or more times for robustness.
 2. Sender emits sequential `DATA` chunks (fixed chunk size).
-3. Sender emits `FIN`.
-4. Receiver either finalizes (if complete) or requests sparse repair ranges.
-5. Sender repairs only requested chunks and emits `REPAIR_DONE`.
-6. Receiver validates full-file SHA-256 and reports final status.
-7. In feedback mode, sender treats `STATUS(COMPLETE)` as the authoritative completion
-   signal and accepts `TRANSFER_COMPLETE` as a compatibility fast path.
+3. Receiver emits `STATUS(INCOMPLETE)` with missing ranges as needed.
+4. Sender retransmits requested ranges as `DATA`.
+5. Receiver validates full-file SHA-256 and reports final `STATUS`.
 
 ## Why This Fits Asymmetric LEO Links
 
@@ -48,7 +40,7 @@ frame-specific payloads.
 
 ## Extensibility Hooks
 
-- `MANIFEST` supports TLV metadata for mission/application-specific fields.
+- `MANIFEST`/`METADATA` supports TLV metadata for mission/application-specific fields.
 - New frame types can be added without replacing base framing.
 - Current chunk-based logic can be extended with optional parity/FEC blocks.
 - File mode lays groundwork for stream mode in future revisions.
@@ -59,11 +51,14 @@ frame-specific payloads.
 - Integrity primitive: whole-file SHA-256 verification.
 - Current status model avoids per-packet ACK chatter.
 - Duplicate and out-of-order data chunks are tolerated.
+- Receiver may buffer bounded data before metadata arrival and replay it once metadata is known.
 - Feedback mode sender behavior is timer-bounded (`feedback_wait_s`,
   `max_feedback_idle_timeouts`, `max_repair_rounds`) with explicit incomplete
   terminal outcome when no terminal status is received.
-- During post-`FIN` waits, sender retries `MANIFEST` and `FIN` on relevant idle windows
-  to recover from lost control traffic in impaired links.
+- During feedback waits, sender retries `METADATA` on relevant idle windows
+  to recover from lost control context in impaired links.
+- Sender periodically re-emits `METADATA` during transfer (default every 10s)
+  to improve late-join and beginning-of-transfer loss recovery.
 
 ## Assumptions
 
@@ -86,7 +81,7 @@ frame-specific payloads.
 
 ## Near-Term Next Steps
 
-1. Improve post-FIN convergence under severe impairment (backoff/retry policy tuning).
+1. Improve post-metadata convergence under severe impairment (backoff/retry policy tuning).
 2. Add explicit contact/session identifiers and policy-based scheduling.
 3. Add optional FEC blocks and hybrid retransmit+FEC strategies.
 4. Add authenticated control frames and key management hooks.

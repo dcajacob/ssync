@@ -23,7 +23,8 @@ _TermiosAttrs = list[int | list[bytes | int]]
 _RATE_WINDOW_S = 3.0
 _DETAIL_MAP_WIDTH = 96
 _DETAIL_MAP_HEIGHT = 18
-_COMPLETED_SCAN_INTERVAL_S = 2.0
+_COMPLETED_SCAN_ACTIVE_INTERVAL_S = 5.0
+_COMPLETED_SCAN_IDLE_INTERVAL_S = 15.0
 
 
 @dataclass(slots=True)
@@ -126,16 +127,27 @@ def _read_transfer_snapshots(output_dir: Path) -> list[TransferSnapshot]:
 def _count_completed_files(output_dir: Path) -> tuple[int, int]:
     count = 0
     total_size = 0
-    for path in output_dir.rglob("*"):
-        if not path.is_file():
-            continue
-        if path.name.startswith("."):
-            continue
+    pending_dirs = [output_dir]
+    while pending_dirs:
+        current_dir = pending_dirs.pop()
         try:
-            total_size += path.stat().st_size
+            entries = list(os.scandir(current_dir))
         except OSError:
             continue
-        count += 1
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    pending_dirs.append(Path(entry.path))
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                stat_result = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            total_size += stat_result.st_size
+            count += 1
     return count, total_size
 
 
@@ -424,13 +436,18 @@ def run_monitor_tui(output_dir: Path, refresh_interval_s: float) -> int:
                 elif key == "down":
                     selected_index += 1
                 now = time.monotonic()
+                snapshots = _read_transfer_snapshots(output_dir)
+                scan_interval_s = (
+                    _COMPLETED_SCAN_ACTIVE_INTERVAL_S
+                    if snapshots
+                    else _COMPLETED_SCAN_IDLE_INTERVAL_S
+                )
                 if (
                     last_completed_scan_s <= 0
-                    or now - last_completed_scan_s >= _COMPLETED_SCAN_INTERVAL_S
+                    or now - last_completed_scan_s >= scan_interval_s
                 ):
                     completed_count, completed_size = _count_completed_files(output_dir)
                     last_completed_scan_s = now
-                snapshots = _read_transfer_snapshots(output_dir)
                 if snapshots:
                     selected_index = max(0, min(selected_index, len(snapshots) - 1))
                 else:

@@ -114,6 +114,13 @@ uv run ssync send ./example.bin --dest-port 9000 --feedback \
   --feedback-wait-s 3.0 --max-feedback-idle-timeouts 10 --max-repair-rounds 32
 ```
 
+Periodic transfer metadata is enabled by default every 10 seconds:
+
+```bash
+uv run ssync send ./example.bin --dest-port 9000 --feedback \
+  --periodic-metadata-interval-s 10.0 --periodic-metadata-every-n-chunks 1024
+```
+
 Availability beacons (default every second; `0` disables):
 
 ```bash
@@ -121,14 +128,27 @@ uv run ssyncd --bind-port 9000 --beacon-interval-s 1.0
 uv run ssync send ./example.bin --dest-port 9000 --feedback --beacon-interval-s 1.0
 ```
 
+Pre-metadata buffering controls on receiver/server:
+
+```bash
+uv run ssync receive --bind-port 9000 --feedback \
+  --pre-metadata-max-pending-bytes 8388608 \
+  --pre-metadata-max-pending-bytes-per-transfer 524288 \
+  --pre-metadata-max-pending-transfers 128 \
+  --pre-metadata-ttl-s 30
+```
+
 Receiver state advertisement:
 
-- On repeated `MANIFEST`, receiver may advertise current `STATUS(INCOMPLETE)` with
+- On repeated `METADATA`, receiver may advertise current `STATUS(INCOMPLETE)` with
   bounded missing ranges to help sender prioritize immediate repairs.
+- Receiver emits `STATUS(INCOMPLETE)` as the repair signal.
 - If destination already has a hash-matching completed file, receiver short-circuits
   with `STATUS(COMPLETE)` and sender exits early.
-- During post-`FIN` feedback wait, sender retries `MANIFEST` + `FIN` on relevant
-  idle windows to recover from control-frame loss on impaired links.
+- During feedback wait, sender retries `METADATA` on relevant idle windows to recover
+  control-context loss on impaired links.
+- Receiver can buffer bounded unknown-transfer data chunks before metadata arrives;
+  once metadata appears, buffered chunks are replayed and missing ranges are advertised.
 
 Simulate loss to exercise repair:
 

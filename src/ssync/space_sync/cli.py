@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import collections
+import dataclasses
 import fnmatch
 import glob
 import json
@@ -76,6 +78,36 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Cap chunks requested in each repair request (0 means unlimited)",
     )
     recv.add_argument(
+        "--adaptive-leading-hole-boost",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Dynamically boost repair request chunk budget for large leading holes",
+    )
+    recv.add_argument(
+        "--leading-hole-start-threshold-chunks",
+        type=int,
+        default=512,
+        help="Max starting chunk index for considering a leading-hole boost",
+    )
+    recv.add_argument(
+        "--leading-hole-min-span-chunks",
+        type=int,
+        default=2048,
+        help="Minimum first-missing-range span to trigger leading-hole boost",
+    )
+    recv.add_argument(
+        "--leading-hole-boost-multiplier",
+        type=int,
+        default=4,
+        help="Multiplier applied to max repair chunk budget during leading-hole boost",
+    )
+    recv.add_argument(
+        "--leading-hole-max-repair-chunks-per-request",
+        type=int,
+        default=2048,
+        help="Hard cap for boosted per-request repair chunk budget (0 means unlimited)",
+    )
+    recv.add_argument(
         "--repair-request-cooldown-s",
         type=float,
         default=0.2,
@@ -111,6 +143,30 @@ def _build_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="Receiver beacon interval in seconds (0 disables beacons)",
     )
+    recv.add_argument(
+        "--pre-metadata-max-pending-bytes",
+        type=int,
+        default=8 * 1024 * 1024,
+        help="Max global bytes buffered for unknown-transfer DATA",
+    )
+    recv.add_argument(
+        "--pre-metadata-max-pending-bytes-per-transfer",
+        type=int,
+        default=512 * 1024,
+        help="Max bytes buffered per unknown transfer ID",
+    )
+    recv.add_argument(
+        "--pre-metadata-max-pending-transfers",
+        type=int,
+        default=128,
+        help="Max unknown transfer IDs tracked in pre-metadata buffer",
+    )
+    recv.add_argument(
+        "--pre-metadata-ttl-s",
+        type=float,
+        default=30.0,
+        help="TTL for buffered unknown-transfer DATA before eviction",
+    )
     _add_log_level_arg(recv)
 
     server = subparsers.add_parser(
@@ -130,6 +186,12 @@ def _build_parser() -> argparse.ArgumentParser:
     send.add_argument("--dest-port", type=int, default=9000)
     send.add_argument("--chunk-size", type=int, default=1024)
     send.add_argument("--manifest-repeats", type=int, default=3)
+    send.add_argument(
+        "--metadata-repeats",
+        type=int,
+        dest="manifest_repeats",
+        help="Alias for --manifest-repeats",
+    )
     send.add_argument("--feedback", action="store_true", help="Enable repair flow")
     send.add_argument("--feedback-wait-s", type=float, default=2.0)
     send.add_argument(
@@ -175,6 +237,48 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Sender beacon interval in seconds (0 disables beacons)",
+    )
+    send.add_argument(
+        "--periodic-metadata-interval-s",
+        type=float,
+        default=10.0,
+        help="Send METADATA periodically during transfer (seconds, default 10, 0 disables)",
+    )
+    send.add_argument(
+        "--periodic-metadata-every-n-chunks",
+        type=int,
+        default=0,
+        help="Send METADATA every N data chunks during transfer (0 disables)",
+    )
+    send.add_argument(
+        "--revisit-incomplete-passes",
+        type=int,
+        default=2,
+        help="Maximum revisit attempts for each incomplete transfer (feedback mode)",
+    )
+    send.add_argument(
+        "--revisit-max-rounds-per-pass",
+        type=int,
+        default=8,
+        help="Max repair rounds handled during each revisit attempt (0 unlimited)",
+    )
+    send.add_argument(
+        "--primary-feedback-max-rounds",
+        type=int,
+        default=0,
+        help=(
+            "Cap feedback repair rounds per primary file attempt in sync-style flows "
+            "(0 disables)"
+        ),
+    )
+    send.add_argument(
+        "--primary-feedback-max-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Cap wall-clock feedback servicing time per primary file attempt in "
+            "sync-style flows (0 disables)"
+        ),
     )
     send.add_argument("--json", action="store_true", dest="json_output")
     _add_log_level_arg(send)
@@ -270,6 +374,36 @@ def _add_server_args(parser: argparse.ArgumentParser) -> None:
         help="Cap chunks requested in each repair request (0 means unlimited)",
     )
     parser.add_argument(
+        "--adaptive-leading-hole-boost",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Dynamically boost repair request chunk budget for large leading holes",
+    )
+    parser.add_argument(
+        "--leading-hole-start-threshold-chunks",
+        type=int,
+        default=512,
+        help="Max starting chunk index for considering a leading-hole boost",
+    )
+    parser.add_argument(
+        "--leading-hole-min-span-chunks",
+        type=int,
+        default=2048,
+        help="Minimum first-missing-range span to trigger leading-hole boost",
+    )
+    parser.add_argument(
+        "--leading-hole-boost-multiplier",
+        type=int,
+        default=4,
+        help="Multiplier applied to max repair chunk budget during leading-hole boost",
+    )
+    parser.add_argument(
+        "--leading-hole-max-repair-chunks-per-request",
+        type=int,
+        default=2048,
+        help="Hard cap for boosted per-request repair chunk budget (0 means unlimited)",
+    )
+    parser.add_argument(
         "--repair-request-cooldown-s",
         type=float,
         default=0.2,
@@ -304,6 +438,30 @@ def _add_server_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=1.0,
         help="Receiver beacon interval in seconds (0 disables beacons)",
+    )
+    parser.add_argument(
+        "--pre-metadata-max-pending-bytes",
+        type=int,
+        default=8 * 1024 * 1024,
+        help="Max global bytes buffered for unknown-transfer DATA",
+    )
+    parser.add_argument(
+        "--pre-metadata-max-pending-bytes-per-transfer",
+        type=int,
+        default=512 * 1024,
+        help="Max bytes buffered per unknown transfer ID",
+    )
+    parser.add_argument(
+        "--pre-metadata-max-pending-transfers",
+        type=int,
+        default=128,
+        help="Max unknown transfer IDs tracked in pre-metadata buffer",
+    )
+    parser.add_argument(
+        "--pre-metadata-ttl-s",
+        type=float,
+        default=30.0,
+        help="TTL for buffered unknown-transfer DATA before eviction",
     )
     _add_log_level_arg(parser)
 
@@ -366,6 +524,12 @@ def _add_sync_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--chunk-size", type=int, default=1024)
     parser.add_argument("--manifest-repeats", type=int, default=3)
     parser.add_argument(
+        "--metadata-repeats",
+        type=int,
+        dest="manifest_repeats",
+        help="Alias for --manifest-repeats",
+    )
+    parser.add_argument(
         "--feedback",
         action="store_true",
         default=True,
@@ -423,6 +587,48 @@ def _add_sync_args(parser: argparse.ArgumentParser) -> None:
         help="Sender beacon interval in seconds (0 disables beacons)",
     )
     parser.add_argument(
+        "--periodic-metadata-interval-s",
+        type=float,
+        default=10.0,
+        help="Send METADATA periodically during transfer (seconds, default 10, 0 disables)",
+    )
+    parser.add_argument(
+        "--periodic-metadata-every-n-chunks",
+        type=int,
+        default=0,
+        help="Send METADATA every N data chunks during transfer (0 disables)",
+    )
+    parser.add_argument(
+        "--revisit-incomplete-passes",
+        type=int,
+        default=2,
+        help="Maximum revisit attempts for each incomplete transfer (feedback mode)",
+    )
+    parser.add_argument(
+        "--revisit-max-rounds-per-pass",
+        type=int,
+        default=8,
+        help="Max repair rounds handled during each revisit attempt (0 unlimited)",
+    )
+    parser.add_argument(
+        "--primary-feedback-max-rounds",
+        type=int,
+        default=64,
+        help=(
+            "Cap feedback repair rounds per primary file attempt so revisits run "
+            "regularly (0 disables)"
+        ),
+    )
+    parser.add_argument(
+        "--primary-feedback-max-seconds",
+        type=float,
+        default=8.0,
+        help=(
+            "Cap wall-clock feedback servicing time per primary file attempt so "
+            "revisits run regularly (0 disables)"
+        ),
+    )
+    parser.add_argument(
         "--state-file",
         type=Path,
         default=Path(".ssync-open-loop-state.json"),
@@ -448,12 +654,21 @@ def _run_receiver_common(
     periodic_repair_request_s: float,
     periodic_repair_min_seen_chunks: int,
     max_repair_chunks_per_request: int,
+    adaptive_leading_hole_boost: bool,
+    leading_hole_start_threshold_chunks: int,
+    leading_hole_min_span_chunks: int,
+    leading_hole_boost_multiplier: int,
+    leading_hole_max_repair_chunks_per_request: int,
     repair_request_cooldown_s: float,
     repair_request_inflight_timeout_s: float,
     transfer_inactivity_timeout_s: float,
     socket_rcvbuf_bytes: int,
     journal_flush_interval_s: float,
     beacon_interval_s: float,
+    pre_metadata_max_pending_bytes: int,
+    pre_metadata_max_pending_bytes_per_transfer: int,
+    pre_metadata_max_pending_transfers: int,
+    pre_metadata_ttl_s: float,
     banner: str,
 ) -> int:
     receiver = SpaceSyncReceiver(
@@ -467,12 +682,26 @@ def _run_receiver_common(
             periodic_repair_request_s=max(0.0, periodic_repair_request_s),
             periodic_repair_min_seen_chunks=max(1, periodic_repair_min_seen_chunks),
             max_repair_chunks_per_request=max(0, max_repair_chunks_per_request),
+            adaptive_leading_hole_boost=adaptive_leading_hole_boost,
+            leading_hole_start_threshold_chunks=max(0, leading_hole_start_threshold_chunks),
+            leading_hole_min_span_chunks=max(1, leading_hole_min_span_chunks),
+            leading_hole_boost_multiplier=max(1, leading_hole_boost_multiplier),
+            leading_hole_max_repair_chunks_per_request=max(
+                0,
+                leading_hole_max_repair_chunks_per_request,
+            ),
             repair_request_cooldown_s=max(0.0, repair_request_cooldown_s),
             repair_request_inflight_timeout_s=max(0.0, repair_request_inflight_timeout_s),
             transfer_inactivity_timeout_s=max(0.0, transfer_inactivity_timeout_s),
             socket_rcvbuf_bytes=max(0, socket_rcvbuf_bytes),
             journal_flush_interval_s=max(0.0, journal_flush_interval_s),
             beacon_interval_s=max(0.0, beacon_interval_s),
+            pre_metadata_max_pending_bytes=max(0, pre_metadata_max_pending_bytes),
+            pre_metadata_max_pending_bytes_per_transfer=max(
+                0, pre_metadata_max_pending_bytes_per_transfer
+            ),
+            pre_metadata_max_pending_transfers=max(1, pre_metadata_max_pending_transfers),
+            pre_metadata_ttl_s=max(0.0, pre_metadata_ttl_s),
         ),
     )
     receiver.start()
@@ -505,12 +734,23 @@ def _run_receiver(args: argparse.Namespace) -> int:
         periodic_repair_request_s=args.periodic_repair_request_s,
         periodic_repair_min_seen_chunks=args.periodic_repair_min_seen_chunks,
         max_repair_chunks_per_request=args.max_repair_chunks_per_request,
+        adaptive_leading_hole_boost=args.adaptive_leading_hole_boost,
+        leading_hole_start_threshold_chunks=args.leading_hole_start_threshold_chunks,
+        leading_hole_min_span_chunks=args.leading_hole_min_span_chunks,
+        leading_hole_boost_multiplier=args.leading_hole_boost_multiplier,
+        leading_hole_max_repair_chunks_per_request=args.leading_hole_max_repair_chunks_per_request,
         repair_request_cooldown_s=args.repair_request_cooldown_s,
         repair_request_inflight_timeout_s=args.repair_request_inflight_timeout_s,
         transfer_inactivity_timeout_s=args.transfer_inactivity_timeout_s,
         socket_rcvbuf_bytes=args.socket_rcvbuf_bytes,
         journal_flush_interval_s=args.journal_flush_interval_s,
         beacon_interval_s=args.beacon_interval_s,
+        pre_metadata_max_pending_bytes=args.pre_metadata_max_pending_bytes,
+        pre_metadata_max_pending_bytes_per_transfer=(
+            args.pre_metadata_max_pending_bytes_per_transfer
+        ),
+        pre_metadata_max_pending_transfers=args.pre_metadata_max_pending_transfers,
+        pre_metadata_ttl_s=args.pre_metadata_ttl_s,
         banner=f"Space Sync receiver listening on {args.bind_host}:{args.bind_port}",
     )
 
@@ -526,12 +766,23 @@ def _run_server(args: argparse.Namespace) -> int:
         periodic_repair_request_s=args.periodic_repair_request_s,
         periodic_repair_min_seen_chunks=args.periodic_repair_min_seen_chunks,
         max_repair_chunks_per_request=args.max_repair_chunks_per_request,
+        adaptive_leading_hole_boost=args.adaptive_leading_hole_boost,
+        leading_hole_start_threshold_chunks=args.leading_hole_start_threshold_chunks,
+        leading_hole_min_span_chunks=args.leading_hole_min_span_chunks,
+        leading_hole_boost_multiplier=args.leading_hole_boost_multiplier,
+        leading_hole_max_repair_chunks_per_request=args.leading_hole_max_repair_chunks_per_request,
         repair_request_cooldown_s=args.repair_request_cooldown_s,
         repair_request_inflight_timeout_s=args.repair_request_inflight_timeout_s,
         transfer_inactivity_timeout_s=args.transfer_inactivity_timeout_s,
         socket_rcvbuf_bytes=args.socket_rcvbuf_bytes,
         journal_flush_interval_s=args.journal_flush_interval_s,
         beacon_interval_s=args.beacon_interval_s,
+        pre_metadata_max_pending_bytes=args.pre_metadata_max_pending_bytes,
+        pre_metadata_max_pending_bytes_per_transfer=(
+            args.pre_metadata_max_pending_bytes_per_transfer
+        ),
+        pre_metadata_max_pending_transfers=args.pre_metadata_max_pending_transfers,
+        pre_metadata_ttl_s=args.pre_metadata_ttl_s,
         banner=(
             "Space Sync server listening on "
             f"{args.bind_host}:{args.bind_port} root={args.root_dir}"
@@ -559,6 +810,12 @@ def _run_sender(args: argparse.Namespace) -> int:
             ),
             repair_duplicate_suppression_s=max(0.0, args.repair_duplicate_suppression_s),
             beacon_interval_s=max(0.0, args.beacon_interval_s),
+            periodic_metadata_interval_s=max(0.0, args.periodic_metadata_interval_s),
+            periodic_metadata_every_n_chunks=max(0, args.periodic_metadata_every_n_chunks),
+            revisit_incomplete_passes=max(0, args.revisit_incomplete_passes),
+            revisit_max_rounds_per_pass=max(0, args.revisit_max_rounds_per_pass),
+            primary_feedback_max_rounds=max(0, args.primary_feedback_max_rounds),
+            primary_feedback_max_seconds=max(0.0, args.primary_feedback_max_seconds),
         )
     )
     try:
@@ -797,6 +1054,15 @@ def _order_items_for_open_loop(
     )
 
 
+@dataclasses.dataclass(slots=True)
+class _RevisitEntry:
+    source_file: Path
+    destination_host: str
+    remote_name: str
+    transfer_id_hex: str
+    attempts: int = 0
+
+
 def _run_sync(args: argparse.Namespace) -> int:
     if len(args.paths) < 2:
         print("sync error: expected at least one source and one destination")
@@ -858,6 +1124,12 @@ def _run_sync(args: argparse.Namespace) -> int:
             ),
             repair_duplicate_suppression_s=max(0.0, args.repair_duplicate_suppression_s),
             beacon_interval_s=max(0.0, args.beacon_interval_s),
+            periodic_metadata_interval_s=max(0.0, args.periodic_metadata_interval_s),
+            periodic_metadata_every_n_chunks=max(0, args.periodic_metadata_every_n_chunks),
+            revisit_incomplete_passes=max(0, args.revisit_incomplete_passes),
+            revisit_max_rounds_per_pass=max(0, args.revisit_max_rounds_per_pass),
+            primary_feedback_max_rounds=max(0, args.primary_feedback_max_rounds),
+            primary_feedback_max_seconds=max(0.0, args.primary_feedback_max_seconds),
         )
     )
 
@@ -869,6 +1141,18 @@ def _run_sync(args: argparse.Namespace) -> int:
     open_loop_mode = not args.feedback
     if args.open_loop_max_rounds < 0:
         print("sync error: --open-loop-max-rounds must be >= 0")
+        return 2
+    if args.revisit_incomplete_passes < 0:
+        print("sync error: --revisit-incomplete-passes must be >= 0")
+        return 2
+    if args.revisit_max_rounds_per_pass < 0:
+        print("sync error: --revisit-max-rounds-per-pass must be >= 0")
+        return 2
+    if args.primary_feedback_max_rounds < 0:
+        print("sync error: --primary-feedback-max-rounds must be >= 0")
+        return 2
+    if args.primary_feedback_max_seconds < 0:
+        print("sync error: --primary-feedback-max-seconds must be >= 0")
         return 2
     open_loop_state = _load_open_loop_state(args.state_file) if open_loop_mode else {}
     round_index = 0
@@ -884,6 +1168,100 @@ def _run_sync(args: argparse.Namespace) -> int:
     collect_item_results = (not open_loop_mode) or args.dry_run or args.open_loop_max_rounds > 0
     item_results: list[dict[str, object]] | None = [] if collect_item_results else None
     total_items = sum(len(items) for _, items in sync_plans)
+    revisit_enabled = (
+        args.feedback and not args.dry_run and args.revisit_incomplete_passes > 0
+    )
+    revisit_queue: collections.deque[_RevisitEntry] = collections.deque()
+    revisit_active_keys: set[tuple[str, str]] = set()
+
+    def _enqueue_revisit(
+        *,
+        source_file: Path,
+        destination_host: str,
+        remote_name: str,
+        transfer_id_hex: str,
+    ) -> None:
+        revisit_key = (destination_host, remote_name)
+        if revisit_key in revisit_active_keys:
+            return
+        revisit_queue.append(
+            _RevisitEntry(
+                source_file=source_file,
+                destination_host=destination_host,
+                remote_name=remote_name,
+                transfer_id_hex=transfer_id_hex,
+            )
+        )
+        revisit_active_keys.add(revisit_key)
+
+    def _run_revisit_attempts(max_attempts: int) -> tuple[int, int]:
+        nonlocal should_stop, sent_count, failed
+        completed_transfers = 0
+        retired_incomplete_transfers = 0
+        attempts_remaining = max(0, max_attempts)
+        while revisit_queue and attempts_remaining > 0 and not should_stop:
+            attempts_remaining -= 1
+            entry = revisit_queue.popleft()
+            destination_host = entry.destination_host
+            remote_name = entry.remote_name
+            revisit_key = (destination_host, remote_name)
+            transfer_id_hex = entry.transfer_id_hex
+            attempts = entry.attempts + 1
+            try:
+                transfer_id = bytes.fromhex(transfer_id_hex)
+            except ValueError:
+                transfer_id = b""
+            if len(transfer_id) != 16:
+                failed += 1
+                retired_incomplete_transfers += 1
+                revisit_active_keys.discard(revisit_key)
+                continue
+            source_file = entry.source_file
+            result = sender.send_file(
+                file_path=source_file,
+                destination_host=destination_host,
+                destination_port=args.dest_port,
+                remote_name=remote_name,
+                stop_requested=lambda: should_stop,
+                transfer_id=transfer_id,
+                send_initial_data=False,
+                max_repair_rounds_override=args.revisit_max_rounds_per_pass,
+                max_feedback_seconds_override=0.0,
+                max_feedback_total_rounds_override=0,
+            )
+            status = "revisit-sent" if result.completed else "revisit-incomplete"
+            item_result = {
+                "status": status,
+                "source": str(source_file),
+                "destination": f"{destination_host}:{remote_name}",
+                "transfer_id": result.transfer_id_hex,
+                "chunks": result.total_chunks,
+                "repaired": result.repaired_chunks,
+                "rounds": result.repair_rounds,
+                "completed": result.completed,
+                "revisit_attempt": attempts,
+            }
+            if item_results is not None:
+                item_results.append(item_result)
+            if args.verbose and not args.json_output:
+                print(
+                    f"[{status}] {source_file} -> {destination_host}:{remote_name} "
+                    f"completed={result.completed} attempt={attempts}"
+                )
+            if result.completed:
+                sent_count += 1
+                completed_transfers += 1
+                revisit_active_keys.discard(revisit_key)
+                continue
+            if attempts >= args.revisit_incomplete_passes:
+                failed += 1
+                retired_incomplete_transfers += 1
+                revisit_active_keys.discard(revisit_key)
+                continue
+            entry.attempts = attempts
+            revisit_queue.append(entry)
+        return completed_transfers, retired_incomplete_transfers
+
     while True:
         round_index += 1
         for destination_host, items in sync_plans:
@@ -939,10 +1317,20 @@ def _run_sync(args: argparse.Namespace) -> int:
                         destination_port=args.dest_port,
                         remote_name=remote_name,
                         stop_requested=lambda: should_stop,
+                        max_feedback_seconds_override=args.primary_feedback_max_seconds,
+                        max_feedback_total_rounds_override=args.primary_feedback_max_rounds,
                     )
                     status = "sent" if result.completed else "incomplete"
                     if not result.completed:
-                        failed += 1
+                        if revisit_enabled:
+                            _enqueue_revisit(
+                                source_file=source_file,
+                                destination_host=destination_host,
+                                remote_name=remote_name,
+                                transfer_id_hex=result.transfer_id_hex,
+                            )
+                        else:
+                            failed += 1
                     else:
                         sent_count += 1
                     item_result = {
@@ -971,6 +1359,8 @@ def _run_sync(args: argparse.Namespace) -> int:
                         f"[{status}] {source_file} -> {destination_host}:{remote_name} "
                         f"completed={item_result.get('completed', False)}"
                     )
+                if revisit_enabled and not should_stop:
+                    _run_revisit_attempts(1)
 
         if args.dry_run:
             break
@@ -980,6 +1370,16 @@ def _run_sync(args: argparse.Namespace) -> int:
             break
         if args.open_loop_max_rounds > 0 and round_index >= args.open_loop_max_rounds:
             break
+
+    if revisit_enabled and not should_stop:
+        while revisit_queue:
+            queue_size = len(revisit_queue)
+            completed_now, retired_now = _run_revisit_attempts(queue_size)
+            if completed_now == 0 and retired_now == 0:
+                break
+    if revisit_queue:
+        failed += len(revisit_queue)
+        revisit_queue.clear()
 
     if failed:
         if args.json_output:
@@ -1063,14 +1463,14 @@ def main(argv: list[str] | None = None) -> int:
     return 1
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-
 def ssyncd_main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     parser = _build_ssyncd_parser()
     args = parser.parse_args(argv)
     _configure_logging(args.log_level)
     return _run_server(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 
