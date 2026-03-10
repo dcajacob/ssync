@@ -58,6 +58,7 @@ sudo PROFILE=leo_nominal bash ./scripts/apply_tc_profile.sh
 
 Supported profiles:
 
+- `leo_manual`
 - `leo_nominal`
 - `leo_stressed`
 - `open_loop_harsh`
@@ -113,6 +114,12 @@ Open-loop run:
 sudo PROFILE=open_loop_harsh FEEDBACK=0 bash ./scripts/run_emulated_scenario.sh
 ```
 
+Manual profile run:
+
+```bash
+sudo PROFILE=leo_manual FEEDBACK=1 bash ./scripts/run_emulated_scenario.sh
+```
+
 Artifacts include:
 
 - sender JSON result
@@ -137,9 +144,13 @@ Track per run:
 - repair rounds/chunks
 - packet counts from pcap
 - queue drops/requeues from `tc -s`
+- sender post-FIN behavior (`post_fin_timeout`, `status=COMPLETE`, `received_transfer_complete`)
 
 ## Notes and caveats
 
 - `netem corrupt` approximates packet corruption and does not model true PHY BER.
 - This setup shapes egress in each namespace direction (sufficient for directional asymmetry in this veth topology).
 - Scripts are idempotent where practical and include cleanup; still run teardown after abnormal exits.
+- On highly impaired return links, increase sender tolerance while testing:
+  - `--feedback-wait-s 3`
+  - `--max-feedback-idle-timeouts 10`

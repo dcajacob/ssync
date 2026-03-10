@@ -30,6 +30,18 @@ fi
 
 set_profile_defaults() {
   case "${PROFILE}" in
+    leo_manual)
+      DOWN_RATE="50mbit"
+      DOWN_DELAY="220ms"
+      DOWN_JITTER="10ms"
+      DOWN_LOSS="2.0%"
+      DOWN_CORRUPT="0.03%"
+      UP_RATE="256kbit"
+      UP_DELAY="220ms"
+      UP_JITTER="25ms"
+      UP_LOSS="2.0%"
+      UP_CORRUPT="0.03%"
+      ;;
     leo_nominal)
       DOWN_RATE="50mbit"
       DOWN_DELAY="120ms"

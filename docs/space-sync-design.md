@@ -24,6 +24,9 @@ frame-specific payloads.
 - `STATUS`: receiver summary (`INCOMPLETE`, `COMPLETE`, `HASH_MISMATCH`) and missing ranges
 - `REPAIR_REQUEST`: receiver request for missing chunk ranges
 - `REPAIR_DONE`: sender signal that requested repair pass has ended
+- `FILE_INFO_REQUEST` / `FILE_INFO_RESPONSE`: optional remote file query for sync decisions
+- `TRANSFER_COMPLETE`: compatibility completion hint
+- `BEACON`: optional availability keepalive
 
 ### Transfer Model
 
@@ -33,6 +36,8 @@ frame-specific payloads.
 4. Receiver either finalizes (if complete) or requests sparse repair ranges.
 5. Sender repairs only requested chunks and emits `REPAIR_DONE`.
 6. Receiver validates full-file SHA-256 and reports final status.
+7. In feedback mode, sender treats `STATUS(COMPLETE)` as the authoritative completion
+   signal and accepts `TRANSFER_COMPLETE` as a compatibility fast path.
 
 ## Why This Fits Asymmetric LEO Links
 
@@ -57,6 +62,8 @@ frame-specific payloads.
 - Feedback mode sender behavior is timer-bounded (`feedback_wait_s`,
   `max_feedback_idle_timeouts`, `max_repair_rounds`) with explicit incomplete
   terminal outcome when no terminal status is received.
+- During post-`FIN` waits, sender retries `MANIFEST` and `FIN` on relevant idle windows
+  to recover from lost control traffic in impaired links.
 
 ## Assumptions
 
@@ -65,6 +72,8 @@ frame-specific payloads.
 - Receiver transfer state is persisted as a local journal in output directories so
   incomplete transfers can resume after receiver restart.
 - One active sender destination per transfer in the current implementation.
+- Receiver can correlate repeated logical transfers by manifest signature to continue
+  filling existing partial files across changing transfer IDs.
 
 ## Intentionally Deferred
 
@@ -75,11 +84,11 @@ frame-specific payloads.
 - Prioritization, deletion/housekeeping controls
 - Stream transport semantics
 
-## Next Steps
+## Near-Term Next Steps
 
-1. Add durable transfer journals for pass-to-pass recovery.
+1. Improve post-FIN convergence under severe impairment (backoff/retry policy tuning).
 2. Add explicit contact/session identifiers and policy-based scheduling.
 3. Add optional FEC blocks and hybrid retransmit+FEC strategies.
 4. Add authenticated control frames and key management hooks.
-5. Add bidirectional telemetry (delivery quality, RTT, repair efficiency).
+5. Add richer delivery telemetry (delivery quality, RTT, repair efficiency).
 

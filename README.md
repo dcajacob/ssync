@@ -111,7 +111,7 @@ Feedback mode timing controls:
 
 ```bash
 uv run ssync send ./example.bin --dest-port 9000 --feedback \
-  --feedback-wait-s 2.0 --max-feedback-idle-timeouts 2 --max-repair-rounds 2
+  --feedback-wait-s 3.0 --max-feedback-idle-timeouts 10 --max-repair-rounds 32
 ```
 
 Availability beacons (default every second; `0` disables):
@@ -127,6 +127,8 @@ Receiver state advertisement:
   bounded missing ranges to help sender prioritize immediate repairs.
 - If destination already has a hash-matching completed file, receiver short-circuits
   with `STATUS(COMPLETE)` and sender exits early.
+- During post-`FIN` feedback wait, sender retries `MANIFEST` + `FIN` on relevant
+  idle windows to recover from control-frame loss on impaired links.
 
 Simulate loss to exercise repair:
 

@@ -264,6 +264,7 @@ class SpaceSyncSender:
             suppressed_duplicate_repairs = 0
             last_post_fin_signature: tuple[tuple[int, int], ...] | None = None
             last_post_fin_service_s = 0.0
+            last_post_fin_activity_s = time.monotonic()
             if completed_by_receiver_signal:
                 return SendResult(
                     transfer_id_hex=manifest.transfer_id.hex(),
@@ -279,6 +280,49 @@ class SpaceSyncSender:
             ):
                 if self._should_stop(stop_requested):
                     return self._aborted_result(manifest.transfer_id.hex(), len(chunks))
+                now = time.monotonic()
+                if now - last_post_fin_activity_s >= self.config.feedback_wait_s:
+                    idle_timeouts += 1
+                    LOGGER.debug(
+                        "transfer_id=%s post_fin_timeout idle=%d/%d",
+                        transfer_id_hex,
+                        idle_timeouts,
+                        self.config.max_feedback_idle_timeouts,
+                    )
+                    # Under lossy links, FIN or even all initial MANIFEST frames can be
+                    # dropped. Re-send control frames so receiver can either finalize
+                    # or request repairs for any chunks it did not track yet.
+                    if self._sendto_with_interrupt(
+                        sock=sock,
+                        payload=encode_manifest(manifest),
+                        destination=destination,
+                        stop_requested=stop_requested,
+                    ):
+                        LOGGER.debug(
+                            "transfer_id=%s resent_manifest_after_post_fin_timeout",
+                            transfer_id_hex,
+                        )
+                    else:
+                        return self._aborted_result(manifest.transfer_id.hex(), len(chunks))
+                    if self._sendto_with_interrupt(
+                        sock=sock,
+                        payload=encode_fin(manifest.transfer_id),
+                        destination=destination,
+                        stop_requested=stop_requested,
+                    ):
+                        LOGGER.debug(
+                            "transfer_id=%s resent_fin_after_post_fin_timeout",
+                            transfer_id_hex,
+                        )
+                    else:
+                        return self._aborted_result(manifest.transfer_id.hex(), len(chunks))
+                    last_post_fin_activity_s = now
+                    if idle_timeouts >= self.config.max_feedback_idle_timeouts:
+                        LOGGER.warning(
+                            "transfer_id=%s stopping_after_idle_timeouts",
+                            transfer_id_hex,
+                        )
+                        break
                 last_beacon_s = self._maybe_send_beacon(
                     sock=sock,
                     destination=destination,
@@ -288,31 +332,19 @@ class SpaceSyncSender:
                 try:
                     response_raw, response_addr = sock.recvfrom(65535)
                 except TimeoutError:
-                    idle_timeouts += 1
-                    LOGGER.debug(
-                        "transfer_id=%s post_fin_timeout idle=%d/%d",
-                        transfer_id_hex,
-                        idle_timeouts,
-                        self.config.max_feedback_idle_timeouts,
-                    )
-                    if idle_timeouts >= self.config.max_feedback_idle_timeouts:
-                        LOGGER.warning(
-                            "transfer_id=%s stopping_after_idle_timeouts",
-                            transfer_id_hex,
-                        )
-                        break
                     continue
                 try:
                     parsed = decode_frame(response_raw)
                 except ValueError:
                     continue
-                idle_timeouts = 0
                 if parsed.frame_type is None:
                     continue
                 if parsed.frame_type == FrameType.STATUS:
                     status = decode_status(parsed.payload)
                     if status.transfer_id != manifest.transfer_id:
                         continue
+                    idle_timeouts = 0
+                    last_post_fin_activity_s = time.monotonic()
                     LOGGER.debug(
                         "transfer_id=%s status=%s missing=%s",
                         transfer_id_hex,
@@ -331,6 +363,8 @@ class SpaceSyncSender:
                     complete_transfer_id = decode_transfer_complete(parsed.payload)
                     if complete_transfer_id != manifest.transfer_id:
                         continue
+                    idle_timeouts = 0
+                    last_post_fin_activity_s = time.monotonic()
                     LOGGER.debug("transfer_id=%s received_transfer_complete", transfer_id_hex)
                     completed = True
                     break
@@ -339,6 +373,8 @@ class SpaceSyncSender:
                 request = decode_repair_request(parsed.payload)
                 if request.transfer_id != manifest.transfer_id:
                     continue
+                idle_timeouts = 0
+                last_post_fin_activity_s = time.monotonic()
                 request_signature = tuple(request.missing_ranges)
                 now = time.monotonic()
                 if (
@@ -354,7 +390,9 @@ class SpaceSyncSender:
                             transfer_id_hex,
                             suppressed_duplicate_repairs,
                         )
-                    sock.sendto(encode_repair_done(manifest.transfer_id), response_addr)
+                    # Do not emit REPAIR_DONE when no repair data was sent. Sending
+                    # a synthetic done can create false progress on the receiver and
+                    # stretch convergence under heavy loss/corruption.
                     continue
                 LOGGER.debug(
                     "transfer_id=%s post_fin_repair_request missing=%s",

@@ -39,6 +39,13 @@ uv run ssync send ./example.bin --dest-host 127.0.0.1 --dest-port 9000 --feedbac
 
 Stop capture with `Ctrl-C` in Terminal B.
 
+Namespace lab capture (when using `ns_tx`/`ns_rx`):
+
+```bash
+sudo ip netns exec ns_tx tcpdump -i veth_tx -nn -s 0 -U -w ./ssync-ns-tx.pcap "udp port 9000"
+sudo ip netns exec ns_rx tcpdump -i veth_rx -nn -s 0 -U -w ./ssync-ns-rx.pcap "udp port 9000"
+```
+
 ## Inspecting the capture
 
 Basic packet list:
@@ -100,3 +107,8 @@ For namespace-based asymmetric link emulation and `tc -s` stats capture, see
 - Only sender packets, no receiver packets
   - Receiver may not be in feedback mode or not receiving frames.
   - Check server bind host/port and local firewall rules.
+- Sender appears stuck after `sent_fin`
+  - Capture both directions and verify whether receiver emits `REPAIR_REQUEST`,
+    `STATUS(COMPLETE)`, or `TRANSFER_COMPLETE`.
+  - If return-link impairment is high, increase sender tolerance:
+    `--feedback-wait-s 3 --max-feedback-idle-timeouts 10`.
