@@ -7,6 +7,8 @@ from ssync.space_sync.monitor import (
     TransferSnapshot,
     _build_hole_map,
     _build_hole_map_2d,
+    _estimate_overall_mode,
+    _estimate_transfer_mode,
     _read_transfer_snapshots,
 )
 
@@ -78,3 +80,46 @@ def test_build_hole_map_2d_shows_cursor() -> None:
     )
     hole_map = _build_hole_map_2d(snapshot, width=8, height=4)
     assert "▣" in hole_map.plain
+
+
+def test_estimate_transfer_mode_detects_feedback_backfill() -> None:
+    snapshot = TransferSnapshot(
+        transfer_id_hex="id",
+        file_name="f.bin",
+        file_size=2048,
+        total_chunks=100,
+        chunk_size=64,
+        received_chunks=40,
+        range_count=3,
+        received_ranges=[(0, 10), (15, 30), (35, 50)],
+        stream_cursor_chunk=20,
+    )
+    label, _style = _estimate_transfer_mode(snapshot)
+    assert label == "FEEDBACK"
+
+
+def test_estimate_overall_mode_prefers_feedback() -> None:
+    feedback_snapshot = TransferSnapshot(
+        transfer_id_hex="id-feedback",
+        file_name="f.bin",
+        file_size=2048,
+        total_chunks=100,
+        chunk_size=64,
+        received_chunks=40,
+        range_count=3,
+        received_ranges=[(0, 10), (15, 30), (35, 50)],
+        stream_cursor_chunk=20,
+    )
+    no_feedback_snapshot = TransferSnapshot(
+        transfer_id_hex="id-open",
+        file_name="g.bin",
+        file_size=1024,
+        total_chunks=32,
+        chunk_size=32,
+        received_chunks=8,
+        range_count=1,
+        received_ranges=[(0, 8)],
+        stream_cursor_chunk=7,
+    )
+    label, _style = _estimate_overall_mode([no_feedback_snapshot, feedback_snapshot])
+    assert label == "FEEDBACK"

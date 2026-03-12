@@ -25,6 +25,7 @@ _DETAIL_MAP_WIDTH = 96
 _DETAIL_MAP_HEIGHT = 18
 _COMPLETED_SCAN_ACTIVE_INTERVAL_S = 5.0
 _COMPLETED_SCAN_IDLE_INTERVAL_S = 15.0
+_INPUT_POLL_INTERVAL_S = 0.03
 
 
 @dataclass(slots=True)
@@ -44,6 +45,35 @@ class TransferSnapshot:
         if self.total_chunks <= 0:
             return 0.0
         return min(1.0, self.received_chunks / float(self.total_chunks))
+
+
+def _estimate_transfer_mode(snapshot: TransferSnapshot) -> tuple[str, str]:
+    if snapshot.total_chunks <= 0:
+        return ("EMPTY", "grey58")
+    if snapshot.range_count <= 1:
+        if snapshot.progress_ratio >= 0.999:
+            return ("COMPLETE", "green")
+        return ("NO-FEEDBACK", "yellow")
+    frontier_chunks = max(0, snapshot.stream_cursor_chunk + 1)
+    if snapshot.received_chunks > frontier_chunks:
+        # Backfill behind the forward cursor generally implies repair flow activity.
+        return ("FEEDBACK", "magenta")
+    return ("NO-FEEDBACK", "yellow")
+
+
+def _estimate_overall_mode(snapshots: list[TransferSnapshot]) -> tuple[str, str]:
+    if not snapshots:
+        return ("IDLE", "grey58")
+    modes = [_estimate_transfer_mode(snapshot)[0] for snapshot in snapshots]
+    if "FEEDBACK" in modes:
+        return ("FEEDBACK", "magenta")
+    if "NO-FEEDBACK" in modes:
+        return ("NO-FEEDBACK", "yellow")
+    if all(mode == "EMPTY" for mode in modes):
+        return ("EMPTY", "grey58")
+    if all(mode in {"COMPLETE", "EMPTY"} for mode in modes):
+        return ("COMPLETE", "green")
+    return ("NO-FEEDBACK", "yellow")
 
 
 def _safe_int(value: object, default: int = 0) -> int:
@@ -279,6 +309,7 @@ def _render_monitor(
     completed_count: int,
     completed_size: int,
 ) -> Group:
+    overall_mode_label, overall_mode_style = _estimate_overall_mode(snapshots)
     summary = Text()
     summary.append("active=", style="bold")
     summary.append(str(len(snapshots)), style="cyan")
@@ -286,6 +317,8 @@ def _render_monitor(
     summary.append(str(completed_count), style="cyan")
     summary.append("  completed_bytes=", style="bold")
     summary.append(_format_bytes(completed_size), style="cyan")
+    summary.append("  mode=", style="bold")
+    summary.append(overall_mode_label, style=overall_mode_style)
 
     table = Table(expand=True)
     table.add_column("File", overflow="fold")
@@ -375,10 +408,10 @@ class _KeyReader:
             return
         termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved_attrs)
 
-    def poll(self) -> str | None:
+    def poll(self, timeout_s: float = 0.0) -> str | None:
         if self._fd is None:
             return None
-        ready, _, _ = select.select([self._fd], [], [], 0.0)
+        ready, _, _ = select.select([self._fd], [], [], max(0.0, timeout_s))
         if not ready:
             return None
         try:
@@ -425,55 +458,75 @@ def run_monitor_tui(output_dir: Path, refresh_interval_s: float) -> int:
     completed_size = 0
     last_completed_scan_s = 0.0
     selected_index = 0
+    snapshots: list[TransferSnapshot] = []
+    next_refresh_s = 0.0
+    render_needed = True
     with _KeyReader() as keys:
         with Live(auto_refresh=False, screen=True) as live:
             while True:
-                key = keys.poll()
+                now = time.monotonic()
+                if now >= next_refresh_s:
+                    snapshots = _read_transfer_snapshots(output_dir)
+                    scan_interval_s = (
+                        _COMPLETED_SCAN_ACTIVE_INTERVAL_S
+                        if snapshots
+                        else _COMPLETED_SCAN_IDLE_INTERVAL_S
+                    )
+                    if (
+                        last_completed_scan_s <= 0
+                        or now - last_completed_scan_s >= scan_interval_s
+                    ):
+                        completed_count, completed_size = _count_completed_files(output_dir)
+                        last_completed_scan_s = now
+                    if snapshots:
+                        selected_index = max(0, min(selected_index, len(snapshots) - 1))
+                    else:
+                        selected_index = 0
+                    active_ids = {snapshot.transfer_id_hex for snapshot in snapshots}
+                    for snapshot in snapshots:
+                        sample = (
+                            now,
+                            snapshot.received_chunks * snapshot.chunk_size,
+                        )
+                        history = transfer_history.setdefault(snapshot.transfer_id_hex, deque())
+                        history.append(sample)
+                        cutoff = now - _RATE_WINDOW_S
+                        while len(history) > 2 and history[0][0] < cutoff:
+                            history.popleft()
+                        if len(history) >= 2:
+                            oldest_time_s, oldest_bytes = history[0]
+                            newest_time_s, newest_bytes = history[-1]
+                            delta_s = newest_time_s - oldest_time_s
+                            delta_bytes = newest_bytes - oldest_bytes
+                            if delta_s > 0 and delta_bytes > 0:
+                                throughput_bps[snapshot.transfer_id_hex] = (
+                                    delta_bytes * 8
+                                ) / delta_s
+                    stale_ids = [item for item in transfer_history if item not in active_ids]
+                    for stale_id in stale_ids:
+                        transfer_history.pop(stale_id, None)
+                        throughput_bps.pop(stale_id, None)
+                    next_refresh_s = now + refresh_interval_s
+                    render_needed = True
+                poll_timeout_s = 0.0 if render_needed else min(
+                    _INPUT_POLL_INTERVAL_S,
+                    max(0.0, next_refresh_s - time.monotonic()),
+                )
+                key = keys.poll(timeout_s=poll_timeout_s)
                 if key == "quit":
                     return 0
                 if key == "up":
                     selected_index -= 1
+                    render_needed = True
                 elif key == "down":
                     selected_index += 1
-                now = time.monotonic()
-                snapshots = _read_transfer_snapshots(output_dir)
-                scan_interval_s = (
-                    _COMPLETED_SCAN_ACTIVE_INTERVAL_S
-                    if snapshots
-                    else _COMPLETED_SCAN_IDLE_INTERVAL_S
-                )
-                if (
-                    last_completed_scan_s <= 0
-                    or now - last_completed_scan_s >= scan_interval_s
-                ):
-                    completed_count, completed_size = _count_completed_files(output_dir)
-                    last_completed_scan_s = now
+                    render_needed = True
                 if snapshots:
                     selected_index = max(0, min(selected_index, len(snapshots) - 1))
                 else:
                     selected_index = 0
-                active_ids = {snapshot.transfer_id_hex for snapshot in snapshots}
-                for snapshot in snapshots:
-                    sample = (
-                        now,
-                        snapshot.received_chunks * snapshot.chunk_size,
-                    )
-                    history = transfer_history.setdefault(snapshot.transfer_id_hex, deque())
-                    history.append(sample)
-                    cutoff = now - _RATE_WINDOW_S
-                    while len(history) > 2 and history[0][0] < cutoff:
-                        history.popleft()
-                    if len(history) >= 2:
-                        oldest_time_s, oldest_bytes = history[0]
-                        newest_time_s, newest_bytes = history[-1]
-                        delta_s = newest_time_s - oldest_time_s
-                        delta_bytes = newest_bytes - oldest_bytes
-                        if delta_s > 0 and delta_bytes > 0:
-                            throughput_bps[snapshot.transfer_id_hex] = (delta_bytes * 8) / delta_s
-                stale_ids = [item for item in transfer_history if item not in active_ids]
-                for stale_id in stale_ids:
-                    transfer_history.pop(stale_id, None)
-                    throughput_bps.pop(stale_id, None)
+                if not render_needed:
+                    continue
                 live.update(
                     _render_monitor(
                         output_dir=output_dir,
@@ -485,4 +538,4 @@ def run_monitor_tui(output_dir: Path, refresh_interval_s: float) -> int:
                     ),
                     refresh=True,
                 )
-                time.sleep(refresh_interval_s)
+                render_needed = False

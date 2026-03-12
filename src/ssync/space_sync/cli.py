@@ -192,7 +192,22 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="manifest_repeats",
         help="Alias for --manifest-repeats",
     )
-    send.add_argument("--feedback", action="store_true", help="Enable repair flow")
+    send_feedback = send.add_mutually_exclusive_group()
+    send_feedback.add_argument(
+        "--feedback",
+        action="store_const",
+        const=True,
+        default=None,
+        dest="feedback",
+        help="Force feedback/repair flow on",
+    )
+    send_feedback.add_argument(
+        "--no-feedback",
+        action="store_const",
+        const=False,
+        dest="feedback",
+        help="Force feedback/repair flow off",
+    )
     send.add_argument("--feedback-wait-s", type=float, default=2.0)
     send.add_argument(
         "--max-repair-rounds",
@@ -282,13 +297,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     send.add_argument("--json", action="store_true", dest="json_output")
     _add_log_level_arg(send)
-
-    sync = subparsers.add_parser(
-        "sync",
-        help="Compatibility alias for rsync-like sync behavior",
-    )
-    _add_sync_args(sync)
-    _add_log_level_arg(sync)
 
     monitor = subparsers.add_parser(
         "monitor",
@@ -529,17 +537,21 @@ def _add_sync_args(parser: argparse.ArgumentParser) -> None:
         dest="manifest_repeats",
         help="Alias for --manifest-repeats",
     )
-    parser.add_argument(
+    feedback_group = parser.add_mutually_exclusive_group()
+    feedback_group.add_argument(
         "--feedback",
-        action="store_true",
-        default=True,
-        help="Enable repair flow (default: enabled)",
-    )
-    parser.add_argument(
-        "--no-feedback",
-        action="store_false",
+        action="store_const",
+        const=True,
+        default=None,
         dest="feedback",
-        help="Disable feedback/repair flow",
+        help="Force feedback/repair flow on",
+    )
+    feedback_group.add_argument(
+        "--no-feedback",
+        action="store_const",
+        const=False,
+        dest="feedback",
+        help="Force feedback/repair flow off",
     )
     parser.add_argument("--feedback-wait-s", type=float, default=2.0)
     parser.add_argument(
@@ -791,12 +803,15 @@ def _run_server(args: argparse.Namespace) -> int:
 
 
 def _run_sender(args: argparse.Namespace) -> int:
+    feedback_forced_on = args.feedback is True
+    feedback_forced_off = args.feedback is False
     sender = SpaceSyncSender(
         config=SenderConfig(
             chunk_size=args.chunk_size,
             manifest_repeats=args.manifest_repeats,
             inter_packet_delay_s=args.inter_packet_delay_s,
-            enable_feedback=args.feedback,
+            enable_feedback=feedback_forced_on,
+            auto_feedback_discovery=not (feedback_forced_on or feedback_forced_off),
             feedback_wait_s=args.feedback_wait_s,
             max_repair_rounds=args.max_repair_rounds,
             max_feedback_idle_timeouts=args.max_feedback_idle_timeouts,
@@ -1105,12 +1120,15 @@ def _run_sync(args: argparse.Namespace) -> int:
         print("sync error: source directory contains no files")
         return 2
 
+    feedback_forced_on = args.feedback is True
+    feedback_forced_off = args.feedback is False
     sender = SpaceSyncSender(
         config=SenderConfig(
             chunk_size=args.chunk_size,
             manifest_repeats=args.manifest_repeats,
             inter_packet_delay_s=args.inter_packet_delay_s,
-            enable_feedback=args.feedback,
+            enable_feedback=feedback_forced_on,
+            auto_feedback_discovery=not (feedback_forced_on or feedback_forced_off),
             feedback_wait_s=args.feedback_wait_s,
             max_repair_rounds=args.max_repair_rounds,
             max_feedback_idle_timeouts=args.max_feedback_idle_timeouts,
@@ -1138,7 +1156,12 @@ def _run_sync(args: argparse.Namespace) -> int:
     skipped_count = 0
     dry_run_count = 0
     should_query_destination = bool(args.skip_unchanged)
-    open_loop_mode = not args.feedback
+    def _open_loop_mode_active() -> bool:
+        if feedback_forced_off:
+            return True
+        if feedback_forced_on:
+            return False
+        return not bool(getattr(sender, "_auto_feedback_active", False))
     if args.open_loop_max_rounds < 0:
         print("sync error: --open-loop-max-rounds must be >= 0")
         return 2
@@ -1154,7 +1177,7 @@ def _run_sync(args: argparse.Namespace) -> int:
     if args.primary_feedback_max_seconds < 0:
         print("sync error: --primary-feedback-max-seconds must be >= 0")
         return 2
-    open_loop_state = _load_open_loop_state(args.state_file) if open_loop_mode else {}
+    open_loop_state = _load_open_loop_state(args.state_file)
     round_index = 0
     should_stop = False
 
@@ -1165,11 +1188,17 @@ def _run_sync(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    collect_item_results = (not open_loop_mode) or args.dry_run or args.open_loop_max_rounds > 0
+    collect_item_results = (
+        (not _open_loop_mode_active())
+        or args.dry_run
+        or args.open_loop_max_rounds > 0
+    )
     item_results: list[dict[str, object]] | None = [] if collect_item_results else None
     total_items = sum(len(items) for _, items in sync_plans)
     revisit_enabled = (
-        args.feedback and not args.dry_run and args.revisit_incomplete_passes > 0
+        (not feedback_forced_off)
+        and not args.dry_run
+        and args.revisit_incomplete_passes > 0
     )
     revisit_queue: collections.deque[_RevisitEntry] = collections.deque()
     revisit_active_keys: set[tuple[str, str]] = set()
@@ -1272,7 +1301,7 @@ def _run_sync(args: argparse.Namespace) -> int:
                     destination_port=args.dest_port,
                     counts=open_loop_state,
                 )
-                if open_loop_mode
+                if _open_loop_mode_active()
                 else items
             )
             for source_file, remote_name in ordered_items:
@@ -1343,7 +1372,7 @@ def _run_sync(args: argparse.Namespace) -> int:
                         "rounds": result.repair_rounds,
                         "completed": result.completed,
                     }
-                    if open_loop_mode:
+                    if _open_loop_mode_active():
                         key = _retransmission_key(
                             destination_host=destination_host,
                             destination_port=args.dest_port,
@@ -1366,7 +1395,7 @@ def _run_sync(args: argparse.Namespace) -> int:
             break
         if should_stop:
             break
-        if not open_loop_mode:
+        if not _open_loop_mode_active():
             break
         if args.open_loop_max_rounds > 0 and round_index >= args.open_loop_max_rounds:
             break
@@ -1440,7 +1469,10 @@ def _run_monitor(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
-    subcommands = {"receive", "server", "ssyncd", "send", "sync", "monitor"}
+    if argv and argv[0] == "sync":
+        print("sync error: 'ssync sync' is deprecated; use 'ssync <sources> <destination>'")
+        return 2
+    subcommands = {"receive", "server", "ssyncd", "send", "monitor"}
     if argv and argv[0] in subcommands:
         parser = _build_parser()
         args = parser.parse_args(argv)

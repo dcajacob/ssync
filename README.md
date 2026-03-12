@@ -64,8 +64,10 @@ Sync a directory tree to a destination root path:
 uv run ssync -r ./payloads 127.0.0.1:missions/pass-001/ --dest-port 9000
 ```
 
-The `sync` command enables repair feedback by default. Use `--no-feedback` for strict
-open-loop behavior.
+The top-level `ssync SRC DEST` workflow enables auto feedback discovery by default:
+it starts open-loop, promotes to feedback when uplink packets/beacons are observed,
+and can fall back to open-loop if uplink goes idle. Use `--feedback` or
+`--no-feedback` to force either mode.
 
 Rsync-style convenience options:
 
@@ -80,8 +82,7 @@ uv run ssync -r --include "*.txt" --exclude "tmp/*" ./payloads 127.0.0.1:mission
 uv run ssync -r --skip-unchanged --checksum ./payloads 127.0.0.1:missions/pass-001/
 ```
 
-Compatibility note: `uv run ssync sync SRC DEST` still works as an alias, but
-`uv run ssync SRC DEST` is now the primary form.
+`uv run ssync sync SRC DEST` is deprecated; use `uv run ssync SRC DEST`.
 
 By default, sync does not pre-query the destination; it streams files immediately.
 Use `--skip-unchanged` (optionally with `--checksum`) when you want pre-transfer

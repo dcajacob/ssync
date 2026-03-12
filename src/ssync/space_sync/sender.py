@@ -34,6 +34,8 @@ LOGGER = logging.getLogger(__name__)
 class SpaceSyncSender:
     def __init__(self, config: SenderConfig | None = None) -> None:
         self.config = config or SenderConfig()
+        self._auto_feedback_active = False
+        self._last_auto_uplink_activity_s: float | None = None
 
     def send_file(
         self,
@@ -83,17 +85,31 @@ class SpaceSyncSender:
             if max_feedback_total_rounds_override is None
             else max(0, max_feedback_total_rounds_override)
         )
+        auto_feedback_enabled = self.config.auto_feedback_discovery
+        auto_feedback_timeout_s = max(0.0, self.config.auto_feedback_idle_timeout_s)
+        feedback_active = self.config.enable_feedback
+        if auto_feedback_enabled and not self.config.enable_feedback:
+            feedback_active = self._auto_feedback_active
+            if (
+                feedback_active
+                and auto_feedback_timeout_s > 0
+                and self._last_auto_uplink_activity_s is not None
+                and (time.monotonic() - self._last_auto_uplink_activity_s)
+                >= auto_feedback_timeout_s
+            ):
+                feedback_active = False
+        last_uplink_activity_s: float | None = time.monotonic() if feedback_active else None
         paced_start_s = time.monotonic()
         paced_data_bytes = 0
         transfer_id_hex = manifest.transfer_id.hex()
         feedback_deadline_s = (
             (paced_start_s + effective_max_feedback_seconds)
-            if (self.config.enable_feedback and effective_max_feedback_seconds > 0)
+            if (feedback_active and effective_max_feedback_seconds > 0)
             else None
         )
         budget_stop_reason: str | None = None
         prioritize_forward_data = (
-            self.config.enable_feedback
+            feedback_active
             and send_initial_data
             and (
                 effective_max_feedback_seconds > 0
@@ -104,7 +120,7 @@ class SpaceSyncSender:
 
         def _feedback_budget_exhausted() -> bool:
             nonlocal budget_stop_reason
-            if not self.config.enable_feedback:
+            if not feedback_active:
                 return False
             if not initial_data_phase_complete:
                 return False
@@ -124,15 +140,16 @@ class SpaceSyncSender:
                 return True
             return False
         LOGGER.info(
-            "send start transfer_id=%s file=%s remote=%s chunks=%d feedback=%s",
+            "send start transfer_id=%s file=%s remote=%s chunks=%d feedback=%s auto=%s",
             transfer_id_hex,
             file_path,
             manifest.file_name,
             total_chunks,
-            self.config.enable_feedback,
+            feedback_active,
+            auto_feedback_enabled,
         )
         if (
-            self.config.enable_feedback
+            feedback_active
             and self.config.inter_packet_delay_s <= 0
             and total_chunks > 32768
         ):
@@ -151,12 +168,65 @@ class SpaceSyncSender:
                     chunk_size=self.config.chunk_size,
                     chunk_index=index,
                 )
-            if self.config.enable_feedback:
+            if feedback_active:
                 sock.settimeout(self.config.feedback_wait_s)
+                sock.setblocking(False)
             else:
                 sock.setblocking(True)
                 # Use finite timeout so Ctrl-C/stop checks can break blocked sends.
                 sock.settimeout(0.5)
+
+            def _set_feedback_mode(active: bool, reason: str) -> None:
+                nonlocal feedback_active, feedback_deadline_s, prioritize_forward_data
+                nonlocal last_uplink_activity_s
+                if active == feedback_active:
+                    return
+                feedback_active = active
+                if feedback_active:
+                    sock.settimeout(self.config.feedback_wait_s)
+                    sock.setblocking(False)
+                    last_uplink_activity_s = time.monotonic()
+                    if effective_max_feedback_seconds > 0:
+                        feedback_deadline_s = (
+                            time.monotonic() + effective_max_feedback_seconds
+                        )
+                    prioritize_forward_data = (
+                        send_initial_data
+                        and (
+                            effective_max_feedback_seconds > 0
+                            or effective_max_feedback_total_rounds > 0
+                        )
+                    )
+                else:
+                    sock.setblocking(True)
+                    sock.settimeout(0.5)
+                    feedback_deadline_s = None
+                    prioritize_forward_data = False
+                LOGGER.info(
+                    "transfer_id=%s feedback_mode=%s reason=%s",
+                    transfer_id_hex,
+                    "enabled" if feedback_active else "disabled",
+                    reason,
+                )
+
+            def _probe_uplink_packets(max_packets: int = 8) -> bool:
+                # Probe opportunistically while running in open-loop socket mode.
+                if not hasattr(sock, "recvfrom"):
+                    return False
+                sock.setblocking(False)
+                saw_uplink = False
+                for _ in range(max(1, max_packets)):
+                    try:
+                        _response_raw, _response_addr = sock.recvfrom(65535)
+                    except (BlockingIOError, TimeoutError):
+                        break
+                    saw_uplink = True
+                sock.setblocking(True)
+                sock.settimeout(0.5)
+                return saw_uplink
+
+            if auto_feedback_enabled and not feedback_active and _probe_uplink_packets():
+                _set_feedback_mode(True, "auto_uplink_packet_detected")
             last_beacon_s = 0.0
             last_metadata_s = time.monotonic()
             chunks_since_metadata = 0
@@ -178,6 +248,8 @@ class SpaceSyncSender:
                 )
                 if self.config.inter_packet_delay_s > 0:
                     time.sleep(self.config.inter_packet_delay_s)
+                if auto_feedback_enabled and not feedback_active and _probe_uplink_packets():
+                    _set_feedback_mode(True, "auto_uplink_packet_detected")
             last_metadata_s = time.monotonic()
             chunks_since_metadata = 0
             if total_chunks == 0:
@@ -194,11 +266,18 @@ class SpaceSyncSender:
                 )
 
             dropped = 0
-            if self.config.enable_feedback:
-                sock.setblocking(False)
             completed_by_receiver_signal = False
             if send_initial_data:
+                next_probe_s = time.monotonic()
                 for chunk_index in range(total_chunks):
+                    if (
+                        auto_feedback_enabled
+                        and feedback_active
+                        and auto_feedback_timeout_s > 0
+                        and last_uplink_activity_s is not None
+                        and (time.monotonic() - last_uplink_activity_s) >= auto_feedback_timeout_s
+                    ):
+                        _set_feedback_mode(False, "auto_uplink_idle_timeout")
                     if self._should_stop(stop_requested):
                         return self._aborted_result(manifest.transfer_id.hex(), total_chunks)
                     chunk_payload = chunk_reader(chunk_index)
@@ -210,12 +289,13 @@ class SpaceSyncSender:
                         transfer_id=manifest.transfer_id,
                         last_beacon_s=last_beacon_s,
                     )
-                    if self.config.enable_feedback and not prioritize_forward_data:
+                    if feedback_active and not prioritize_forward_data:
                         (
                             repaired_now,
                             rounds_now,
                             paced_data_bytes,
                             completed_now,
+                            saw_uplink_now,
                         ) = self._drain_repair_requests(
                             sock=sock,
                             manifest=manifest,
@@ -227,6 +307,8 @@ class SpaceSyncSender:
                             max_rounds=self.config.midstream_repair_max_rounds_per_poll,
                             max_chunks=self.config.midstream_repair_max_chunks_per_poll,
                         )
+                        if saw_uplink_now:
+                            last_uplink_activity_s = time.monotonic()
                         repaired_chunks += repaired_now
                         repair_rounds += rounds_now
                         if completed_now:
@@ -251,6 +333,22 @@ class SpaceSyncSender:
                                 budget_stop_reason,
                             )
                             break
+                    elif (
+                        auto_feedback_enabled
+                        and not feedback_active
+                        and (
+                            (
+                                self.config.auto_feedback_probe_interval_chunks > 0
+                                and (chunk_index + 1)
+                                % self.config.auto_feedback_probe_interval_chunks
+                                == 0
+                            )
+                            or time.monotonic() >= next_probe_s
+                        )
+                    ):
+                        next_probe_s = time.monotonic() + 0.25
+                        if _probe_uplink_packets():
+                            _set_feedback_mode(True, "auto_uplink_packet_detected")
                     should_drop = (
                         self.config.drop_every_nth_data > 0
                         and (chunk_index + 1) % self.config.drop_every_nth_data == 0
@@ -295,7 +393,7 @@ class SpaceSyncSender:
                 initial_data_phase_complete = True
 
             if (
-                self.config.enable_feedback
+                feedback_active
                 and not completed_by_receiver_signal
                 and not _feedback_budget_exhausted()
             ):
@@ -310,6 +408,7 @@ class SpaceSyncSender:
                     rounds_now,
                     paced_data_bytes,
                     completed_now,
+                    saw_uplink_now,
                 ) = self._drain_repair_requests(
                     sock=sock,
                     manifest=manifest,
@@ -321,6 +420,8 @@ class SpaceSyncSender:
                     max_rounds=self.config.midstream_repair_max_rounds_per_poll,
                     max_chunks=self.config.midstream_repair_max_chunks_per_poll,
                 )
+                if saw_uplink_now:
+                    last_uplink_activity_s = time.monotonic()
                 repaired_chunks += repaired_now
                 repair_rounds += rounds_now
                 if completed_now:
@@ -333,7 +434,7 @@ class SpaceSyncSender:
                         rounds_now,
                         repaired_now,
                     )
-            elif self.config.enable_feedback and _feedback_budget_exhausted():
+            elif feedback_active and _feedback_budget_exhausted():
                 LOGGER.debug(
                     "transfer_id=%s skipping_pre_fin_feedback_due_to_budget %s",
                     transfer_id_hex,
@@ -345,7 +446,17 @@ class SpaceSyncSender:
                     transfer_id_hex,
                 )
 
-            if not self.config.enable_feedback:
+            if (
+                auto_feedback_enabled
+                and not feedback_active
+                and _probe_uplink_packets()
+            ):
+                _set_feedback_mode(True, "auto_uplink_packet_detected")
+
+            if not feedback_active:
+                if auto_feedback_enabled:
+                    self._auto_feedback_active = False
+                    self._last_auto_uplink_activity_s = last_uplink_activity_s
                 LOGGER.info(
                     "send done transfer_id=%s completed=%s dropped_initial=%d",
                     transfer_id_hex,
@@ -381,6 +492,15 @@ class SpaceSyncSender:
             while effective_max_repair_rounds <= 0 or (
                 post_fin_repair_rounds < effective_max_repair_rounds
             ):
+                if (
+                    auto_feedback_enabled
+                    and feedback_active
+                    and auto_feedback_timeout_s > 0
+                    and last_uplink_activity_s is not None
+                    and (time.monotonic() - last_uplink_activity_s) >= auto_feedback_timeout_s
+                ):
+                    _set_feedback_mode(False, "auto_uplink_idle_timeout")
+                    break
                 if _feedback_budget_exhausted():
                     LOGGER.warning(
                         "transfer_id=%s reached_feedback_budget %s",
@@ -436,6 +556,7 @@ class SpaceSyncSender:
                     continue
                 if parsed.frame_type is None:
                     continue
+                last_uplink_activity_s = time.monotonic()
                 if parsed.frame_type == FrameType.STATUS:
                     status = decode_status(parsed.payload)
                     if status.kind != StatusKind.TRANSFER:
@@ -506,8 +627,11 @@ class SpaceSyncSender:
             completed,
             repaired_chunks,
             repair_rounds,
-            suppressed_duplicate_repairs if self.config.enable_feedback else 0,
+            suppressed_duplicate_repairs if feedback_active else 0,
         )
+        if auto_feedback_enabled:
+            self._auto_feedback_active = feedback_active
+            self._last_auto_uplink_activity_s = last_uplink_activity_s
         return SendResult(
             transfer_id_hex=manifest.transfer_id.hex(),
             total_chunks=total_chunks,
@@ -699,10 +823,11 @@ class SpaceSyncSender:
         paced_data_bytes: int,
         max_rounds: int,
         max_chunks: int,
-    ) -> tuple[int, int, int, bool]:
+    ) -> tuple[int, int, int, bool, bool]:
         repaired_chunks = 0
         repair_rounds = 0
         completed = False
+        saw_uplink = False
         while True:
             if max_rounds > 0 and repair_rounds >= max_rounds:
                 break
@@ -712,6 +837,7 @@ class SpaceSyncSender:
                 response_raw, _response_addr = sock.recvfrom(65535)
             except (BlockingIOError, TimeoutError):
                 break
+            saw_uplink = True
             try:
                 parsed = decode_frame(response_raw)
             except ValueError:
@@ -751,7 +877,7 @@ class SpaceSyncSender:
                 repaired_chunks += repaired_now
                 repair_rounds += 1
                 continue
-        return repaired_chunks, repair_rounds, paced_data_bytes, completed
+        return repaired_chunks, repair_rounds, paced_data_bytes, completed, saw_uplink
 
     def _apply_rate_limit(
         self,

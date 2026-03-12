@@ -95,9 +95,10 @@ def test_collect_sync_items_directory(tmp_path: Path) -> None:
 
 def test_send_and_sync_support_json_flag() -> None:
     parser = _build_parser()
+    rsync_parser = _build_rsync_parser()
     send_args = parser.parse_args(["send", "data.bin", "--json", "--beacon-interval-s", "2.5"])
-    sync_args = parser.parse_args(
-        ["sync", "src", "127.0.0.1:dst", "--json", "--beacon-interval-s", "0"]
+    sync_args = rsync_parser.parse_args(
+        ["src", "127.0.0.1:dst", "--json", "--beacon-interval-s", "0"]
     )
     assert send_args.json_output is True
     assert sync_args.json_output is True
@@ -167,8 +168,11 @@ def test_parser_supports_adaptive_leading_hole_repair_flags() -> None:
 
 def test_periodic_metadata_default_is_enabled() -> None:
     parser = _build_parser()
+    rsync_parser = _build_rsync_parser()
     send_args = parser.parse_args(["send", "data.bin"])
-    sync_args = parser.parse_args(["sync", "src", "127.0.0.1:dst"])
+    sync_args = rsync_parser.parse_args(["src", "127.0.0.1:dst"])
+    assert send_args.feedback is None
+    assert sync_args.feedback is None
     assert send_args.periodic_metadata_interval_s == pytest.approx(10.0)
     assert sync_args.periodic_metadata_interval_s == pytest.approx(10.0)
     assert send_args.revisit_incomplete_passes == 2
@@ -179,6 +183,23 @@ def test_periodic_metadata_default_is_enabled() -> None:
     assert sync_args.revisit_max_rounds_per_pass == 8
     assert sync_args.primary_feedback_max_rounds == 64
     assert sync_args.primary_feedback_max_seconds == pytest.approx(8.0)
+
+
+def test_parser_feedback_flags_support_auto_and_overrides() -> None:
+    parser = _build_parser()
+    rsync_parser = _build_rsync_parser()
+    send_auto = parser.parse_args(["send", "data.bin"])
+    send_on = parser.parse_args(["send", "data.bin", "--feedback"])
+    send_off = parser.parse_args(["send", "data.bin", "--no-feedback"])
+    sync_auto = rsync_parser.parse_args(["src", "127.0.0.1:dst"])
+    sync_on = rsync_parser.parse_args(["src", "127.0.0.1:dst", "--feedback"])
+    sync_off = rsync_parser.parse_args(["src", "127.0.0.1:dst", "--no-feedback"])
+    assert send_auto.feedback is None
+    assert send_on.feedback is True
+    assert send_off.feedback is False
+    assert sync_auto.feedback is None
+    assert sync_on.feedback is True
+    assert sync_off.feedback is False
 
 
 def test_parser_supports_ssyncd_alias_subcommand() -> None:
@@ -225,6 +246,13 @@ def test_main_routes_top_level_to_sync(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(cli_module, "_run_sync", _fake_run_sync)
     assert cli_module.main(["src", "127.0.0.1:dst"]) == 0
+
+
+def test_main_rejects_sync_subcommand(capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = cli_module.main(["sync", "src", "127.0.0.1:dst"])
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "deprecated" in captured.out
 
 
 def test_main_routes_ssyncd_to_server(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -445,6 +473,8 @@ def test_run_sync_supports_multiple_destinations(
             "127.0.0.1:./",
             "--destination",
             "127.0.0.2:./",
+            "--open-loop-max-rounds",
+            "1",
         ]
     )
     exit_code = cli_module._run_sync(args)
@@ -520,6 +550,8 @@ def test_run_sync_feedback_revisits_incomplete_transfers(
             "2",
             "--revisit-max-rounds-per-pass",
             "3",
+            "--open-loop-max-rounds",
+            "1",
         ]
     )
     exit_code = cli_module._run_sync(args)
@@ -534,6 +566,68 @@ def test_run_sync_feedback_revisits_incomplete_transfers(
     assert revisit_calls[0]["max_repair_rounds_override"] == 3
     assert revisit_calls[0]["max_feedback_seconds_override"] == pytest.approx(0.0)
     assert revisit_calls[0]["max_feedback_total_rounds_override"] == 0
+
+
+def test_run_sync_auto_feedback_transition_stops_open_loop_repeats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "payload"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "a.bin").write_bytes(b"a" * 1024)
+
+    send_calls = 0
+
+    class FakeSender:
+        def __init__(self, config: object) -> None:
+            self.config = config
+            self._auto_feedback_active = False
+
+        def send_file(
+            self,
+            file_path: Path,
+            destination_host: str,
+            destination_port: int,
+            remote_name: str | None = None,
+            stop_requested: object | None = None,
+            **_kwargs: object,
+        ) -> SimpleNamespace:
+            nonlocal send_calls
+            send_calls += 1
+            if send_calls == 1:
+                return SimpleNamespace(
+                    transfer_id_hex="11" * 16,
+                    total_chunks=10,
+                    repaired_chunks=0,
+                    repair_rounds=0,
+                    completed=True,
+                )
+            self._auto_feedback_active = True
+            return SimpleNamespace(
+                transfer_id_hex="22" * 16,
+                total_chunks=10,
+                repaired_chunks=5,
+                repair_rounds=2,
+                completed=True,
+            )
+
+        def query_remote_file(self, **kwargs: object) -> object:
+            raise AssertionError("query_remote_file should not be called without --skip-unchanged")
+
+    monkeypatch.setattr(cli_module, "SpaceSyncSender", FakeSender)
+    parser = _build_rsync_parser()
+    args = parser.parse_args(
+        [
+            "-r",
+            str(source_dir),
+            "127.0.0.1:./",
+            "--open-loop-max-rounds",
+            "0",
+        ]
+    )
+    exit_code = cli_module._run_sync(args)
+    assert exit_code == 0
+    assert send_calls == 2
 
 
 def test_run_sync_expands_source_wildcards(

@@ -13,11 +13,13 @@ from ssync.space_sync.frames import (
     decode_data_chunk,
     decode_frame,
     decode_manifest,
+    encode_beacon,
     encode_status,
 )
 from ssync.space_sync.manifest import TransferManifest
 from ssync.space_sync.sender import SpaceSyncSender
 from ssync.space_sync.types import (
+    BeaconRole,
     FrameType,
     RemoteFileInfo,
     SenderConfig,
@@ -134,7 +136,7 @@ def test_drain_repair_requests_stops_on_transfer_complete_signal() -> None:
         def sendto(self, _payload: bytes, _destination: tuple[str, int]) -> int:
             return 0
 
-    repaired, rounds, paced, completed = sender._drain_repair_requests(
+    repaired, rounds, paced, completed, saw_uplink = sender._drain_repair_requests(
         sock=FakeSocket(),  # type: ignore[arg-type]
         manifest=manifest,
         total_chunks=3,
@@ -150,6 +152,7 @@ def test_drain_repair_requests_stops_on_transfer_complete_signal() -> None:
     assert rounds == 0
     assert paced == 0
     assert completed is True
+    assert saw_uplink is True
 
 
 def test_drain_repair_requests_services_incomplete_status_ranges() -> None:
@@ -179,7 +182,7 @@ def test_drain_repair_requests_services_incomplete_status_ranges() -> None:
             sent_payloads.append(payload)
             return len(payload)
 
-    repaired, rounds, paced, completed = sender._drain_repair_requests(
+    repaired, rounds, paced, completed, saw_uplink = sender._drain_repair_requests(
         sock=FakeSocket(),  # type: ignore[arg-type]
         manifest=manifest,
         total_chunks=3,
@@ -195,6 +198,7 @@ def test_drain_repair_requests_services_incomplete_status_ranges() -> None:
     assert rounds == 1
     assert paced == 2
     assert completed is False
+    assert saw_uplink is True
     assert sent_payloads
 
 
@@ -574,6 +578,109 @@ def test_send_file_budget_does_not_interrupt_initial_data_pass(tmp_path: Path) -
     assert result.completed is False
     assert len(sent_data_indexes) == 8
     assert sent_data_indexes == list(range(8))
+
+
+def test_send_file_auto_feedback_promotes_on_uplink_packet(tmp_path: Path) -> None:
+    source_path = tmp_path / "auto-promote.bin"
+    source_path.write_bytes(b"x" * 1024)
+    sender = SpaceSyncSender(
+        SenderConfig(
+            chunk_size=256,
+            enable_feedback=False,
+            auto_feedback_discovery=True,
+            auto_feedback_probe_interval_chunks=1,
+            feedback_wait_s=0.01,
+            max_feedback_idle_timeouts=1,
+            manifest_repeats=1,
+        )
+    )
+
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.transfer_id: bytes | None = None
+            self.sent_uplink = False
+
+        def __enter__(self) -> FakeSocket:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def settimeout(self, _value: float | None) -> None:
+            return None
+
+        def setblocking(self, _flag: bool) -> None:
+            return None
+
+        def sendto(self, payload: bytes, _destination: tuple[str, int]) -> int:
+            parsed = decode_frame(payload)
+            if parsed.frame_type == FrameType.METADATA:
+                self.transfer_id = decode_manifest(parsed.payload).transfer_id
+            return len(payload)
+
+        def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+            if not self.sent_uplink and self.transfer_id is not None:
+                self.sent_uplink = True
+                return (
+                    encode_beacon(BeaconRole.RECEIVER, self.transfer_id),
+                    ("127.0.0.1", 9000),
+                )
+            raise BlockingIOError
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    try:
+        sender.send_file(source_path, "127.0.0.1", 9000)
+    finally:
+        monkeypatch.undo()
+
+    assert sender._auto_feedback_active is True
+
+
+def test_send_file_auto_feedback_demotes_after_idle_timeout(tmp_path: Path) -> None:
+    source_path = tmp_path / "auto-demote.bin"
+    source_path.write_bytes(b"x" * 512)
+    sender = SpaceSyncSender(
+        SenderConfig(
+            chunk_size=256,
+            enable_feedback=False,
+            auto_feedback_discovery=True,
+            auto_feedback_idle_timeout_s=0.01,
+            auto_feedback_probe_interval_chunks=0,
+            manifest_repeats=1,
+        )
+    )
+    sender._auto_feedback_active = True
+    sender._last_auto_uplink_activity_s = time.monotonic() - 1.0
+
+    class FakeSocket:
+        def __enter__(self) -> FakeSocket:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def settimeout(self, _value: float | None) -> None:
+            return None
+
+        def setblocking(self, _flag: bool) -> None:
+            return None
+
+        def sendto(self, payload: bytes, _destination: tuple[str, int]) -> int:
+            return len(payload)
+
+        def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+            raise BlockingIOError
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    try:
+        result = sender.send_file(source_path, "127.0.0.1", 9000)
+    finally:
+        monkeypatch.undo()
+
+    assert result.completed is True
+    assert sender._auto_feedback_active is False
 
 
 def test_send_file_honors_stop_requested(tmp_path: Path) -> None:
