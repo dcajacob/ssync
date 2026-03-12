@@ -26,6 +26,8 @@ _DETAIL_MAP_HEIGHT = 18
 _COMPLETED_SCAN_ACTIVE_INTERVAL_S = 5.0
 _COMPLETED_SCAN_IDLE_INTERVAL_S = 15.0
 _INPUT_POLL_INTERVAL_S = 0.03
+_MODE_FEEDBACK_STICKY_S = 10.0
+_MODE_MIN_SWITCH_DWELL_S = 2.0
 
 
 @dataclass(slots=True)
@@ -74,6 +76,27 @@ def _estimate_overall_mode(snapshots: list[TransferSnapshot]) -> tuple[str, str]
     if all(mode in {"COMPLETE", "EMPTY"} for mode in modes):
         return ("COMPLETE", "green")
     return ("NO-FEEDBACK", "yellow")
+
+
+def _stabilize_overall_mode(
+    *,
+    displayed_mode: tuple[str, str],
+    candidate_mode: tuple[str, str],
+    now_s: float,
+    displayed_since_s: float,
+    last_feedback_seen_s: float,
+) -> tuple[tuple[str, str], float, float]:
+    candidate_label, _candidate_style = candidate_mode
+    current_label, _current_style = displayed_mode
+    if candidate_label == "FEEDBACK":
+        return candidate_mode, now_s, now_s
+    if now_s - last_feedback_seen_s < _MODE_FEEDBACK_STICKY_S:
+        return ("FEEDBACK", "magenta"), displayed_since_s, last_feedback_seen_s
+    if candidate_label == current_label:
+        return displayed_mode, displayed_since_s, last_feedback_seen_s
+    if now_s - displayed_since_s < _MODE_MIN_SWITCH_DWELL_S:
+        return displayed_mode, displayed_since_s, last_feedback_seen_s
+    return candidate_mode, now_s, last_feedback_seen_s
 
 
 def _safe_int(value: object, default: int = 0) -> int:
@@ -308,8 +331,12 @@ def _render_monitor(
     selected_index: int,
     completed_count: int,
     completed_size: int,
+    overall_mode: tuple[str, str] | None = None,
 ) -> Group:
-    overall_mode_label, overall_mode_style = _estimate_overall_mode(snapshots)
+    if overall_mode is None:
+        overall_mode_label, overall_mode_style = _estimate_overall_mode(snapshots)
+    else:
+        overall_mode_label, overall_mode_style = overall_mode
     summary = Text()
     summary.append("active=", style="bold")
     summary.append(str(len(snapshots)), style="cyan")
@@ -459,6 +486,9 @@ def run_monitor_tui(output_dir: Path, refresh_interval_s: float) -> int:
     last_completed_scan_s = 0.0
     selected_index = 0
     snapshots: list[TransferSnapshot] = []
+    displayed_mode: tuple[str, str] = ("IDLE", "grey58")
+    displayed_mode_since_s = time.monotonic()
+    last_feedback_seen_s = float("-inf")
     next_refresh_s = 0.0
     render_needed = True
     with _KeyReader() as keys:
@@ -506,6 +536,18 @@ def run_monitor_tui(output_dir: Path, refresh_interval_s: float) -> int:
                     for stale_id in stale_ids:
                         transfer_history.pop(stale_id, None)
                         throughput_bps.pop(stale_id, None)
+                    candidate_mode = _estimate_overall_mode(snapshots)
+                    (
+                        displayed_mode,
+                        displayed_mode_since_s,
+                        last_feedback_seen_s,
+                    ) = _stabilize_overall_mode(
+                        displayed_mode=displayed_mode,
+                        candidate_mode=candidate_mode,
+                        now_s=now,
+                        displayed_since_s=displayed_mode_since_s,
+                        last_feedback_seen_s=last_feedback_seen_s,
+                    )
                     next_refresh_s = now + refresh_interval_s
                     render_needed = True
                 poll_timeout_s = 0.0 if render_needed else min(
@@ -535,6 +577,7 @@ def run_monitor_tui(output_dir: Path, refresh_interval_s: float) -> int:
                         selected_index=selected_index,
                         completed_count=completed_count,
                         completed_size=completed_size,
+                        overall_mode=displayed_mode,
                     ),
                     refresh=True,
                 )

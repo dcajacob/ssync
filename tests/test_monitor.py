@@ -10,6 +10,7 @@ from ssync.space_sync.monitor import (
     _estimate_overall_mode,
     _estimate_transfer_mode,
     _read_transfer_snapshots,
+    _stabilize_overall_mode,
 )
 
 
@@ -123,3 +124,22 @@ def test_estimate_overall_mode_prefers_feedback() -> None:
     )
     label, _style = _estimate_overall_mode([no_feedback_snapshot, feedback_snapshot])
     assert label == "FEEDBACK"
+
+
+def test_stabilize_overall_mode_holds_feedback_briefly_after_loss() -> None:
+    displayed, since_s, last_feedback_s = _stabilize_overall_mode(
+        displayed_mode=("NO-FEEDBACK", "yellow"),
+        candidate_mode=("FEEDBACK", "magenta"),
+        now_s=100.0,
+        displayed_since_s=95.0,
+        last_feedback_seen_s=float("-inf"),
+    )
+    assert displayed[0] == "FEEDBACK"
+    displayed, since_s, last_feedback_s = _stabilize_overall_mode(
+        displayed_mode=displayed,
+        candidate_mode=("NO-FEEDBACK", "yellow"),
+        now_s=104.0,
+        displayed_since_s=since_s,
+        last_feedback_seen_s=last_feedback_s,
+    )
+    assert displayed[0] == "FEEDBACK"
