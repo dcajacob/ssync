@@ -527,6 +527,81 @@ def test_send_file_feedback_round_budget_stops_primary_attempt(tmp_path: Path) -
     assert sent_data_indexes == [0]
 
 
+def test_send_file_parallel_queue_repairs_while_prioritizing_data(tmp_path: Path) -> None:
+    source_path = tmp_path / "queued-midstream.bin"
+    source_path.write_bytes(b"abcdefgh")
+    sender = SpaceSyncSender(
+        SenderConfig(
+            chunk_size=4,
+            enable_feedback=True,
+            manifest_repeats=1,
+            feedback_wait_s=0.05,
+            max_feedback_idle_timeouts=1,
+        )
+    )
+    data_indexes_sent: list[int] = []
+
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.transfer_id: bytes | None = None
+            self._served_status = False
+
+        def __enter__(self) -> FakeSocket:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def settimeout(self, _value: float | None) -> None:
+            return None
+
+        def setblocking(self, _flag: bool) -> None:
+            return None
+
+        def sendto(self, payload: bytes, _destination: tuple[str, int]) -> int:
+            frame = decode_frame(payload)
+            if frame.frame_type == FrameType.METADATA:
+                self.transfer_id = decode_manifest(frame.payload).transfer_id
+            if frame.frame_type == FrameType.DATA:
+                data_chunk = decode_data_chunk(frame.payload)
+                data_indexes_sent.append(data_chunk.chunk_index)
+            return len(payload)
+
+        def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+            if self.transfer_id is None:
+                raise BlockingIOError
+            if not self._served_status:
+                self._served_status = True
+                return (
+                    encode_status(
+                        TransferStatus(
+                            transfer_id=self.transfer_id,
+                            kind=StatusKind.TRANSFER,
+                            state=TransferState.INCOMPLETE,
+                            missing_ranges=[(0, 1)],
+                        )
+                    ),
+                    ("127.0.0.1", 9000),
+                )
+            raise TimeoutError
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    try:
+        result = sender.send_file(
+            source_path,
+            "127.0.0.1",
+            9000,
+            max_feedback_seconds_override=0.1,
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert result.repair_rounds >= 1
+    assert result.repaired_chunks >= 1
+    assert data_indexes_sent.count(0) >= 2
+
+
 def test_send_file_budget_does_not_interrupt_initial_data_pass(tmp_path: Path) -> None:
     source_path = tmp_path / "initial-pass.bin"
     source_path.write_bytes(b"x" * 2048)
@@ -561,7 +636,7 @@ def test_send_file_budget_does_not_interrupt_initial_data_pass(tmp_path: Path) -
             return len(payload)
 
         def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
-            raise AssertionError("budgeted primary pass should not enter feedback recv")
+            raise BlockingIOError
 
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
@@ -635,6 +710,82 @@ def test_send_file_auto_feedback_promotes_on_uplink_packet(tmp_path: Path) -> No
         monkeypatch.undo()
 
     assert sender._auto_feedback_active is True
+
+
+def test_send_file_auto_feedback_promotion_starts_parallel_repairs(tmp_path: Path) -> None:
+    source_path = tmp_path / "auto-promote-parallel-repair.bin"
+    source_path.write_bytes(b"x" * (256 * 64))
+    sender = SpaceSyncSender(
+        SenderConfig(
+            chunk_size=256,
+            enable_feedback=False,
+            auto_feedback_discovery=True,
+            auto_feedback_probe_interval_chunks=1,
+            feedback_wait_s=0.01,
+            max_feedback_idle_timeouts=1,
+            manifest_repeats=1,
+            inter_packet_delay_s=0.0005,
+        )
+    )
+
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.transfer_id: bytes | None = None
+            self._probe_served = False
+            self._status_served = False
+
+        def __enter__(self) -> FakeSocket:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def settimeout(self, _value: float | None) -> None:
+            return None
+
+        def setblocking(self, _flag: bool) -> None:
+            return None
+
+        def sendto(self, payload: bytes, _destination: tuple[str, int]) -> int:
+            frame = decode_frame(payload)
+            if frame.frame_type == FrameType.METADATA:
+                self.transfer_id = decode_manifest(frame.payload).transfer_id
+            return len(payload)
+
+        def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+            if not self._probe_served:
+                self._probe_served = True
+                return (b"uplink", ("127.0.0.1", 9000))
+            if self.transfer_id is not None and not self._status_served:
+                self._status_served = True
+                return (
+                    encode_status(
+                        TransferStatus(
+                            transfer_id=self.transfer_id,
+                            kind=StatusKind.TRANSFER,
+                            state=TransferState.INCOMPLETE,
+                            missing_ranges=[(0, 1)],
+                        )
+                    ),
+                    ("127.0.0.1", 9000),
+                )
+            raise TimeoutError
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    try:
+        result = sender.send_file(
+            source_path,
+            "127.0.0.1",
+            9000,
+            max_feedback_seconds_override=0.01,
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert result.completed is False
+    assert result.repair_rounds >= 1
+    assert result.repaired_chunks >= 1
 
 
 def test_send_file_auto_feedback_demotes_after_idle_timeout(tmp_path: Path) -> None:

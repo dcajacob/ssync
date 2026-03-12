@@ -179,10 +179,18 @@ def test_periodic_metadata_default_is_enabled() -> None:
     assert send_args.revisit_max_rounds_per_pass == 8
     assert send_args.primary_feedback_max_rounds == 0
     assert send_args.primary_feedback_max_seconds == pytest.approx(0.0)
+    assert send_args.repair_queue_max_pending_requests == 1024
+    assert send_args.repair_worker_max_chunks_per_burst == 256
+    assert send_args.initial_pass_repair_max_chunks_per_burst == 16
+    assert send_args.repair_worker_poll_interval_s == pytest.approx(0.01)
     assert sync_args.revisit_incomplete_passes == 2
     assert sync_args.revisit_max_rounds_per_pass == 8
     assert sync_args.primary_feedback_max_rounds == 64
     assert sync_args.primary_feedback_max_seconds == pytest.approx(8.0)
+    assert sync_args.repair_queue_max_pending_requests == 1024
+    assert sync_args.repair_worker_max_chunks_per_burst == 256
+    assert sync_args.initial_pass_repair_max_chunks_per_burst == 16
+    assert sync_args.repair_worker_poll_interval_s == pytest.approx(0.01)
 
 
 def test_parser_feedback_flags_support_auto_and_overrides() -> None:
@@ -566,6 +574,85 @@ def test_run_sync_feedback_revisits_incomplete_transfers(
     assert revisit_calls[0]["max_repair_rounds_override"] == 3
     assert revisit_calls[0]["max_feedback_seconds_override"] == pytest.approx(0.0)
     assert revisit_calls[0]["max_feedback_total_rounds_override"] == 0
+
+
+def test_run_sync_revisit_prioritizes_current_then_checks_others(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "payload"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "a.bin").write_bytes(b"a" * 1024)
+    (source_dir / "b.bin").write_bytes(b"b" * 1024)
+
+    call_order: list[tuple[str, bool]] = []
+    revisit_counts: dict[str, int] = {"a.bin": 0, "b.bin": 0}
+
+    class FakeSender:
+        def __init__(self, config: object) -> None:
+            self.config = config
+
+        def send_file(
+            self,
+            file_path: Path,
+            destination_host: str,
+            destination_port: int,
+            remote_name: str | None = None,
+            stop_requested: object | None = None,
+            transfer_id: bytes | None = None,
+            send_initial_data: bool = True,
+            **_kwargs: object,
+        ) -> SimpleNamespace:
+            assert remote_name is not None
+            call_order.append((remote_name, send_initial_data))
+            if send_initial_data:
+                return SimpleNamespace(
+                    transfer_id_hex=("aa" * 16) if remote_name == "a.bin" else ("bb" * 16),
+                    total_chunks=10,
+                    repaired_chunks=0,
+                    repair_rounds=0,
+                    completed=False,
+                )
+            revisit_counts[remote_name] += 1
+            return SimpleNamespace(
+                transfer_id_hex=("aa" * 16) if remote_name == "a.bin" else ("bb" * 16),
+                total_chunks=10,
+                repaired_chunks=0,
+                repair_rounds=0,
+                completed=revisit_counts[remote_name] >= 2,
+            )
+
+        def query_remote_file(self, **kwargs: object) -> object:
+            raise AssertionError("query_remote_file should not be called without --skip-unchanged")
+
+    monkeypatch.setattr(cli_module, "SpaceSyncSender", FakeSender)
+    parser = _build_rsync_parser()
+    args = parser.parse_args(
+        [
+            "-r",
+            str(source_dir),
+            "127.0.0.1:./",
+            "--revisit-incomplete-passes",
+            "2",
+            "--revisit-max-rounds-per-pass",
+            "3",
+            "--open-loop-max-rounds",
+            "1",
+        ]
+    )
+    exit_code = cli_module._run_sync(args)
+    assert exit_code == 0
+    # Sequence should include: primary first file, revisit first file, primary second file,
+    # then revisit second file before revisiting first file.
+    primary_calls = [entry for entry in call_order if entry[1] is True]
+    assert len(primary_calls) == 2
+    first_primary_name = primary_calls[0][0]
+    second_primary_name = primary_calls[1][0]
+    assert first_primary_name != second_primary_name
+
+    second_primary_index = call_order.index((second_primary_name, True))
+    assert call_order[second_primary_index + 1] == (second_primary_name, False)
+    assert call_order[second_primary_index + 2] == (first_primary_name, False)
 
 
 def test_run_sync_auto_feedback_transition_stops_open_loop_repeats(

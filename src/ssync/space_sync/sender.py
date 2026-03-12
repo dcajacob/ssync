@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import logging
 import math
+import queue
 import socket
+import threading
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
 from typing import BinaryIO
@@ -31,6 +34,30 @@ from .types import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _QueuedRepairRequest:
+    missing_ranges: list[tuple[int, int]]
+    signature: tuple[tuple[int, int], ...]
+    enqueued_s: float
+
+
+@dataclass(slots=True)
+class _ParallelRepairRuntime:
+    queue: queue.Queue[_QueuedRepairRequest]
+    stop_event: threading.Event
+    state_lock: threading.Lock = field(default_factory=threading.Lock)
+    completed: bool = False
+    hash_mismatch: bool = False
+    saw_uplink: bool = False
+    repaired_chunks: int = 0
+    repair_rounds: int = 0
+    suppressed_duplicates: int = 0
+    last_signature: tuple[tuple[int, int], ...] | None = None
+    last_signature_s: float = 0.0
+
+
 class SpaceSyncSender:
     def __init__(self, config: SenderConfig | None = None) -> None:
         self.config = config or SenderConfig()
@@ -69,6 +96,7 @@ class SpaceSyncSender:
         destination = (destination_host, destination_port)
         repaired_chunks = 0
         repair_rounds = 0
+        feedback_budget_rounds = 0
         completed = False
         effective_max_repair_rounds = (
             self.config.max_repair_rounds
@@ -126,7 +154,7 @@ class SpaceSyncSender:
                 return False
             if (
                 effective_max_feedback_total_rounds > 0
-                and repair_rounds >= effective_max_feedback_total_rounds
+                and feedback_budget_rounds >= effective_max_feedback_total_rounds
             ):
                 budget_stop_reason = (
                     "max_feedback_total_rounds="
@@ -162,12 +190,18 @@ class SpaceSyncSender:
             file_path.open("rb") as file_stream,
             socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock,
         ):
+            chunk_reader_lock = threading.Lock()
+
             def chunk_reader(index: int) -> bytes:
-                return self._read_chunk(
-                    file_stream=file_stream,
-                    chunk_size=self.config.chunk_size,
-                    chunk_index=index,
-                )
+                # Parallel repair sends and primary forward sends can both read
+                # from the same file stream. Guard seek/read so offsets cannot
+                # interleave across threads and corrupt chunk payload selection.
+                with chunk_reader_lock:
+                    return self._read_chunk(
+                        file_stream=file_stream,
+                        chunk_size=self.config.chunk_size,
+                        chunk_index=index,
+                    )
             if feedback_active:
                 sock.settimeout(self.config.feedback_wait_s)
                 sock.setblocking(False)
@@ -225,8 +259,178 @@ class SpaceSyncSender:
                 sock.settimeout(0.5)
                 return saw_uplink
 
+            parallel_runtime: _ParallelRepairRuntime | None = None
+            parallel_threads: list[threading.Thread] = []
+
+            def _start_parallel_repairs() -> None:
+                nonlocal parallel_runtime, last_uplink_activity_s, completed
+                if parallel_runtime is not None or not feedback_active:
+                    return
+                parallel_runtime = _ParallelRepairRuntime(
+                    queue=queue.Queue(
+                        maxsize=max(1, self.config.repair_queue_max_pending_requests)
+                    ),
+                    stop_event=threading.Event(),
+                )
+
+                def _recv_pump() -> None:
+                    nonlocal last_uplink_activity_s
+                    assert parallel_runtime is not None
+                    while not parallel_runtime.stop_event.is_set():
+                        try:
+                            response_raw, _response_addr = sock.recvfrom(65535)
+                        except (BlockingIOError, TimeoutError):
+                            time.sleep(self.config.repair_worker_poll_interval_s)
+                            continue
+                        try:
+                            parsed = decode_frame(response_raw)
+                        except ValueError:
+                            continue
+                        if parsed.frame_type is None:
+                            continue
+                        with parallel_runtime.state_lock:
+                            parallel_runtime.saw_uplink = True
+                        last_uplink_activity_s = time.monotonic()
+                        if parsed.frame_type != FrameType.STATUS:
+                            continue
+                        status = decode_status(parsed.payload)
+                        if status.kind != StatusKind.TRANSFER:
+                            continue
+                        if status.transfer_id != manifest.transfer_id:
+                            continue
+                        if status.state == TransferState.COMPLETE:
+                            with parallel_runtime.state_lock:
+                                parallel_runtime.completed = True
+                            parallel_runtime.stop_event.set()
+                            return
+                        if status.state == TransferState.HASH_MISMATCH:
+                            with parallel_runtime.state_lock:
+                                parallel_runtime.hash_mismatch = True
+                            parallel_runtime.stop_event.set()
+                            return
+                        if status.state != TransferState.INCOMPLETE or not status.missing_ranges:
+                            continue
+                        signature = tuple(status.missing_ranges)
+                        request = _QueuedRepairRequest(
+                            missing_ranges=status.missing_ranges,
+                            signature=signature,
+                            enqueued_s=time.monotonic(),
+                        )
+                        try:
+                            parallel_runtime.queue.put_nowait(request)
+                        except queue.Full:
+                            continue
+
+                def _repair_worker() -> None:
+                    nonlocal paced_data_bytes
+                    assert parallel_runtime is not None
+                    while not parallel_runtime.stop_event.is_set():
+                        try:
+                            request = parallel_runtime.queue.get(
+                                timeout=self.config.repair_worker_poll_interval_s
+                            )
+                        except queue.Empty:
+                            continue
+                        with parallel_runtime.state_lock:
+                            if (
+                                self.config.repair_duplicate_suppression_s > 0
+                                and parallel_runtime.last_signature == request.signature
+                                and request.enqueued_s - parallel_runtime.last_signature_s
+                                < self.config.repair_duplicate_suppression_s
+                            ):
+                                parallel_runtime.suppressed_duplicates += 1
+                                continue
+                        if (
+                            send_initial_data
+                            and not initial_data_phase_complete
+                            and prioritize_forward_data
+                        ):
+                            # During the first-pass forward stream, keep only the
+                            # freshest repair request to avoid replaying stale
+                            # missing snapshots and overwhelming the downlink.
+                            while True:
+                                try:
+                                    request = parallel_runtime.queue.get_nowait()
+                                except queue.Empty:
+                                    break
+                        limited_ranges = limit_ranges_to_chunk_budget(
+                            request.missing_ranges,
+                            max(
+                                1,
+                                min(
+                                    self.config.repair_worker_max_chunks_per_burst,
+                                    self.config.initial_pass_repair_max_chunks_per_burst
+                                    if (
+                                        send_initial_data
+                                        and not initial_data_phase_complete
+                                        and prioritize_forward_data
+                                    )
+                                    else self.config.repair_worker_max_chunks_per_burst,
+                                ),
+                            ),
+                        )
+                        repaired_now, _, paced_data_bytes = self._send_requested_repairs(
+                            sock=sock,
+                            manifest=manifest,
+                            total_chunks=total_chunks,
+                            chunk_reader=chunk_reader,
+                            destination=destination,
+                            missing_ranges=limited_ranges,
+                            paced_start_s=paced_start_s,
+                            paced_data_bytes=paced_data_bytes,
+                        )
+                        with parallel_runtime.state_lock:
+                            if repaired_now > 0:
+                                parallel_runtime.repaired_chunks += repaired_now
+                                parallel_runtime.repair_rounds += 1
+                            parallel_runtime.last_signature = request.signature
+                            parallel_runtime.last_signature_s = request.enqueued_s
+                        if (
+                            send_initial_data
+                            and not initial_data_phase_complete
+                            and prioritize_forward_data
+                        ):
+                            time.sleep(max(0.0, self.config.repair_worker_poll_interval_s))
+
+                parallel_threads.extend(
+                    [
+                        threading.Thread(target=_recv_pump, name="ssync-recv-pump", daemon=True),
+                        threading.Thread(
+                            target=_repair_worker,
+                            name="ssync-repair-worker",
+                            daemon=True,
+                        ),
+                    ]
+                )
+                for thread in parallel_threads:
+                    thread.start()
+
+            def _stop_parallel_repairs() -> None:
+                nonlocal parallel_runtime, completed, repair_rounds, repaired_chunks
+                nonlocal last_uplink_activity_s
+                if parallel_runtime is None:
+                    return
+                parallel_runtime.stop_event.set()
+                for thread in parallel_threads:
+                    thread.join(timeout=1.0)
+                with parallel_runtime.state_lock:
+                    repaired_chunks += parallel_runtime.repaired_chunks
+                    # Keep total observability, but do not charge worker rounds
+                    # against feedback-budget termination logic.
+                    repair_rounds += parallel_runtime.repair_rounds
+                    completed = parallel_runtime.completed
+                    if parallel_runtime.hash_mismatch:
+                        completed = False
+                    if parallel_runtime.saw_uplink:
+                        last_uplink_activity_s = time.monotonic()
+                parallel_threads.clear()
+                parallel_runtime = None
+
             if auto_feedback_enabled and not feedback_active and _probe_uplink_packets():
                 _set_feedback_mode(True, "auto_uplink_packet_detected")
+                if send_initial_data and feedback_active:
+                    _start_parallel_repairs()
+
             last_beacon_s = 0.0
             last_metadata_s = time.monotonic()
             chunks_since_metadata = 0
@@ -268,129 +472,147 @@ class SpaceSyncSender:
             dropped = 0
             completed_by_receiver_signal = False
             if send_initial_data:
-                next_probe_s = time.monotonic()
-                for chunk_index in range(total_chunks):
-                    if (
-                        auto_feedback_enabled
-                        and feedback_active
-                        and auto_feedback_timeout_s > 0
-                        and last_uplink_activity_s is not None
-                        and (time.monotonic() - last_uplink_activity_s) >= auto_feedback_timeout_s
-                    ):
-                        _set_feedback_mode(False, "auto_uplink_idle_timeout")
-                    if self._should_stop(stop_requested):
-                        return self._aborted_result(manifest.transfer_id.hex(), total_chunks)
-                    chunk_payload = chunk_reader(chunk_index)
-                    if not chunk_payload:
-                        continue
-                    last_beacon_s = self._maybe_send_beacon(
-                        sock=sock,
-                        destination=destination,
-                        transfer_id=manifest.transfer_id,
-                        last_beacon_s=last_beacon_s,
-                    )
-                    if feedback_active and not prioritize_forward_data:
-                        (
-                            repaired_now,
-                            rounds_now,
-                            paced_data_bytes,
-                            completed_now,
-                            saw_uplink_now,
-                        ) = self._drain_repair_requests(
+                if feedback_active:
+                    _start_parallel_repairs()
+                try:
+                    next_probe_s = time.monotonic()
+                    for chunk_index in range(total_chunks):
+                        if (
+                            auto_feedback_enabled
+                            and feedback_active
+                            and auto_feedback_timeout_s > 0
+                            and last_uplink_activity_s is not None
+                            and (time.monotonic() - last_uplink_activity_s)
+                            >= auto_feedback_timeout_s
+                        ):
+                            _set_feedback_mode(False, "auto_uplink_idle_timeout")
+                        if self._should_stop(stop_requested):
+                            return self._aborted_result(manifest.transfer_id.hex(), total_chunks)
+                        chunk_payload = chunk_reader(chunk_index)
+                        if not chunk_payload:
+                            continue
+                        last_beacon_s = self._maybe_send_beacon(
                             sock=sock,
-                            manifest=manifest,
-                            total_chunks=total_chunks,
-                            chunk_reader=chunk_reader,
                             destination=destination,
+                            transfer_id=manifest.transfer_id,
+                            last_beacon_s=last_beacon_s,
+                        )
+                        if feedback_active and not prioritize_forward_data:
+                            if parallel_runtime is None:
+                                (
+                                    repaired_now,
+                                    rounds_now,
+                                    paced_data_bytes,
+                                    completed_now,
+                                    saw_uplink_now,
+                                ) = self._drain_repair_requests(
+                                    sock=sock,
+                                    manifest=manifest,
+                                    total_chunks=total_chunks,
+                                    chunk_reader=chunk_reader,
+                                    destination=destination,
+                                    paced_start_s=paced_start_s,
+                                    paced_data_bytes=paced_data_bytes,
+                                    max_rounds=self.config.midstream_repair_max_rounds_per_poll,
+                                    max_chunks=self.config.midstream_repair_max_chunks_per_poll,
+                                )
+                                if saw_uplink_now:
+                                    last_uplink_activity_s = time.monotonic()
+                                repaired_chunks += repaired_now
+                                repair_rounds += rounds_now
+                                feedback_budget_rounds += rounds_now
+                                if completed_now:
+                                    completed = True
+                                    completed_by_receiver_signal = True
+                                    LOGGER.debug(
+                                        "transfer_id=%s midstream_transfer_complete_short_circuit",
+                                        transfer_id_hex,
+                                    )
+                                    break
+                                if rounds_now:
+                                    LOGGER.debug(
+                                        (
+                                            "transfer_id=%s serviced_midstream_repairs "
+                                            "rounds=%d chunks=%d"
+                                        ),
+                                        transfer_id_hex,
+                                        rounds_now,
+                                        repaired_now,
+                                    )
+                                if _feedback_budget_exhausted():
+                                    LOGGER.debug(
+                                        (
+                                            "transfer_id=%s "
+                                            "reached_feedback_budget_after_midstream_repairs %s"
+                                        ),
+                                        transfer_id_hex,
+                                        budget_stop_reason,
+                                    )
+                                    break
+                        elif (
+                            auto_feedback_enabled
+                            and not feedback_active
+                            and (
+                                (
+                                    self.config.auto_feedback_probe_interval_chunks > 0
+                                    and (chunk_index + 1)
+                                    % self.config.auto_feedback_probe_interval_chunks
+                                    == 0
+                                )
+                                or time.monotonic() >= next_probe_s
+                            )
+                        ):
+                            next_probe_s = time.monotonic() + 0.25
+                            if _probe_uplink_packets():
+                                _set_feedback_mode(True, "auto_uplink_packet_detected")
+                                if send_initial_data and feedback_active:
+                                    _start_parallel_repairs()
+                        should_drop = (
+                            self.config.drop_every_nth_data > 0
+                            and (chunk_index + 1) % self.config.drop_every_nth_data == 0
+                        )
+                        if should_drop:
+                            dropped += 1
+                            continue
+                        if not self._sendto_with_interrupt(
+                            sock=sock,
+                            payload=encode_data_chunk(
+                                manifest.transfer_id, chunk_index, chunk_payload
+                            ),
+                            destination=destination,
+                            stop_requested=stop_requested,
+                        ):
+                            return self._aborted_result(manifest.transfer_id.hex(), total_chunks)
+                        paced_data_bytes = self._apply_rate_limit(
                             paced_start_s=paced_start_s,
                             paced_data_bytes=paced_data_bytes,
-                            max_rounds=self.config.midstream_repair_max_rounds_per_poll,
-                            max_chunks=self.config.midstream_repair_max_chunks_per_poll,
+                            just_sent_bytes=len(chunk_payload),
                         )
-                        if saw_uplink_now:
-                            last_uplink_activity_s = time.monotonic()
-                        repaired_chunks += repaired_now
-                        repair_rounds += rounds_now
-                        if completed_now:
-                            completed = True
-                            completed_by_receiver_signal = True
-                            LOGGER.debug(
-                                "transfer_id=%s midstream_transfer_complete_short_circuit",
-                                transfer_id_hex,
-                            )
-                            break
-                        if rounds_now:
-                            LOGGER.debug(
-                                "transfer_id=%s serviced_midstream_repairs rounds=%d chunks=%d",
-                                transfer_id_hex,
-                                rounds_now,
-                                repaired_now,
-                            )
-                        if _feedback_budget_exhausted():
-                            LOGGER.debug(
-                                "transfer_id=%s reached_feedback_budget_after_midstream_repairs %s",
-                                transfer_id_hex,
-                                budget_stop_reason,
-                            )
-                            break
-                    elif (
-                        auto_feedback_enabled
-                        and not feedback_active
-                        and (
-                            (
-                                self.config.auto_feedback_probe_interval_chunks > 0
-                                and (chunk_index + 1)
-                                % self.config.auto_feedback_probe_interval_chunks
-                                == 0
-                            )
-                            or time.monotonic() >= next_probe_s
+                        chunks_since_metadata += 1
+                        (
+                            last_metadata_s,
+                            chunks_since_metadata,
+                        ) = self._maybe_send_periodic_metadata(
+                            sock=sock,
+                            destination=destination,
+                            manifest=manifest,
+                            last_metadata_s=last_metadata_s,
+                            chunks_since_metadata=chunks_since_metadata,
                         )
-                    ):
-                        next_probe_s = time.monotonic() + 0.25
-                        if _probe_uplink_packets():
-                            _set_feedback_mode(True, "auto_uplink_packet_detected")
-                    should_drop = (
-                        self.config.drop_every_nth_data > 0
-                        and (chunk_index + 1) % self.config.drop_every_nth_data == 0
-                    )
-                    if should_drop:
-                        dropped += 1
-                        continue
-                    if not self._sendto_with_interrupt(
-                        sock=sock,
-                        payload=encode_data_chunk(
-                            manifest.transfer_id, chunk_index, chunk_payload
-                        ),
-                        destination=destination,
-                        stop_requested=stop_requested,
-                    ):
-                        return self._aborted_result(manifest.transfer_id.hex(), total_chunks)
-                    paced_data_bytes = self._apply_rate_limit(
-                        paced_start_s=paced_start_s,
-                        paced_data_bytes=paced_data_bytes,
-                        just_sent_bytes=len(chunk_payload),
-                    )
-                    chunks_since_metadata += 1
-                    (
-                        last_metadata_s,
-                        chunks_since_metadata,
-                    ) = self._maybe_send_periodic_metadata(
-                        sock=sock,
-                        destination=destination,
-                        manifest=manifest,
-                        last_metadata_s=last_metadata_s,
-                        chunks_since_metadata=chunks_since_metadata,
-                    )
-                    if self.config.inter_packet_delay_s > 0:
-                        time.sleep(self.config.inter_packet_delay_s)
-                    if chunk_index > 0 and chunk_index % 4096 == 0:
-                        LOGGER.debug(
-                            "transfer_id=%s sent_chunk_progress=%d/%d",
-                            transfer_id_hex,
-                            chunk_index + 1,
-                            total_chunks,
-                        )
-                initial_data_phase_complete = True
+                        if self.config.inter_packet_delay_s > 0:
+                            time.sleep(self.config.inter_packet_delay_s)
+                        if chunk_index > 0 and chunk_index % 4096 == 0:
+                            LOGGER.debug(
+                                "transfer_id=%s sent_chunk_progress=%d/%d",
+                                transfer_id_hex,
+                                chunk_index + 1,
+                                total_chunks,
+                            )
+                finally:
+                    initial_data_phase_complete = True
+                    _stop_parallel_repairs()
+                    if completed:
+                        completed_by_receiver_signal = True
 
             if (
                 feedback_active
@@ -424,6 +646,7 @@ class SpaceSyncSender:
                     last_uplink_activity_s = time.monotonic()
                 repaired_chunks += repaired_now
                 repair_rounds += rounds_now
+                feedback_budget_rounds += rounds_now
                 if completed_now:
                     completed = True
                     completed_by_receiver_signal = True
@@ -603,6 +826,7 @@ class SpaceSyncSender:
                     )
                     repaired_chunks += repaired_now
                     repair_rounds += 1
+                    feedback_budget_rounds += 1
                     post_fin_repair_rounds += 1
                     last_post_fin_signature = request_signature
                     last_post_fin_service_s = now

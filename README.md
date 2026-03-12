@@ -112,8 +112,13 @@ Feedback mode timing controls:
 
 ```bash
 uv run ssync send ./example.bin --dest-port 9000 --feedback \
-  --feedback-wait-s 3.0 --max-feedback-idle-timeouts 10 --max-repair-rounds 32
+  --feedback-wait-s 3.0 --max-feedback-idle-timeouts 10 --max-repair-rounds 32 \
+  --repair-worker-max-chunks-per-burst 256 \
+  --initial-pass-repair-max-chunks-per-burst 16
 ```
+
+Use `--initial-pass-repair-max-chunks-per-burst` to keep first-pass forward data
+dominant while still servicing queued repairs in near-real-time.
 
 Periodic transfer metadata is enabled by default every 10 seconds:
 
@@ -144,6 +149,9 @@ Receiver state advertisement:
 - On repeated `METADATA`, receiver may advertise current `STATUS(INCOMPLETE)` with
   bounded missing ranges to help sender prioritize immediate repairs.
 - Receiver emits `STATUS(INCOMPLETE)` as the repair signal.
+- In feedback mode, sender enqueues incoming `STATUS(INCOMPLETE)` requests and
+  services repairs concurrently during forward data streaming using bounded
+  repair bursts.
 - If destination already has a hash-matching completed file, receiver short-circuits
   with `STATUS(COMPLETE)` and sender exits early.
 - During feedback wait, sender retries `METADATA` on relevant idle windows to recover

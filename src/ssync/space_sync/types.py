@@ -79,6 +79,10 @@ class SenderConfig:
     revisit_max_rounds_per_pass: int = 8
     primary_feedback_max_rounds: int = 0
     primary_feedback_max_seconds: float = 0.0
+    repair_queue_max_pending_requests: int = 1024
+    repair_worker_max_chunks_per_burst: int = 256
+    initial_pass_repair_max_chunks_per_burst: int = 16
+    repair_worker_poll_interval_s: float = 0.01
 
     @property
     def metadata_repeats(self) -> int:

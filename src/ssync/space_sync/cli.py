@@ -248,6 +248,33 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Suppress servicing identical repair requests within this interval",
     )
     send.add_argument(
+        "--repair-queue-max-pending-requests",
+        type=int,
+        default=1024,
+        help="Maximum queued repair STATUS requests before dropping new ones",
+    )
+    send.add_argument(
+        "--repair-worker-max-chunks-per-burst",
+        type=int,
+        default=256,
+        help="Maximum repair chunks sent for each queued repair request burst",
+    )
+    send.add_argument(
+        "--initial-pass-repair-max-chunks-per-burst",
+        type=int,
+        default=16,
+        help=(
+            "Maximum queued-repair chunks per burst during the initial forward "
+            "data pass"
+        ),
+    )
+    send.add_argument(
+        "--repair-worker-poll-interval-s",
+        type=float,
+        default=0.01,
+        help="Repair worker queue poll interval in seconds",
+    )
+    send.add_argument(
         "--beacon-interval-s",
         type=float,
         default=1.0,
@@ -593,6 +620,33 @@ def _add_sync_args(parser: argparse.ArgumentParser) -> None:
         help="Suppress servicing identical repair requests within this interval",
     )
     parser.add_argument(
+        "--repair-queue-max-pending-requests",
+        type=int,
+        default=1024,
+        help="Maximum queued repair STATUS requests before dropping new ones",
+    )
+    parser.add_argument(
+        "--repair-worker-max-chunks-per-burst",
+        type=int,
+        default=256,
+        help="Maximum repair chunks sent for each queued repair request burst",
+    )
+    parser.add_argument(
+        "--initial-pass-repair-max-chunks-per-burst",
+        type=int,
+        default=16,
+        help=(
+            "Maximum queued-repair chunks per burst during the initial forward "
+            "data pass"
+        ),
+    )
+    parser.add_argument(
+        "--repair-worker-poll-interval-s",
+        type=float,
+        default=0.01,
+        help="Repair worker queue poll interval in seconds",
+    )
+    parser.add_argument(
         "--beacon-interval-s",
         type=float,
         default=1.0,
@@ -824,6 +878,12 @@ def _run_sender(args: argparse.Namespace) -> int:
                 0, args.midstream_repair_max_chunks_per_poll
             ),
             repair_duplicate_suppression_s=max(0.0, args.repair_duplicate_suppression_s),
+            repair_queue_max_pending_requests=max(1, args.repair_queue_max_pending_requests),
+            repair_worker_max_chunks_per_burst=max(1, args.repair_worker_max_chunks_per_burst),
+            initial_pass_repair_max_chunks_per_burst=max(
+                1, args.initial_pass_repair_max_chunks_per_burst
+            ),
+            repair_worker_poll_interval_s=max(0.001, args.repair_worker_poll_interval_s),
             beacon_interval_s=max(0.0, args.beacon_interval_s),
             periodic_metadata_interval_s=max(0.0, args.periodic_metadata_interval_s),
             periodic_metadata_every_n_chunks=max(0, args.periodic_metadata_every_n_chunks),
@@ -1141,6 +1201,12 @@ def _run_sync(args: argparse.Namespace) -> int:
                 0, args.midstream_repair_max_chunks_per_poll
             ),
             repair_duplicate_suppression_s=max(0.0, args.repair_duplicate_suppression_s),
+            repair_queue_max_pending_requests=max(1, args.repair_queue_max_pending_requests),
+            repair_worker_max_chunks_per_burst=max(1, args.repair_worker_max_chunks_per_burst),
+            initial_pass_repair_max_chunks_per_burst=max(
+                1, args.initial_pass_repair_max_chunks_per_burst
+            ),
+            repair_worker_poll_interval_s=max(0.001, args.repair_worker_poll_interval_s),
             beacon_interval_s=max(0.0, args.beacon_interval_s),
             periodic_metadata_interval_s=max(0.0, args.periodic_metadata_interval_s),
             periodic_metadata_every_n_chunks=max(0, args.periodic_metadata_every_n_chunks),
@@ -1209,18 +1275,21 @@ def _run_sync(args: argparse.Namespace) -> int:
         destination_host: str,
         remote_name: str,
         transfer_id_hex: str,
+        prioritize: bool = False,
     ) -> None:
         revisit_key = (destination_host, remote_name)
         if revisit_key in revisit_active_keys:
             return
-        revisit_queue.append(
-            _RevisitEntry(
-                source_file=source_file,
-                destination_host=destination_host,
-                remote_name=remote_name,
-                transfer_id_hex=transfer_id_hex,
-            )
+        entry = _RevisitEntry(
+            source_file=source_file,
+            destination_host=destination_host,
+            remote_name=remote_name,
+            transfer_id_hex=transfer_id_hex,
         )
+        if prioritize:
+            revisit_queue.appendleft(entry)
+        else:
+            revisit_queue.append(entry)
         revisit_active_keys.add(revisit_key)
 
     def _run_revisit_attempts(max_attempts: int) -> tuple[int, int]:
@@ -1357,6 +1426,7 @@ def _run_sync(args: argparse.Namespace) -> int:
                                 destination_host=destination_host,
                                 remote_name=remote_name,
                                 transfer_id_hex=result.transfer_id_hex,
+                                prioritize=True,
                             )
                         else:
                             failed += 1
@@ -1389,7 +1459,7 @@ def _run_sync(args: argparse.Namespace) -> int:
                         f"completed={item_result.get('completed', False)}"
                     )
                 if revisit_enabled and not should_stop:
-                    _run_revisit_attempts(1)
+                    _run_revisit_attempts(len(revisit_queue))
 
         if args.dry_run:
             break
