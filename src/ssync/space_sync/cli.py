@@ -5,12 +5,15 @@ import collections
 import dataclasses
 import fnmatch
 import glob
+import inspect
 import json
 import logging
 import os
 import signal
 import sys
+import threading
 import time
+from hashlib import sha256
 from pathlib import Path, PurePosixPath
 
 from .monitor import run_monitor_tui
@@ -18,9 +21,15 @@ from .receiver import SpaceSyncReceiver
 from .sender import SpaceSyncSender
 from .types import ReceiverConfig, RemoteFileInfo, SenderConfig
 
+_REVISIT_WORKER_POLL_INTERVAL_S = 0.05
+
 
 def _default_log_level() -> str:
     return os.getenv("SSYNC_LOG_LEVEL", "WARNING")
+
+
+def _default_monitor_ipc_socket_for_dir(base_dir: Path) -> Path:
+    return base_dir / ".ssync-monitor.sock"
 
 
 def _add_log_level_arg(parser: argparse.ArgumentParser) -> None:
@@ -47,6 +56,15 @@ def _build_parser() -> argparse.ArgumentParser:
     recv.add_argument("--bind-host", default="127.0.0.1")
     recv.add_argument("--bind-port", type=int, default=9000)
     recv.add_argument("--output-dir", type=Path, default=Path("./received"))
+    recv.add_argument(
+        "--monitor-ipc-socket",
+        type=Path,
+        default=None,
+        help=(
+            "Unix datagram socket for live monitor IPC "
+            "(default: <output-dir>/.ssync-monitor.sock)"
+        ),
+    )
     recv.add_argument("--feedback", action="store_true", help="Enable repair feedback")
     recv.add_argument(
         "--keep-part-files-on-complete",
@@ -341,6 +359,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.5,
         help="TUI refresh interval in seconds",
     )
+    monitor.add_argument(
+        "--monitor-ipc-socket",
+        type=Path,
+        default=None,
+        help=(
+            "Unix datagram socket for live monitor IPC "
+            "(default: <output-dir>/.ssync-monitor.sock)"
+        ),
+    )
     _add_log_level_arg(monitor)
     return parser
 
@@ -366,6 +393,12 @@ def _add_server_args(parser: argparse.ArgumentParser) -> None:
         type=Path,
         default=Path("./received"),
         help="Root directory where incoming files are written",
+    )
+    parser.add_argument(
+        "--monitor-ipc-socket",
+        type=Path,
+        default=None,
+        help="Unix datagram socket for live monitor IPC (default: <root-dir>/.ssync-monitor.sock)",
     )
     parser.add_argument(
         "--feedback",
@@ -731,12 +764,16 @@ def _run_receiver_common(
     socket_rcvbuf_bytes: int,
     journal_flush_interval_s: float,
     beacon_interval_s: float,
+    monitor_ipc_socket: Path | None,
     pre_metadata_max_pending_bytes: int,
     pre_metadata_max_pending_bytes_per_transfer: int,
     pre_metadata_max_pending_transfers: int,
     pre_metadata_ttl_s: float,
     banner: str,
 ) -> int:
+    resolved_monitor_ipc_socket = monitor_ipc_socket or _default_monitor_ipc_socket_for_dir(
+        output_dir
+    )
     receiver = SpaceSyncReceiver(
         bind_host=bind_host,
         bind_port=bind_port,
@@ -762,6 +799,7 @@ def _run_receiver_common(
             socket_rcvbuf_bytes=max(0, socket_rcvbuf_bytes),
             journal_flush_interval_s=max(0.0, journal_flush_interval_s),
             beacon_interval_s=max(0.0, beacon_interval_s),
+            monitor_ipc_socket=resolved_monitor_ipc_socket,
             pre_metadata_max_pending_bytes=max(0, pre_metadata_max_pending_bytes),
             pre_metadata_max_pending_bytes_per_transfer=max(
                 0, pre_metadata_max_pending_bytes_per_transfer
@@ -811,6 +849,7 @@ def _run_receiver(args: argparse.Namespace) -> int:
         socket_rcvbuf_bytes=args.socket_rcvbuf_bytes,
         journal_flush_interval_s=args.journal_flush_interval_s,
         beacon_interval_s=args.beacon_interval_s,
+        monitor_ipc_socket=args.monitor_ipc_socket,
         pre_metadata_max_pending_bytes=args.pre_metadata_max_pending_bytes,
         pre_metadata_max_pending_bytes_per_transfer=(
             args.pre_metadata_max_pending_bytes_per_transfer
@@ -843,6 +882,7 @@ def _run_server(args: argparse.Namespace) -> int:
         socket_rcvbuf_bytes=args.socket_rcvbuf_bytes,
         journal_flush_interval_s=args.journal_flush_interval_s,
         beacon_interval_s=args.beacon_interval_s,
+        monitor_ipc_socket=args.monitor_ipc_socket,
         pre_metadata_max_pending_bytes=args.pre_metadata_max_pending_bytes,
         pre_metadata_max_pending_bytes_per_transfer=(
             args.pre_metadata_max_pending_bytes_per_transfer
@@ -1222,12 +1262,174 @@ def _run_sync(args: argparse.Namespace) -> int:
     skipped_count = 0
     dry_run_count = 0
     should_query_destination = bool(args.skip_unchanged)
+    send_file_params = inspect.signature(sender.send_file).parameters
+    supports_sha256_override = (
+        "local_sha256_override" in send_file_params
+        or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in send_file_params.values()
+        )
+    )
+
+    checksum_prefetch_lock = threading.Lock()
+    checksum_prefetch_cv = threading.Condition(checksum_prefetch_lock)
+    checksum_prefetch_stop = threading.Event()
+    checksum_prefetch_queue: collections.deque[Path] = collections.deque()
+    checksum_prefetch_inflight: Path | None = None
+    checksum_prefetch_cache: dict[Path, tuple[int, int, bytes]] = {}
+    checksum_prefetch_thread: threading.Thread | None = None
+
+    if supports_sha256_override:
+        seen_sources: set[Path] = set()
+        for _destination_host, items in sync_plans:
+            for source_file, _remote_name in items:
+                if source_file in seen_sources:
+                    continue
+                checksum_prefetch_queue.append(source_file)
+                seen_sources.add(source_file)
+
+    def _checksum_prefetch_worker() -> None:
+        nonlocal checksum_prefetch_inflight
+        while not checksum_prefetch_stop.is_set():
+            with checksum_prefetch_cv:
+                while (
+                    not checksum_prefetch_queue and not checksum_prefetch_stop.is_set()
+                ):
+                    checksum_prefetch_cv.wait(timeout=0.1)
+                if checksum_prefetch_stop.is_set():
+                    break
+                source_file = checksum_prefetch_queue.popleft()
+                checksum_prefetch_inflight = source_file
+            try:
+                stat_result = source_file.stat()
+                digest = sha256()
+                with source_file.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                checksum_value = digest.digest()
+                with checksum_prefetch_cv:
+                    checksum_prefetch_cache[source_file] = (
+                        stat_result.st_size,
+                        int(stat_result.st_mtime_ns),
+                        checksum_value,
+                    )
+            except OSError:
+                pass
+            finally:
+                with checksum_prefetch_cv:
+                    checksum_prefetch_inflight = None
+                    checksum_prefetch_cv.notify_all()
+
+    def _start_checksum_prefetch_worker() -> None:
+        nonlocal checksum_prefetch_thread
+        if not supports_sha256_override:
+            return
+        if checksum_prefetch_thread is not None:
+            return
+        checksum_prefetch_stop.clear()
+        checksum_prefetch_thread = threading.Thread(
+            target=_checksum_prefetch_worker,
+            name="ssync-sync-checksum-prefetch",
+            daemon=True,
+        )
+        checksum_prefetch_thread.start()
+
+    def _stop_checksum_prefetch_worker() -> None:
+        nonlocal checksum_prefetch_thread
+        if checksum_prefetch_thread is None:
+            return
+        checksum_prefetch_stop.set()
+        with checksum_prefetch_cv:
+            checksum_prefetch_cv.notify_all()
+        checksum_prefetch_thread.join(timeout=1.0)
+        checksum_prefetch_thread = None
+
+    def _get_prefetched_checksum(source_file: Path) -> bytes | None:
+        if not supports_sha256_override:
+            return None
+        try:
+            stat_result = source_file.stat()
+        except OSError:
+            return None
+        size = stat_result.st_size
+        mtime_ns = int(stat_result.st_mtime_ns)
+        with checksum_prefetch_cv:
+            cached = checksum_prefetch_cache.get(source_file)
+            if cached is not None:
+                cached_size, cached_mtime_ns, cached_digest = cached
+                if cached_size == size and cached_mtime_ns == mtime_ns:
+                    return cached_digest
+                checksum_prefetch_cache.pop(source_file, None)
+            if checksum_prefetch_inflight != source_file:
+                return None
+            deadline = time.monotonic() + 0.2
+            while checksum_prefetch_inflight == source_file:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                checksum_prefetch_cv.wait(timeout=remaining)
+                cached = checksum_prefetch_cache.get(source_file)
+                if cached is None:
+                    continue
+                cached_size, cached_mtime_ns, cached_digest = cached
+                if cached_size == size and cached_mtime_ns == mtime_ns:
+                    return cached_digest
+        return None
+
+    def _refresh_auto_feedback_idle_state() -> None:
+        if feedback_forced_off or feedback_forced_on:
+            return
+        if not bool(getattr(sender, "_auto_feedback_active", False)):
+            return
+        last_uplink_activity_s = getattr(sender, "_last_auto_uplink_activity_s", None)
+        if last_uplink_activity_s is None:
+            return
+        idle_timeout_s = max(
+            0.0,
+            float(getattr(sender.config, "auto_feedback_idle_timeout_s", 0.0)),
+        )
+        if idle_timeout_s <= 0:
+            return
+        if (time.monotonic() - float(last_uplink_activity_s)) >= idle_timeout_s:
+            sender._auto_feedback_active = False
+
     def _open_loop_mode_active() -> bool:
         if feedback_forced_off:
             return True
         if feedback_forced_on:
             return False
+        _refresh_auto_feedback_idle_state()
         return not bool(getattr(sender, "_auto_feedback_active", False))
+
+    def _feedback_mode_active_for_repairs() -> bool:
+        if feedback_forced_on:
+            return True
+        if feedback_forced_off:
+            return False
+        _refresh_auto_feedback_idle_state()
+        return bool(getattr(sender, "_auto_feedback_active", False))
+
+    def _sync_revisit_sender_mode() -> None:
+        if feedback_forced_on:
+            revisit_sender.config.enable_feedback = True
+            revisit_sender.config.auto_feedback_discovery = False
+            revisit_sender._auto_feedback_active = True
+            return
+        if feedback_forced_off:
+            revisit_sender.config.enable_feedback = False
+            revisit_sender.config.auto_feedback_discovery = False
+            revisit_sender._auto_feedback_active = False
+            return
+        revisit_sender.config.enable_feedback = False
+        revisit_sender.config.auto_feedback_discovery = True
+        revisit_sender._auto_feedback_active = bool(
+            getattr(sender, "_auto_feedback_active", False)
+        )
+        revisit_sender._last_auto_uplink_activity_s = getattr(
+            sender,
+            "_last_auto_uplink_activity_s",
+            None,
+        )
     if args.open_loop_max_rounds < 0:
         print("sync error: --open-loop-max-rounds must be >= 0")
         return 2
@@ -1268,6 +1470,12 @@ def _run_sync(args: argparse.Namespace) -> int:
     )
     revisit_queue: collections.deque[_RevisitEntry] = collections.deque()
     revisit_active_keys: set[tuple[str, str]] = set()
+    revisit_lock = threading.Lock()
+    counters_lock = threading.Lock()
+    revisit_worker_stop = threading.Event()
+    revisit_worker_thread: threading.Thread | None = None
+    revisit_sender = SpaceSyncSender(config=dataclasses.replace(sender.config))
+    current_primary_revisit_key: tuple[str, str] | None = None
 
     def _enqueue_revisit(
         *,
@@ -1278,31 +1486,49 @@ def _run_sync(args: argparse.Namespace) -> int:
         prioritize: bool = False,
     ) -> None:
         revisit_key = (destination_host, remote_name)
-        if revisit_key in revisit_active_keys:
-            return
-        entry = _RevisitEntry(
-            source_file=source_file,
-            destination_host=destination_host,
-            remote_name=remote_name,
-            transfer_id_hex=transfer_id_hex,
-        )
-        if prioritize:
-            revisit_queue.appendleft(entry)
-        else:
-            revisit_queue.append(entry)
-        revisit_active_keys.add(revisit_key)
+        with revisit_lock:
+            if revisit_key in revisit_active_keys:
+                return
+            entry = _RevisitEntry(
+                source_file=source_file,
+                destination_host=destination_host,
+                remote_name=remote_name,
+                transfer_id_hex=transfer_id_hex,
+            )
+            if prioritize:
+                revisit_queue.appendleft(entry)
+            else:
+                revisit_queue.append(entry)
+            revisit_active_keys.add(revisit_key)
 
-    def _run_revisit_attempts(max_attempts: int) -> tuple[int, int]:
+    def _run_revisit_attempts(
+        max_attempts: int,
+        *,
+        repair_sender: SpaceSyncSender | None = None,
+    ) -> tuple[int, int]:
         nonlocal should_stop, sent_count, failed
+        if not _feedback_mode_active_for_repairs():
+            return 0, 0
         completed_transfers = 0
         retired_incomplete_transfers = 0
         attempts_remaining = max(0, max_attempts)
-        while revisit_queue and attempts_remaining > 0 and not should_stop:
-            attempts_remaining -= 1
-            entry = revisit_queue.popleft()
+        sender_for_attempts = repair_sender or sender
+        if repair_sender is not None:
+            _sync_revisit_sender_mode()
+        while attempts_remaining > 0 and not should_stop:
+            with revisit_lock:
+                if not revisit_queue:
+                    break
+                entry = revisit_queue.popleft()
+                blocked_key = current_primary_revisit_key
             destination_host = entry.destination_host
             remote_name = entry.remote_name
             revisit_key = (destination_host, remote_name)
+            if repair_sender is not None and blocked_key == revisit_key:
+                with revisit_lock:
+                    revisit_queue.append(entry)
+                continue
+            attempts_remaining -= 1
             transfer_id_hex = entry.transfer_id_hex
             attempts = entry.attempts + 1
             try:
@@ -1310,12 +1536,14 @@ def _run_sync(args: argparse.Namespace) -> int:
             except ValueError:
                 transfer_id = b""
             if len(transfer_id) != 16:
-                failed += 1
+                with counters_lock:
+                    failed += 1
                 retired_incomplete_transfers += 1
-                revisit_active_keys.discard(revisit_key)
+                with revisit_lock:
+                    revisit_active_keys.discard(revisit_key)
                 continue
             source_file = entry.source_file
-            result = sender.send_file(
+            result = sender_for_attempts.send_file(
                 file_path=source_file,
                 destination_host=destination_host,
                 destination_port=args.dest_port,
@@ -1347,18 +1575,59 @@ def _run_sync(args: argparse.Namespace) -> int:
                     f"completed={result.completed} attempt={attempts}"
                 )
             if result.completed:
-                sent_count += 1
+                with counters_lock:
+                    sent_count += 1
                 completed_transfers += 1
-                revisit_active_keys.discard(revisit_key)
+                with revisit_lock:
+                    revisit_active_keys.discard(revisit_key)
+                continue
+            made_feedback_progress = (
+                int(getattr(result, "repair_rounds", 0)) > 0
+                or int(getattr(result, "repaired_chunks", 0)) > 0
+            )
+            if not made_feedback_progress:
+                with revisit_lock:
+                    revisit_queue.append(entry)
                 continue
             if attempts >= args.revisit_incomplete_passes:
-                failed += 1
+                with counters_lock:
+                    failed += 1
                 retired_incomplete_transfers += 1
-                revisit_active_keys.discard(revisit_key)
+                with revisit_lock:
+                    revisit_active_keys.discard(revisit_key)
                 continue
             entry.attempts = attempts
-            revisit_queue.append(entry)
+            with revisit_lock:
+                revisit_queue.append(entry)
         return completed_transfers, retired_incomplete_transfers
+
+    def _start_revisit_worker() -> None:
+        nonlocal revisit_worker_thread
+        if not revisit_enabled or revisit_worker_thread is not None:
+            return
+        revisit_worker_stop.clear()
+
+        def _worker() -> None:
+            while not revisit_worker_stop.is_set() and not should_stop:
+                _run_revisit_attempts(1, repair_sender=revisit_sender)
+                time.sleep(_REVISIT_WORKER_POLL_INTERVAL_S)
+
+        revisit_worker_thread = threading.Thread(
+            target=_worker,
+            name="ssync-sync-revisit-worker",
+            daemon=True,
+        )
+        revisit_worker_thread.start()
+
+    def _stop_revisit_worker() -> None:
+        nonlocal revisit_worker_thread
+        if revisit_worker_thread is None:
+            return
+        revisit_worker_stop.set()
+        revisit_worker_thread.join(timeout=1.0)
+        revisit_worker_thread = None
+
+    _start_checksum_prefetch_worker()
 
     while True:
         round_index += 1
@@ -1409,15 +1678,36 @@ def _run_sync(args: argparse.Namespace) -> int:
                         "completed": True,
                     }
                 else:
-                    result = sender.send_file(
-                        file_path=source_file,
-                        destination_host=destination_host,
-                        destination_port=args.dest_port,
-                        remote_name=remote_name,
-                        stop_requested=lambda: should_stop,
-                        max_feedback_seconds_override=args.primary_feedback_max_seconds,
-                        max_feedback_total_rounds_override=args.primary_feedback_max_rounds,
-                    )
+                    _start_revisit_worker()
+                    with revisit_lock:
+                        current_primary_revisit_key = (destination_host, remote_name)
+                    try:
+                        prefetched_checksum = _get_prefetched_checksum(source_file)
+                        if prefetched_checksum is not None:
+                            result = sender.send_file(
+                                file_path=source_file,
+                                destination_host=destination_host,
+                                destination_port=args.dest_port,
+                                remote_name=remote_name,
+                                stop_requested=lambda: should_stop,
+                                max_feedback_seconds_override=args.primary_feedback_max_seconds,
+                                max_feedback_total_rounds_override=args.primary_feedback_max_rounds,
+                                local_sha256_override=prefetched_checksum,
+                            )
+                        else:
+                            result = sender.send_file(
+                                file_path=source_file,
+                                destination_host=destination_host,
+                                destination_port=args.dest_port,
+                                remote_name=remote_name,
+                                stop_requested=lambda: should_stop,
+                                max_feedback_seconds_override=args.primary_feedback_max_seconds,
+                                max_feedback_total_rounds_override=args.primary_feedback_max_rounds,
+                            )
+                    finally:
+                        with revisit_lock:
+                            current_primary_revisit_key = None
+                        _stop_revisit_worker()
                     status = "sent" if result.completed else "incomplete"
                     if not result.completed:
                         if revisit_enabled:
@@ -1459,7 +1749,9 @@ def _run_sync(args: argparse.Namespace) -> int:
                         f"completed={item_result.get('completed', False)}"
                     )
                 if revisit_enabled and not should_stop:
-                    _run_revisit_attempts(len(revisit_queue))
+                    with revisit_lock:
+                        revisit_count = len(revisit_queue)
+                    _run_revisit_attempts(revisit_count)
 
         if args.dry_run:
             break
@@ -1470,15 +1762,23 @@ def _run_sync(args: argparse.Namespace) -> int:
         if args.open_loop_max_rounds > 0 and round_index >= args.open_loop_max_rounds:
             break
 
+    _stop_revisit_worker()
+    _stop_checksum_prefetch_worker()
     if revisit_enabled and not should_stop:
-        while revisit_queue:
-            queue_size = len(revisit_queue)
+        while True:
+            with revisit_lock:
+                queue_size = len(revisit_queue)
+            if queue_size <= 0:
+                break
             completed_now, retired_now = _run_revisit_attempts(queue_size)
             if completed_now == 0 and retired_now == 0:
                 break
-    if revisit_queue:
-        failed += len(revisit_queue)
+    with revisit_lock:
+        remaining_revisits = len(revisit_queue)
         revisit_queue.clear()
+        revisit_active_keys.clear()
+    if remaining_revisits:
+        failed += remaining_revisits
 
     if failed:
         if args.json_output:
@@ -1532,6 +1832,10 @@ def _run_monitor(args: argparse.Namespace) -> int:
         return run_monitor_tui(
             output_dir=args.output_dir,
             refresh_interval_s=args.refresh_interval_s,
+            monitor_ipc_socket=(
+                args.monitor_ipc_socket
+                or _default_monitor_ipc_socket_for_dir(args.output_dir)
+            ),
         )
     except KeyboardInterrupt:
         return 0

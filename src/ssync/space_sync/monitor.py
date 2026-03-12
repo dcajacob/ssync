@@ -4,6 +4,7 @@ import json
 import math
 import os
 import select
+import socket
 import sys
 import termios
 import time
@@ -28,6 +29,9 @@ _COMPLETED_SCAN_IDLE_INTERVAL_S = 15.0
 _INPUT_POLL_INTERVAL_S = 0.03
 _MODE_FEEDBACK_STICKY_S = 10.0
 _MODE_MIN_SWITCH_DWELL_S = 2.0
+_BEACON_FLASH_WINDOW_S = 0.6
+_MODE_BEACON_FEEDBACK_WINDOW_S = 10.0
+_IPC_MAX_EVENTS_PER_REFRESH = 512
 
 
 @dataclass(slots=True)
@@ -41,6 +45,8 @@ class TransferSnapshot:
     range_count: int
     received_ranges: list[tuple[int, int]]
     stream_cursor_chunk: int
+    last_beacon_tx_s: float = 0.0
+    last_beacon_rx_s: float = 0.0
 
     @property
     def progress_ratio(self) -> float:
@@ -63,18 +69,20 @@ def _estimate_transfer_mode(snapshot: TransferSnapshot) -> tuple[str, str]:
     return ("NO-FEEDBACK", "yellow")
 
 
-def _estimate_overall_mode(snapshots: list[TransferSnapshot]) -> tuple[str, str]:
+def _estimate_overall_mode(
+    snapshots: list[TransferSnapshot],
+    *,
+    now_s: float | None = None,
+) -> tuple[str, str]:
     if not snapshots:
         return ("IDLE", "grey58")
-    modes = [_estimate_transfer_mode(snapshot)[0] for snapshot in snapshots]
-    if "FEEDBACK" in modes:
+    current_s = time.monotonic() if now_s is None else now_s
+    if any(
+        snapshot.last_beacon_tx_s > 0
+        and (current_s - snapshot.last_beacon_tx_s) <= _MODE_BEACON_FEEDBACK_WINDOW_S
+        for snapshot in snapshots
+    ):
         return ("FEEDBACK", "magenta")
-    if "NO-FEEDBACK" in modes:
-        return ("NO-FEEDBACK", "yellow")
-    if all(mode == "EMPTY" for mode in modes):
-        return ("EMPTY", "grey58")
-    if all(mode in {"COMPLETE", "EMPTY"} for mode in modes):
-        return ("COMPLETE", "green")
     return ("NO-FEEDBACK", "yellow")
 
 
@@ -107,6 +115,19 @@ def _safe_int(value: object, default: int = 0) -> int:
     if isinstance(value, str):
         try:
             return int(value)
+        except ValueError:
+            return default
+    return default
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
         except ValueError:
             return default
     return default
@@ -171,10 +192,101 @@ def _read_transfer_snapshots(output_dir: Path) -> list[TransferSnapshot]:
                         max(0, _safe_int(manifest.get("total_chunks", 0)) - 1),
                     ),
                 ),
+                last_beacon_tx_s=_safe_float(transfer.get("last_beacon_tx_s", 0.0)),
+                last_beacon_rx_s=_safe_float(transfer.get("last_beacon_rx_s", 0.0)),
             )
         )
     snapshots.sort(key=lambda item: (item.file_name, item.transfer_id_hex))
     return snapshots
+
+
+def _drain_monitor_ipc_events(
+    sock: socket.socket | None,
+    *,
+    max_events: int = _IPC_MAX_EVENTS_PER_REFRESH,
+) -> list[dict[str, object]]:
+    if sock is None:
+        return []
+    events: list[dict[str, object]] = []
+    for _ in range(max(1, max_events)):
+        try:
+            payload = sock.recv(65535)
+        except (BlockingIOError, TimeoutError):
+            break
+        except OSError:
+            break
+        if not payload:
+            break
+        try:
+            event = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def _merge_monitor_ipc_events(
+    snapshots: list[TransferSnapshot],
+    events: list[dict[str, object]],
+) -> list[TransferSnapshot]:
+    if not events:
+        return snapshots
+    by_id = {snapshot.transfer_id_hex: snapshot for snapshot in snapshots}
+    for event in events:
+        event_type = str(event.get("type", ""))
+        transfer_id_hex = str(event.get("transfer_id_hex", ""))
+        if not transfer_id_hex:
+            continue
+        current = by_id.get(transfer_id_hex)
+        if event_type == "transfer_terminal":
+            by_id.pop(transfer_id_hex, None)
+            continue
+        if event_type in {"beacon_tx", "beacon_rx"}:
+            if current is None:
+                continue
+            ts_s = _safe_float(event.get("ts_s", 0.0))
+            if event_type == "beacon_tx":
+                current.last_beacon_tx_s = max(current.last_beacon_tx_s, ts_s)
+            else:
+                current.last_beacon_rx_s = max(current.last_beacon_rx_s, ts_s)
+            continue
+        if event_type != "transfer_update":
+            continue
+        if current is None:
+            current = TransferSnapshot(
+                transfer_id_hex=transfer_id_hex,
+                file_name=str(event.get("file_name", "")),
+                file_size=_safe_int(event.get("file_size", 0)),
+                total_chunks=_safe_int(event.get("total_chunks", 0)),
+                chunk_size=_safe_int(event.get("chunk_size", 0)),
+                received_chunks=_safe_int(event.get("received_chunks", 0)),
+                range_count=_safe_int(event.get("range_count", 0)),
+                received_ranges=[],
+                stream_cursor_chunk=_safe_int(event.get("stream_cursor_chunk", 0)),
+                last_beacon_tx_s=_safe_float(event.get("last_beacon_tx_s", 0.0)),
+                last_beacon_rx_s=_safe_float(event.get("last_beacon_rx_s", 0.0)),
+            )
+            by_id[transfer_id_hex] = current
+            continue
+        current.file_name = str(event.get("file_name", current.file_name))
+        current.file_size = _safe_int(event.get("file_size", current.file_size))
+        current.total_chunks = _safe_int(event.get("total_chunks", current.total_chunks))
+        current.chunk_size = _safe_int(event.get("chunk_size", current.chunk_size))
+        current.received_chunks = _safe_int(event.get("received_chunks", current.received_chunks))
+        current.range_count = _safe_int(event.get("range_count", current.range_count))
+        current.stream_cursor_chunk = _safe_int(
+            event.get("stream_cursor_chunk", current.stream_cursor_chunk)
+        )
+        current.last_beacon_tx_s = _safe_float(
+            event.get("last_beacon_tx_s", current.last_beacon_tx_s)
+        )
+        current.last_beacon_rx_s = _safe_float(
+            event.get("last_beacon_rx_s", current.last_beacon_rx_s)
+        )
+    merged = list(by_id.values())
+    merged.sort(key=lambda item: (item.file_name, item.transfer_id_hex))
+    return merged
 
 
 def _count_completed_files(output_dir: Path) -> tuple[int, int]:
@@ -323,6 +435,75 @@ def _build_hole_map_2d(snapshot: TransferSnapshot, width: int, height: int) -> T
     return text
 
 
+def _autoselect_active_transfer_index(
+    snapshots: list[TransferSnapshot],
+    *,
+    selected_index: int,
+    activity_bytes: dict[str, int],
+    throughput_bps: dict[str, float],
+) -> int:
+    if not snapshots:
+        return 0
+    clamped_selected = max(0, min(selected_index, len(snapshots) - 1))
+    best_activity_index = -1
+    best_activity_key = (0, 0.0, 0)
+    for index, snapshot in enumerate(snapshots):
+        activity = max(0, activity_bytes.get(snapshot.transfer_id_hex, 0))
+        throughput = max(0.0, throughput_bps.get(snapshot.transfer_id_hex, 0.0))
+        tie_breaker = snapshot.received_chunks
+        key = (activity, throughput, tie_breaker)
+        if key > best_activity_key:
+            best_activity_key = key
+            best_activity_index = index
+    if best_activity_index >= 0 and best_activity_key[0] > 0:
+        return best_activity_index
+    best_rate_index = -1
+    best_rate_key = (0.0, 0)
+    for index, snapshot in enumerate(snapshots):
+        throughput = max(0.0, throughput_bps.get(snapshot.transfer_id_hex, 0.0))
+        rate_key = (throughput, snapshot.received_chunks)
+        if rate_key > best_rate_key:
+            best_rate_key = rate_key
+            best_rate_index = index
+    if best_rate_index >= 0 and best_rate_key[0] > 0.0:
+        return best_rate_index
+    return clamped_selected
+
+
+def _autoselect_new_transfer_index(
+    snapshots: list[TransferSnapshot],
+    *,
+    selected_index: int,
+    new_transfer_ids: set[str],
+    activity_bytes: dict[str, int],
+    throughput_bps: dict[str, float],
+) -> int:
+    if not snapshots:
+        return 0
+    clamped_selected = max(0, min(selected_index, len(snapshots) - 1))
+    if not new_transfer_ids:
+        return clamped_selected
+    best_new_index = -1
+    best_new_key = (0, 0.0, 0, "")
+    for index, snapshot in enumerate(snapshots):
+        if snapshot.transfer_id_hex not in new_transfer_ids:
+            continue
+        activity = max(0, activity_bytes.get(snapshot.transfer_id_hex, 0))
+        throughput = max(0.0, throughput_bps.get(snapshot.transfer_id_hex, 0.0))
+        key = (
+            activity,
+            throughput,
+            snapshot.received_chunks,
+            snapshot.transfer_id_hex,
+        )
+        if key > best_new_key:
+            best_new_key = key
+            best_new_index = index
+    if best_new_index >= 0:
+        return best_new_index
+    return clamped_selected
+
+
 def _render_monitor(
     *,
     output_dir: Path,
@@ -346,6 +527,23 @@ def _render_monitor(
     summary.append(_format_bytes(completed_size), style="cyan")
     summary.append("  mode=", style="bold")
     summary.append(overall_mode_label, style=overall_mode_style)
+    now_s = time.monotonic()
+    beacon_rx_active = any(
+        snapshot.last_beacon_rx_s > 0
+        and (now_s - snapshot.last_beacon_rx_s) <= _BEACON_FLASH_WINDOW_S
+        for snapshot in snapshots
+    )
+    beacon_tx_active = any(
+        snapshot.last_beacon_tx_s > 0
+        and (now_s - snapshot.last_beacon_tx_s) <= _BEACON_FLASH_WINDOW_S
+        for snapshot in snapshots
+    )
+    beacon_summary = Text("beacons: ", style="grey62")
+    beacon_summary.append("S->R ", style="grey62")
+    beacon_summary.append("●", style="bold green" if beacon_rx_active else "grey35")
+    beacon_summary.append("   ", style="grey62")
+    beacon_summary.append("R->S ", style="grey62")
+    beacon_summary.append("●", style="bold cyan" if beacon_tx_active else "grey35")
 
     table = Table(expand=True)
     table.add_column("File", overflow="fold")
@@ -377,6 +575,7 @@ def _render_monitor(
             Text("Space Sync Receiver Monitor", style="bold"),
             Text(f"output_dir={output_dir}", style="grey70"),
             summary,
+            beacon_summary,
             help_line,
         ),
         border_style="blue",
@@ -476,7 +675,26 @@ class _KeyReader:
         return None
 
 
-def run_monitor_tui(output_dir: Path, refresh_interval_s: float) -> int:
+def _open_monitor_ipc_socket(path: Path | None) -> socket.socket | None:
+    if path is None:
+        return None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            path.unlink()
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sock.bind(str(path))
+        sock.setblocking(False)
+        return sock
+    except OSError:
+        return None
+
+
+def run_monitor_tui(
+    output_dir: Path,
+    refresh_interval_s: float,
+    monitor_ipc_socket: Path | None = None,
+) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     refresh_interval_s = max(0.1, refresh_interval_s)
     transfer_history: dict[str, deque[tuple[float, int]]] = {}
@@ -486,99 +704,132 @@ def run_monitor_tui(output_dir: Path, refresh_interval_s: float) -> int:
     last_completed_scan_s = 0.0
     selected_index = 0
     snapshots: list[TransferSnapshot] = []
+    previous_active_ids: set[str] = set()
     displayed_mode: tuple[str, str] = ("IDLE", "grey58")
     displayed_mode_since_s = time.monotonic()
     last_feedback_seen_s = float("-inf")
     next_refresh_s = 0.0
     render_needed = True
+    ipc_sock = _open_monitor_ipc_socket(monitor_ipc_socket)
     with _KeyReader() as keys:
-        with Live(auto_refresh=False, screen=True) as live:
-            while True:
-                now = time.monotonic()
-                if now >= next_refresh_s:
-                    snapshots = _read_transfer_snapshots(output_dir)
-                    scan_interval_s = (
-                        _COMPLETED_SCAN_ACTIVE_INTERVAL_S
-                        if snapshots
-                        else _COMPLETED_SCAN_IDLE_INTERVAL_S
+        try:
+            with Live(auto_refresh=False, screen=True) as live:
+                while True:
+                    now = time.monotonic()
+                    if now >= next_refresh_s:
+                        snapshots = _read_transfer_snapshots(output_dir)
+                        snapshots = _merge_monitor_ipc_events(
+                            snapshots,
+                            _drain_monitor_ipc_events(ipc_sock),
+                        )
+                        activity_bytes: dict[str, int] = {}
+                        scan_interval_s = (
+                            _COMPLETED_SCAN_ACTIVE_INTERVAL_S
+                            if snapshots
+                            else _COMPLETED_SCAN_IDLE_INTERVAL_S
+                        )
+                        if (
+                            last_completed_scan_s <= 0
+                            or now - last_completed_scan_s >= scan_interval_s
+                        ):
+                            completed_count, completed_size = _count_completed_files(output_dir)
+                            last_completed_scan_s = now
+                        if snapshots:
+                            selected_index = max(0, min(selected_index, len(snapshots) - 1))
+                        else:
+                            selected_index = 0
+                        active_ids = {snapshot.transfer_id_hex for snapshot in snapshots}
+                        new_active_ids = active_ids - previous_active_ids
+                        for snapshot in snapshots:
+                            sample = (
+                                now,
+                                snapshot.received_chunks * snapshot.chunk_size,
+                            )
+                            history = transfer_history.setdefault(snapshot.transfer_id_hex, deque())
+                            latest_bytes = history[-1][1] if history else None
+                            history.append(sample)
+                            if latest_bytes is not None:
+                                delta = sample[1] - latest_bytes
+                                if delta > 0:
+                                    activity_bytes[snapshot.transfer_id_hex] = delta
+                            cutoff = now - _RATE_WINDOW_S
+                            while len(history) > 2 and history[0][0] < cutoff:
+                                history.popleft()
+                            if len(history) >= 2:
+                                oldest_time_s, oldest_bytes = history[0]
+                                newest_time_s, newest_bytes = history[-1]
+                                delta_s = newest_time_s - oldest_time_s
+                                delta_bytes = newest_bytes - oldest_bytes
+                                if delta_s > 0 and delta_bytes > 0:
+                                    throughput_bps[snapshot.transfer_id_hex] = (
+                                        delta_bytes * 8
+                                    ) / delta_s
+                        stale_ids = [item for item in transfer_history if item not in active_ids]
+                        for stale_id in stale_ids:
+                            transfer_history.pop(stale_id, None)
+                            throughput_bps.pop(stale_id, None)
+                        selected_index = _autoselect_new_transfer_index(
+                            snapshots,
+                            selected_index=selected_index,
+                            new_transfer_ids=new_active_ids,
+                            activity_bytes=activity_bytes,
+                            throughput_bps=throughput_bps,
+                        )
+                        previous_active_ids = active_ids
+                        candidate_mode = _estimate_overall_mode(snapshots)
+                        (
+                            displayed_mode,
+                            displayed_mode_since_s,
+                            last_feedback_seen_s,
+                        ) = _stabilize_overall_mode(
+                            displayed_mode=displayed_mode,
+                            candidate_mode=candidate_mode,
+                            now_s=now,
+                            displayed_since_s=displayed_mode_since_s,
+                            last_feedback_seen_s=last_feedback_seen_s,
+                        )
+                        next_refresh_s = now + refresh_interval_s
+                        render_needed = True
+                    poll_timeout_s = 0.0 if render_needed else min(
+                        _INPUT_POLL_INTERVAL_S,
+                        max(0.0, next_refresh_s - time.monotonic()),
                     )
-                    if (
-                        last_completed_scan_s <= 0
-                        or now - last_completed_scan_s >= scan_interval_s
-                    ):
-                        completed_count, completed_size = _count_completed_files(output_dir)
-                        last_completed_scan_s = now
+                    key = keys.poll(timeout_s=poll_timeout_s)
+                    if key == "quit":
+                        return 0
+                    if key == "up":
+                        selected_index -= 1
+                        render_needed = True
+                    elif key == "down":
+                        selected_index += 1
+                        render_needed = True
                     if snapshots:
                         selected_index = max(0, min(selected_index, len(snapshots) - 1))
                     else:
                         selected_index = 0
-                    active_ids = {snapshot.transfer_id_hex for snapshot in snapshots}
-                    for snapshot in snapshots:
-                        sample = (
-                            now,
-                            snapshot.received_chunks * snapshot.chunk_size,
-                        )
-                        history = transfer_history.setdefault(snapshot.transfer_id_hex, deque())
-                        history.append(sample)
-                        cutoff = now - _RATE_WINDOW_S
-                        while len(history) > 2 and history[0][0] < cutoff:
-                            history.popleft()
-                        if len(history) >= 2:
-                            oldest_time_s, oldest_bytes = history[0]
-                            newest_time_s, newest_bytes = history[-1]
-                            delta_s = newest_time_s - oldest_time_s
-                            delta_bytes = newest_bytes - oldest_bytes
-                            if delta_s > 0 and delta_bytes > 0:
-                                throughput_bps[snapshot.transfer_id_hex] = (
-                                    delta_bytes * 8
-                                ) / delta_s
-                    stale_ids = [item for item in transfer_history if item not in active_ids]
-                    for stale_id in stale_ids:
-                        transfer_history.pop(stale_id, None)
-                        throughput_bps.pop(stale_id, None)
-                    candidate_mode = _estimate_overall_mode(snapshots)
-                    (
-                        displayed_mode,
-                        displayed_mode_since_s,
-                        last_feedback_seen_s,
-                    ) = _stabilize_overall_mode(
-                        displayed_mode=displayed_mode,
-                        candidate_mode=candidate_mode,
-                        now_s=now,
-                        displayed_since_s=displayed_mode_since_s,
-                        last_feedback_seen_s=last_feedback_seen_s,
+                    if not render_needed:
+                        continue
+                    live.update(
+                        _render_monitor(
+                            output_dir=output_dir,
+                            snapshots=snapshots,
+                            throughput_bps=throughput_bps,
+                            selected_index=selected_index,
+                            completed_count=completed_count,
+                            completed_size=completed_size,
+                            overall_mode=displayed_mode,
+                        ),
+                        refresh=True,
                     )
-                    next_refresh_s = now + refresh_interval_s
-                    render_needed = True
-                poll_timeout_s = 0.0 if render_needed else min(
-                    _INPUT_POLL_INTERVAL_S,
-                    max(0.0, next_refresh_s - time.monotonic()),
-                )
-                key = keys.poll(timeout_s=poll_timeout_s)
-                if key == "quit":
-                    return 0
-                if key == "up":
-                    selected_index -= 1
-                    render_needed = True
-                elif key == "down":
-                    selected_index += 1
-                    render_needed = True
-                if snapshots:
-                    selected_index = max(0, min(selected_index, len(snapshots) - 1))
-                else:
-                    selected_index = 0
-                if not render_needed:
-                    continue
-                live.update(
-                    _render_monitor(
-                        output_dir=output_dir,
-                        snapshots=snapshots,
-                        throughput_bps=throughput_bps,
-                        selected_index=selected_index,
-                        completed_count=completed_count,
-                        completed_size=completed_size,
-                        overall_mode=displayed_mode,
-                    ),
-                    refresh=True,
-                )
-                render_needed = False
+                    render_needed = False
+        finally:
+            if ipc_sock is not None:
+                try:
+                    if monitor_ipc_socket is not None and monitor_ipc_socket.exists():
+                        monitor_ipc_socket.unlink()
+                except OSError:
+                    pass
+                try:
+                    ipc_sock.close()
+                except OSError:
+                    pass

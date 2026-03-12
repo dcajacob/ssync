@@ -76,11 +76,15 @@ class SpaceSyncSender:
         max_repair_rounds_override: int | None = None,
         max_feedback_seconds_override: float | None = None,
         max_feedback_total_rounds_override: int | None = None,
+        local_sha256_override: bytes | None = None,
     ) -> SendResult:
         file_path = file_path.resolve()
         file_stat = file_path.stat()
         file_size = file_stat.st_size
         total_chunks = math.ceil(file_size / self.config.chunk_size) if file_size else 0
+        file_checksum = local_sha256_override
+        if file_checksum is None or len(file_checksum) != 32:
+            file_checksum = self.local_file_checksum(file_path)
         metadata = {
             int(MetadataType.SOURCE_MTIME_NS): int(file_stat.st_mtime_ns).to_bytes(8, "big"),
         }
@@ -90,7 +94,7 @@ class SpaceSyncSender:
             file_size=file_size,
             chunk_size=self.config.chunk_size,
             total_chunks=total_chunks,
-            sha256=self.local_file_checksum(file_path),
+            sha256=file_checksum,
             metadata=metadata,
         )
         destination = (destination_host, destination_port)

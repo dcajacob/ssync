@@ -52,6 +52,31 @@ def _wait_for_predicate(predicate: object, timeout_s: float = 3.0) -> bool:
     return False
 
 
+def _wait_for_ipc_events(
+    sock: socket.socket,
+    *,
+    min_events: int,
+    timeout_s: float = 2.0,
+) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline and len(events) < min_events:
+        try:
+            payload = sock.recv(65535)
+        except (BlockingIOError, TimeoutError):
+            time.sleep(0.02)
+            continue
+        if not payload:
+            continue
+        try:
+            decoded = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(decoded, dict):
+            events.append(decoded)
+    return events
+
+
 def test_open_loop_local_transfer(tmp_path: Path) -> None:
     receiver_dir = tmp_path / "rx-open"
     receiver = SpaceSyncReceiver(
@@ -80,6 +105,48 @@ def test_open_loop_local_transfer(tmp_path: Path) -> None:
         receiver.stop()
 
 
+def test_receiver_emits_monitor_ipc_events(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-ipc-events"
+    ipc_socket_path = tmp_path / "ssync-monitor-test.sock"
+    monitor_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    monitor_sock.bind(str(ipc_socket_path))
+    monitor_sock.setblocking(False)
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(
+            output_dir=receiver_dir,
+            enable_feedback=True,
+            monitor_ipc_socket=ipc_socket_path,
+        ),
+    )
+    receiver.start()
+    try:
+        source_path = tmp_path / "source-ipc.bin"
+        source_path.write_bytes(b"ipc-events-" * 8_000)
+        sender = SpaceSyncSender(
+            config=SenderConfig(
+                chunk_size=256,
+                enable_feedback=True,
+                feedback_wait_s=0.2,
+                max_repair_rounds=1,
+            )
+        )
+        sender.send_file(source_path, "127.0.0.1", receiver.bind_port)
+        events = _wait_for_ipc_events(monitor_sock, min_events=2, timeout_s=3.0)
+        assert events
+        event_types = {str(item.get("type", "")) for item in events}
+        assert "transfer_update" in event_types
+        assert ("beacon_rx" in event_types) or ("beacon_tx" in event_types)
+    finally:
+        receiver.stop()
+        monitor_sock.close()
+        try:
+            ipc_socket_path.unlink()
+        except OSError:
+            pass
+
+
 def test_feedback_zero_chunk_send_returns_immediately(tmp_path: Path) -> None:
     receiver_dir = tmp_path / "rx-empty-feedback"
     receiver = SpaceSyncReceiver(
@@ -104,6 +171,11 @@ def test_feedback_zero_chunk_send_returns_immediately(tmp_path: Path) -> None:
         assert result.completed is True
         assert result.total_chunks == 0
         assert elapsed < 0.5
+        target_path = receiver_dir / source_path.name
+        assert _wait_for_file(target_path)
+        assert target_path.read_bytes() == b""
+        part_path = receiver_dir / f".{result.transfer_id_hex}.part"
+        assert not part_path.exists()
     finally:
         receiver.stop()
 
@@ -757,6 +829,52 @@ def test_receiver_chains_post_fin_repairs_without_periodic_wait(tmp_path: Path) 
         target_path = receiver_dir / source_path.name
         assert _wait_for_file(target_path, timeout_s=4.0)
         assert target_path.read_bytes() == source_payload
+    finally:
+        receiver.stop()
+
+
+def test_receiver_keeps_stale_incomplete_transfer_for_resume(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-stale-incomplete-retained"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(
+            output_dir=receiver_dir,
+            enable_feedback=True,
+            transfer_inactivity_timeout_s=0.5,
+        ),
+    )
+    receiver.start()
+    try:
+        source_path = tmp_path / "source-stale-retain.bin"
+        source_payload = b"retain-stale-" * 80_000
+        source_path.write_bytes(source_payload)
+        sender = SpaceSyncSender(
+            config=SenderConfig(
+                chunk_size=256,
+                enable_feedback=False,
+            )
+        )
+        stop_deadline = time.monotonic() + 0.02
+        result = sender.send_file(
+            source_path,
+            "127.0.0.1",
+            receiver.bind_port,
+            stop_requested=lambda: time.monotonic() >= stop_deadline,
+        )
+        assert result.completed is False
+        journal_path = receiver_dir / ".ssync-journal.json"
+        assert _wait_for_file(journal_path, timeout_s=2.0)
+        time.sleep(0.8)
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        transfers = journal.get("transfers", [])
+        assert isinstance(transfers, list)
+        assert any(
+            isinstance(item, dict)
+            and isinstance(item.get("manifest"), dict)
+            and item["manifest"].get("file_name") == source_path.name
+            for item in transfers
+        )
     finally:
         receiver.stop()
 

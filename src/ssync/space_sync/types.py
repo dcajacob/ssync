@@ -113,6 +113,7 @@ class ReceiverConfig:
     pre_metadata_max_pending_bytes_per_transfer: int = 512 * 1024
     pre_metadata_max_pending_transfers: int = 128
     pre_metadata_ttl_s: float = 30.0
+    monitor_ipc_socket: Path | None = None
 
 
 @dataclass(slots=True)

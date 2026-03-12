@@ -66,6 +66,9 @@ frame-specific payloads.
 - Prototype runs over IPv4 UDP in local tests.
 - Receiver transfer state is persisted as a local journal in output directories so
   incomplete transfers can resume after receiver restart.
+- Receiver also emits live local monitor events via Unix datagram IPC
+  (`.ssync-monitor.sock` under the receiver root by default). Monitor uses this
+  for low-latency updates and beacon strobes, while journal remains bootstrap/fallback.
 - One active sender destination per transfer in the current implementation.
 - Receiver can correlate repeated logical transfers by manifest signature to continue
   filling existing partial files across changing transfer IDs.

@@ -40,6 +40,7 @@ from .types import (
 LOGGER = logging.getLogger(__name__)
 _COMPLETED_HASH_CACHE_MAX_ENTRIES = 4096
 _REPAIR_PROGRESS_EARLY_RELEASE_RATIO = 0.75
+_MONITOR_IPC_MIN_UPDATE_INTERVAL_S = 0.05
 @dataclass(slots=True)
 class _TransferStateData:
     manifest: TransferManifest
@@ -63,6 +64,8 @@ class _TransferStateData:
     mmap_dirty: bool = False
     last_mmap_flush_s: float = 0.0
     last_beacon_s: float = 0.0
+    last_beacon_rx_s: float = 0.0
+    last_monitor_publish_s: float = 0.0
 
 
 @dataclass(slots=True)
@@ -94,6 +97,7 @@ class SpaceSyncReceiver:
         self._completed_hash_cache: dict[Path, tuple[int, int, bytes]] = {}
         self._pending_pre_metadata: dict[bytes, _PendingPreMetadata] = {}
         self._pending_pre_metadata_total_bytes = 0
+        self._monitor_ipc_send_sock: socket.socket | None = None
 
     @property
     def completed_transfers(self) -> list[ReceivedTransferInfo]:
@@ -151,6 +155,12 @@ class SpaceSyncReceiver:
             for transfer in self._transfers.values():
                 self._close_transfer_mmap(transfer)
             self._flush_journal_locked(force=True)
+        if self._monitor_ipc_send_sock is not None:
+            try:
+                self._monitor_ipc_send_sock.close()
+            except OSError:
+                pass
+            self._monitor_ipc_send_sock = None
         LOGGER.info("receiver stopped bind=%s:%d", self.bind_host, self.bind_port)
 
     def run(self) -> None:
@@ -238,6 +248,13 @@ class SpaceSyncReceiver:
                     return
                 transfer.source_addr = source_addr
                 transfer.last_activity_s = time.monotonic()
+                transfer.last_beacon_rx_s = transfer.last_activity_s
+                self._mark_journal_dirty_locked()
+                self._publish_beacon_event_locked(
+                    transfer,
+                    direction="rx",
+                    timestamp_s=transfer.last_activity_s,
+                )
             return
 
     def _prepare_transfer(
@@ -273,6 +290,7 @@ class SpaceSyncReceiver:
             return
         part_path = self.config.output_dir / f".{manifest.transfer_id.hex()}.part"
         buffered_chunks: list[tuple[int, bytes]] = []
+        transfer_to_finalize: _TransferStateData | None = None
         with self._lock:
             existing = self._transfers.get(manifest.transfer_id)
             if existing is not None:
@@ -284,6 +302,7 @@ class SpaceSyncReceiver:
                     return
                 existing.source_addr = source_addr
                 self._maybe_advertise_receiver_state(sock, existing)
+                self._publish_transfer_update_locked(existing, force=True)
                 return
             resumed = self._find_transfer_by_manifest_locked(manifest)
             if resumed is not None:
@@ -309,6 +328,7 @@ class SpaceSyncReceiver:
                     )
                 transfer.source_addr = source_addr
                 self._maybe_advertise_receiver_state(sock, transfer)
+                self._publish_transfer_update_locked(transfer, force=True)
                 return
             if not part_path.exists():
                 with part_path.open("wb") as stream:
@@ -326,7 +346,13 @@ class SpaceSyncReceiver:
             )
             self._ensure_mapped_file_locked(self._transfers[manifest.transfer_id])
             buffered_chunks = self._pop_pre_metadata_buffer_locked(manifest.transfer_id)
+            if manifest.total_chunks == 0:
+                transfer_to_finalize = self._transfers[manifest.transfer_id]
             self._mark_journal_dirty_locked()
+            self._publish_transfer_update_locked(
+                self._transfers[manifest.transfer_id],
+                force=True,
+            )
         LOGGER.debug(
             "transfer prepared transfer_id=%s file=%s chunks=%d source=%s:%d",
             manifest.transfer_id.hex(),
@@ -335,6 +361,11 @@ class SpaceSyncReceiver:
             source_addr[0],
             source_addr[1],
         )
+        if transfer_to_finalize is not None:
+            # Empty files have no DATA frames and should complete as soon as
+            # metadata is accepted instead of waiting for inactivity timeout.
+            self._finalize_transfer(sock, transfer_to_finalize, [])
+            return
         if buffered_chunks:
             LOGGER.debug(
                 "transfer_id=%s replaying_pre_metadata_chunks count=%d",
@@ -526,6 +557,9 @@ class SpaceSyncReceiver:
             if chunk_index > transfer.highest_chunk_seen:
                 transfer.highest_chunk_seen = chunk_index
             transfer.last_chunk_seen = chunk_index
+            # Keep receiver->sender beacons alive even under sustained inbound
+            # traffic; relying only on timeout ticks can starve beacon sends.
+            self._maybe_send_beacon(sock, transfer)
             if chunk_index > 0 and chunk_index % 4096 == 0:
                 LOGGER.debug(
                     "transfer_id=%s receiver_chunk_progress=%d/%d",
@@ -541,6 +575,7 @@ class SpaceSyncReceiver:
                 finalize_missing_ranges = []
             if changed:
                 self._mark_journal_dirty_locked()
+                self._publish_transfer_update_locked(transfer, force=False)
         if finalize_transfer is not None and finalize_missing_ranges is not None:
             self._finalize_transfer(sock, finalize_transfer, finalize_missing_ranges)
 
@@ -707,6 +742,12 @@ class SpaceSyncReceiver:
         )
         if sent:
             transfer.last_beacon_s = now
+            self._mark_journal_dirty_locked()
+            self._publish_beacon_event_locked(
+                transfer,
+                direction="tx",
+                timestamp_s=now,
+            )
 
     def _ensure_mapped_file_locked(self, transfer: _TransferStateData) -> None:
         if transfer.mapped_file is not None:
@@ -829,8 +870,25 @@ class SpaceSyncReceiver:
                 return
             missing_ranges = transfer.tracker.missing_ranges()
             transfer_id_hex = transfer.manifest.transfer_id.hex()
+            if missing_ranges:
+                # Keep stale incomplete transfers resumable and visible in the
+                # active journal instead of finalizing/removing them.
+                transfer.last_activity_s = time.monotonic()
+                transfer.repair_request_in_flight = False
+                transfer.requested_chunks_at_last_request = 0
+                self._mark_journal_dirty_locked()
+                LOGGER.warning(
+                    (
+                        "transfer stale transfer_id=%s inactivity=%.2fs "
+                        "retaining incomplete transfer for resume missing=%s"
+                    ),
+                    transfer_id_hex,
+                    inactivity_s,
+                    summarize_ranges(missing_ranges),
+                )
+                return
         LOGGER.warning(
-            "transfer stale transfer_id=%s inactivity=%.2fs finalizing incomplete missing=%s",
+            "transfer stale transfer_id=%s inactivity=%.2fs finalizing missing=%s",
             transfer_id_hex,
             inactivity_s,
             summarize_ranges(missing_ranges),
@@ -929,6 +987,11 @@ class SpaceSyncReceiver:
             state.name,
             summarize_ranges(missing_ranges),
             hash_mismatch,
+        )
+        self._publish_transfer_terminal_event(
+            transfer_id_hex=transfer_id_hex,
+            state=state.name,
+            missing_ranges=missing_ranges,
         )
         if feedback_enabled:
             for _ in range(status_repeat):
@@ -1044,6 +1107,97 @@ class SpaceSyncReceiver:
     def _journal_path(self) -> Path:
         return self.config.output_dir / ".ssync-journal.json"
 
+    def _monitor_ipc_socket_path(self) -> Path | None:
+        return self.config.monitor_ipc_socket
+
+    def _ensure_monitor_ipc_sender(self) -> socket.socket | None:
+        if self._monitor_ipc_send_sock is not None:
+            return self._monitor_ipc_send_sock
+        ipc_path = self._monitor_ipc_socket_path()
+        if ipc_path is None:
+            return None
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sock.setblocking(False)
+        self._monitor_ipc_send_sock = sock
+        return sock
+
+    def _publish_monitor_event(self, payload: dict[str, object]) -> None:
+        ipc_path = self._monitor_ipc_socket_path()
+        if ipc_path is None:
+            return
+        sock = self._ensure_monitor_ipc_sender()
+        if sock is None:
+            return
+        try:
+            sock.sendto(json.dumps(payload, separators=(",", ":")).encode("utf-8"), str(ipc_path))
+        except (BlockingIOError, FileNotFoundError, OSError):
+            return
+
+    def _publish_transfer_update_locked(self, transfer: _TransferStateData, *, force: bool) -> None:
+        now = time.monotonic()
+        if (
+            not force
+            and transfer.last_monitor_publish_s > 0
+            and now - transfer.last_monitor_publish_s < _MONITOR_IPC_MIN_UPDATE_INTERVAL_S
+        ):
+            return
+        transfer.last_monitor_publish_s = now
+        self._publish_monitor_event(
+            {
+                "type": "transfer_update",
+                "transfer_id_hex": transfer.manifest.transfer_id.hex(),
+                "file_name": transfer.manifest.file_name,
+                "file_size": transfer.manifest.file_size,
+                "chunk_size": transfer.manifest.chunk_size,
+                "total_chunks": transfer.manifest.total_chunks,
+                "received_chunks": transfer.tracker.received_count(),
+                "range_count": len(transfer.tracker.received_ranges()),
+                "stream_cursor_chunk": max(transfer.last_chunk_seen, transfer.highest_chunk_seen),
+                "last_beacon_tx_s": transfer.last_beacon_s,
+                "last_beacon_rx_s": transfer.last_beacon_rx_s,
+                "ts_s": now,
+            }
+        )
+
+    def _publish_beacon_event_locked(
+        self,
+        transfer: _TransferStateData,
+        *,
+        direction: str,
+        timestamp_s: float | None = None,
+    ) -> None:
+        now = time.monotonic() if timestamp_s is None else timestamp_s
+        if direction == "tx":
+            transfer.last_beacon_s = now
+        elif direction == "rx":
+            transfer.last_beacon_rx_s = now
+        else:
+            return
+        self._publish_monitor_event(
+            {
+                "type": f"beacon_{direction}",
+                "transfer_id_hex": transfer.manifest.transfer_id.hex(),
+                "ts_s": now,
+            }
+        )
+
+    def _publish_transfer_terminal_event(
+        self,
+        *,
+        transfer_id_hex: str,
+        state: str,
+        missing_ranges: list[tuple[int, int]],
+    ) -> None:
+        self._publish_monitor_event(
+            {
+                "type": "transfer_terminal",
+                "transfer_id_hex": transfer_id_hex,
+                "state": state,
+                "missing_ranges": [list(item) for item in missing_ranges],
+                "ts_s": time.monotonic(),
+            }
+        )
+
     def _manifest_signature(self, manifest: TransferManifest) -> tuple[int, int, bytes, str]:
         return (
             manifest.file_size,
@@ -1075,6 +1229,8 @@ class SpaceSyncReceiver:
                     "highest_chunk_seen": transfer.highest_chunk_seen,
                     "last_chunk_seen": transfer.last_chunk_seen,
                     "source_addr": [transfer.source_addr[0], transfer.source_addr[1]],
+                    "last_beacon_tx_s": transfer.last_beacon_s,
+                    "last_beacon_rx_s": transfer.last_beacon_rx_s,
                 }
             )
         journal_path = self._journal_path()
@@ -1206,6 +1362,10 @@ class SpaceSyncReceiver:
             last_activity_s=time.monotonic(),
             highest_chunk_seen=max(-1, highest_chunk_seen),
             last_chunk_seen=max(-1, last_chunk_seen),
+            last_beacon_s=self._coerce_optional_float(raw.get("last_beacon_tx_s", 0.0), 0.0),
+            last_beacon_rx_s=self._coerce_optional_float(
+                raw.get("last_beacon_rx_s", 0.0), 0.0
+            ),
         )
         self._ensure_mapped_file_locked(transfer)
         return transfer
@@ -1242,6 +1402,16 @@ class SpaceSyncReceiver:
             return int(value)
         if isinstance(value, str):
             return int(value)
+        return default
+
+    @staticmethod
+    def _coerce_optional_float(value: object, default: float) -> float:
+        if isinstance(value, bool):
+            return default
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            return float(value)
         return default
 
     def _sendto_best_effort(

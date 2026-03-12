@@ -216,6 +216,26 @@ range counts, smoothed receive throughput, and a 2D hole map for the selected
 transfer (`█` full, `▒` partial, `·` missing). Use up/down (or `j`/`k`) to
 change selection and `q` to quit.
 
+Monitor live IPC (default hybrid mode):
+
+- `ssyncd`/receiver publishes live monitor events over a Unix datagram socket.
+- Monitor subscribes to this socket for low-latency updates (including beacon
+  strobes) and falls back to journal polling if IPC is unavailable.
+- Default socket path is `<output-dir>/.ssync-monitor.sock` (or
+  `<root-dir>/.ssync-monitor.sock` for `ssyncd`).
+
+```bash
+# destination daemon publishes monitor IPC here by default:
+uv run ssyncd --root-dir ./received
+
+# monitor subscribes to the matching default socket path:
+uv run ssync monitor --output-dir ./received
+
+# optional explicit socket override:
+uv run ssyncd --root-dir ./received --monitor-ipc-socket /tmp/ssync-monitor.sock
+uv run ssync monitor --output-dir ./received --monitor-ipc-socket /tmp/ssync-monitor.sock
+```
+
 Traffic emulation with `tc`/`netem`:
 
 ```bash
