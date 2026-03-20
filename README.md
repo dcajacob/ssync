@@ -68,6 +68,8 @@ The top-level `ssync SRC DEST` workflow enables auto feedback discovery by defau
 it starts open-loop, promotes to feedback when uplink packets/beacons are observed,
 and can fall back to open-loop if uplink goes idle. Use `--feedback` or
 `--no-feedback` to force either mode.
+- Default auto-feedback demotion window is `60s` of uplink inactivity
+  (`--auto-feedback-idle-timeout-s`).
 
 Rsync-style convenience options:
 
@@ -92,6 +94,8 @@ Open-loop behavior (`--no-feedback`) is round-based and continuous by default:
 once the file set is finished, `ssync` starts another round. It keeps a persistent
 send-state file (`.ssync-open-loop-state.json`) with retransmission counts and
 orders each round so files with the lowest retransmission count are sent first.
+When feedback becomes active, a revisit worker services queued incomplete
+transfers on a `50ms` poll interval and prioritizes the current transfer first.
 
 ```bash
 # run open-loop continuously
@@ -119,6 +123,17 @@ uv run ssync send ./example.bin --dest-port 9000 --feedback \
 
 Use `--initial-pass-repair-max-chunks-per-burst` to keep first-pass forward data
 dominant while still servicing queued repairs in near-real-time.
+
+Sync-mode checksum prefetch:
+
+- `ssync` starts one background checksum worker that precomputes SHA-256 for
+  upcoming source files in planned send order to reduce inter-file startup gaps.
+- Prefetch is intentionally bounded to one hash at a time (no hash fan-out) to
+  avoid uncontrolled CPU/IO amplification on large trees.
+- Prefetched hashes are used only when `(path, size, mtime_ns)` still match at
+  send time; otherwise sender falls back to inline hashing.
+- Sender waits at most about `0.2s` for an in-flight prefetch result before
+  falling back to inline hashing, so transfer progress is not blocked by prefetch.
 
 Periodic transfer metadata is enabled by default every 10 seconds:
 
@@ -223,6 +238,12 @@ Monitor live IPC (default hybrid mode):
   strobes) and falls back to journal polling if IPC is unavailable.
 - Default socket path is `<output-dir>/.ssync-monitor.sock` (or
   `<root-dir>/.ssync-monitor.sock` for `ssyncd`).
+- If IPC is missing/unavailable, receiver continues transfer behavior and monitor
+  remains functional via journal polling fallback.
+- If a stale datagram socket path is detected (for example, after monitor crash),
+  receiver best-effort removes the stale socket path so monitor restart can re-bind.
+- Recommended operational model on shared hosts: keep receiver output/root
+  directories private (for example `0700`) so local IPC visibility stays scoped.
 
 ```bash
 # destination daemon publishes monitor IPC here by default:

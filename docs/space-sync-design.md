@@ -69,9 +69,24 @@ frame-specific payloads.
 - Receiver also emits live local monitor events via Unix datagram IPC
   (`.ssync-monitor.sock` under the receiver root by default). Monitor uses this
   for low-latency updates and beacon strobes, while journal remains bootstrap/fallback.
+- Monitor IPC is intentionally local-only; deployments on shared hosts should keep
+  receiver roots private so socket path visibility follows directory permissions.
+- Receiver treats monitor IPC as best-effort telemetry only: transfer correctness
+  does not depend on IPC availability, and journal polling remains the fallback path.
+- Receiver attempts stale monitor socket cleanup on send failures associated with
+  dead Unix datagram endpoints so monitor restarts can re-bind cleanly.
 - One active sender destination per transfer in the current implementation.
 - Receiver can correlate repeated logical transfers by manifest signature to continue
   filling existing partial files across changing transfer IDs.
+
+## Operational Timing and Resource Bounds
+
+- Auto-feedback idle demotion defaults to `60s` without uplink activity.
+- Sync revisit worker checks queued incomplete transfers every `50ms` while feedback
+  is active.
+- Sync checksum prefetch runs in one bounded background worker (single concurrent
+  hash), validates `(path, size, mtime_ns)` before use, and caps send-side wait for
+  an in-flight prefetch result to about `0.2s` before inline fallback.
 
 ## Intentionally Deferred
 
@@ -89,4 +104,7 @@ frame-specific payloads.
 3. Add optional FEC blocks and hybrid retransmit+FEC strategies.
 4. Add authenticated control frames and key management hooks.
 5. Add richer delivery telemetry (delivery quality, RTT, repair efficiency).
+6. Expand operational validation for monitor IPC partial-failure paths (missing or
+   stale sockets, transient send errors) and checksum-prefetch effectiveness under
+   large trees.
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
@@ -7,6 +8,7 @@ import mmap
 import os
 import shutil
 import socket
+import stat
 import threading
 import time
 from dataclasses import dataclass
@@ -1110,6 +1112,19 @@ class SpaceSyncReceiver:
     def _monitor_ipc_socket_path(self) -> Path | None:
         return self.config.monitor_ipc_socket
 
+    def _cleanup_stale_monitor_ipc_socket_path(self, ipc_path: Path) -> None:
+        try:
+            stat_result = ipc_path.lstat()
+        except OSError:
+            return
+        if not stat.S_ISSOCK(stat_result.st_mode):
+            return
+        try:
+            ipc_path.unlink()
+        except OSError:
+            return
+        LOGGER.debug("removed_stale_monitor_ipc_socket path=%s", ipc_path)
+
     def _ensure_monitor_ipc_sender(self) -> socket.socket | None:
         if self._monitor_ipc_send_sock is not None:
             return self._monitor_ipc_send_sock
@@ -1130,7 +1145,21 @@ class SpaceSyncReceiver:
             return
         try:
             sock.sendto(json.dumps(payload, separators=(",", ":")).encode("utf-8"), str(ipc_path))
-        except (BlockingIOError, FileNotFoundError, OSError):
+        except BlockingIOError:
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            # If monitor crashed and left a stale datagram socket path behind,
+            # remove it so a restarted monitor can bind cleanly.
+            if exc.errno in {errno.ECONNREFUSED, errno.ENOTCONN}:
+                self._cleanup_stale_monitor_ipc_socket_path(ipc_path)
+            if self._monitor_ipc_send_sock is not None:
+                try:
+                    self._monitor_ipc_send_sock.close()
+                except OSError:
+                    pass
+                self._monitor_ipc_send_sock = None
             return
 
     def _publish_transfer_update_locked(self, transfer: _TransferStateData, *, force: bool) -> None:

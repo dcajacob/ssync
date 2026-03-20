@@ -147,6 +147,27 @@ def test_receiver_emits_monitor_ipc_events(tmp_path: Path) -> None:
             pass
 
 
+def test_receiver_monitor_ipc_cleans_up_stale_socket_path(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-ipc-stale"
+    ipc_socket_path = tmp_path / "ssync-monitor-stale.sock"
+    stale_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    stale_sock.bind(str(ipc_socket_path))
+    stale_sock.close()
+    assert ipc_socket_path.exists()
+
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(
+            output_dir=receiver_dir,
+            enable_feedback=True,
+            monitor_ipc_socket=ipc_socket_path,
+        ),
+    )
+    receiver._publish_monitor_event({"type": "transfer_update", "transfer_id_hex": "abc"})
+    assert not ipc_socket_path.exists()
+
+
 def test_feedback_zero_chunk_send_returns_immediately(tmp_path: Path) -> None:
     receiver_dir = tmp_path / "rx-empty-feedback"
     receiver = SpaceSyncReceiver(
