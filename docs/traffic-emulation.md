@@ -144,7 +144,7 @@ Track per run:
 - repair rounds/chunks
 - packet counts from pcap
 - queue drops/requeues from `tc -s`
-- sender post-FIN behavior (`post_fin_timeout`, `status=COMPLETE`, `received_transfer_complete`)
+- sender feedback-wait behavior (`feedback_timeout`, `status=COMPLETE`, `status=HASH_MISMATCH`)
 
 ## Notes and caveats
 

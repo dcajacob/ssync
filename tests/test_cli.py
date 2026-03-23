@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
@@ -95,15 +96,119 @@ def test_collect_sync_items_directory(tmp_path: Path) -> None:
 
 def test_send_and_sync_support_json_flag() -> None:
     parser = _build_parser()
+    rsync_parser = _build_rsync_parser()
     send_args = parser.parse_args(["send", "data.bin", "--json", "--beacon-interval-s", "2.5"])
-    sync_args = parser.parse_args(
-        ["sync", "src", "127.0.0.1:dst", "--json", "--beacon-interval-s", "0"]
+    sync_args = rsync_parser.parse_args(
+        ["src", "127.0.0.1:dst", "--json", "--beacon-interval-s", "0"]
     )
     assert send_args.json_output is True
     assert sync_args.json_output is True
     assert send_args.files == ["data.bin"]
     assert send_args.beacon_interval_s == pytest.approx(2.5)
     assert sync_args.beacon_interval_s == pytest.approx(0.0)
+
+
+def test_parser_supports_metadata_alias_flags() -> None:
+    parser = _build_parser()
+    send_args = parser.parse_args(
+        [
+            "send",
+            "data.bin",
+            "--metadata-repeats",
+            "5",
+            "--periodic-metadata-interval-s",
+            "1.5",
+            "--periodic-metadata-every-n-chunks",
+            "100",
+        ]
+    )
+    receive_args = parser.parse_args(
+        [
+            "receive",
+            "--pre-metadata-max-pending-bytes",
+            "123456",
+            "--pre-metadata-max-pending-bytes-per-transfer",
+            "2048",
+            "--pre-metadata-max-pending-transfers",
+            "16",
+            "--pre-metadata-ttl-s",
+            "12.5",
+        ]
+    )
+    assert send_args.manifest_repeats == 5
+    assert send_args.periodic_metadata_interval_s == pytest.approx(1.5)
+    assert send_args.periodic_metadata_every_n_chunks == 100
+    assert receive_args.pre_metadata_max_pending_bytes == 123456
+    assert receive_args.pre_metadata_max_pending_bytes_per_transfer == 2048
+    assert receive_args.pre_metadata_max_pending_transfers == 16
+    assert receive_args.pre_metadata_ttl_s == pytest.approx(12.5)
+
+
+def test_parser_supports_adaptive_leading_hole_repair_flags() -> None:
+    parser = _build_parser()
+    receive_args = parser.parse_args(
+        [
+            "receive",
+            "--adaptive-leading-hole-boost",
+            "--leading-hole-start-threshold-chunks",
+            "128",
+            "--leading-hole-min-span-chunks",
+            "4096",
+            "--leading-hole-boost-multiplier",
+            "6",
+            "--leading-hole-max-repair-chunks-per-request",
+            "8192",
+        ]
+    )
+    assert receive_args.adaptive_leading_hole_boost is True
+    assert receive_args.leading_hole_start_threshold_chunks == 128
+    assert receive_args.leading_hole_min_span_chunks == 4096
+    assert receive_args.leading_hole_boost_multiplier == 6
+    assert receive_args.leading_hole_max_repair_chunks_per_request == 8192
+
+
+def test_periodic_metadata_default_is_enabled() -> None:
+    parser = _build_parser()
+    rsync_parser = _build_rsync_parser()
+    send_args = parser.parse_args(["send", "data.bin"])
+    sync_args = rsync_parser.parse_args(["src", "127.0.0.1:dst"])
+    assert send_args.feedback is None
+    assert sync_args.feedback is None
+    assert send_args.periodic_metadata_interval_s == pytest.approx(10.0)
+    assert sync_args.periodic_metadata_interval_s == pytest.approx(10.0)
+    assert send_args.revisit_incomplete_passes == 2
+    assert send_args.revisit_max_rounds_per_pass == 8
+    assert send_args.primary_feedback_max_rounds == 0
+    assert send_args.primary_feedback_max_seconds == pytest.approx(0.0)
+    assert send_args.repair_queue_max_pending_requests == 1024
+    assert send_args.repair_worker_max_chunks_per_burst == 256
+    assert send_args.initial_pass_repair_max_chunks_per_burst == 16
+    assert send_args.repair_worker_poll_interval_s == pytest.approx(0.01)
+    assert sync_args.revisit_incomplete_passes == 2
+    assert sync_args.revisit_max_rounds_per_pass == 8
+    assert sync_args.primary_feedback_max_rounds == 64
+    assert sync_args.primary_feedback_max_seconds == pytest.approx(8.0)
+    assert sync_args.repair_queue_max_pending_requests == 1024
+    assert sync_args.repair_worker_max_chunks_per_burst == 256
+    assert sync_args.initial_pass_repair_max_chunks_per_burst == 16
+    assert sync_args.repair_worker_poll_interval_s == pytest.approx(0.01)
+
+
+def test_parser_feedback_flags_support_auto_and_overrides() -> None:
+    parser = _build_parser()
+    rsync_parser = _build_rsync_parser()
+    send_auto = parser.parse_args(["send", "data.bin"])
+    send_on = parser.parse_args(["send", "data.bin", "--feedback"])
+    send_off = parser.parse_args(["send", "data.bin", "--no-feedback"])
+    sync_auto = rsync_parser.parse_args(["src", "127.0.0.1:dst"])
+    sync_on = rsync_parser.parse_args(["src", "127.0.0.1:dst", "--feedback"])
+    sync_off = rsync_parser.parse_args(["src", "127.0.0.1:dst", "--no-feedback"])
+    assert send_auto.feedback is None
+    assert send_on.feedback is True
+    assert send_off.feedback is False
+    assert sync_auto.feedback is None
+    assert sync_on.feedback is True
+    assert sync_off.feedback is False
 
 
 def test_parser_supports_ssyncd_alias_subcommand() -> None:
@@ -121,6 +226,7 @@ def test_parser_supports_monitor_subcommand() -> None:
     assert args.command == "monitor"
     assert args.output_dir == Path("./received")
     assert args.refresh_interval_s == pytest.approx(0.2)
+    assert args.monitor_ipc_socket is None
     assert args.log_level == "WARNING"
 
 
@@ -129,6 +235,7 @@ def test_ssyncd_parser_accepts_server_args() -> None:
     args = parser.parse_args(["--bind-port", "9011", "--root-dir", "./rx"])
     assert args.bind_port == 9011
     assert args.root_dir == Path("./rx")
+    assert args.monitor_ipc_socket is None
 
 
 def test_top_level_rsync_parser_supports_options() -> None:
@@ -150,6 +257,13 @@ def test_main_routes_top_level_to_sync(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(cli_module, "_run_sync", _fake_run_sync)
     assert cli_module.main(["src", "127.0.0.1:dst"]) == 0
+
+
+def test_main_rejects_sync_subcommand(capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = cli_module.main(["sync", "src", "127.0.0.1:dst"])
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "deprecated" in captured.out
 
 
 def test_main_routes_ssyncd_to_server(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -284,6 +398,7 @@ def test_run_sync_open_loop_uses_persistent_order(
     class FakeSender:
         def __init__(self, config: object) -> None:
             self.config = config
+            self._auto_feedback_active = True
 
         def send_file(
             self,
@@ -292,6 +407,7 @@ def test_run_sync_open_loop_uses_persistent_order(
             destination_port: int,
             remote_name: str | None = None,
             stop_requested: object | None = None,
+            **_kwargs: object,
         ) -> SimpleNamespace:
             send_order.append(remote_name or file_path.name)
             return SimpleNamespace(
@@ -338,6 +454,7 @@ def test_run_sync_supports_multiple_destinations(
     class FakeSender:
         def __init__(self, config: object) -> None:
             self.config = config
+            self._auto_feedback_active = True
 
         def send_file(
             self,
@@ -346,6 +463,7 @@ def test_run_sync_supports_multiple_destinations(
             destination_port: int,
             remote_name: str | None = None,
             stop_requested: object | None = None,
+            **_kwargs: object,
         ) -> SimpleNamespace:
             send_targets.append(f"{destination_host}:{remote_name}")
             return SimpleNamespace(
@@ -368,11 +486,520 @@ def test_run_sync_supports_multiple_destinations(
             "127.0.0.1:./",
             "--destination",
             "127.0.0.2:./",
+            "--open-loop-max-rounds",
+            "1",
         ]
     )
     exit_code = cli_module._run_sync(args)
     assert exit_code == 0
     assert sorted(send_targets) == ["127.0.0.1:a.bin", "127.0.0.2:a.bin"]
+
+
+def test_run_sync_uses_prefetched_checksum_override_when_supported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "payload"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    source_file = source_dir / "a.bin"
+    source_file.write_bytes(b"a" * (1024 * 1024))
+
+    checksum_overrides: list[bytes | None] = []
+    call_count = 0
+
+    class FakeSender:
+        def __init__(self, config: object) -> None:
+            self.config = config
+            self._auto_feedback_active = True
+
+        def send_file(
+            self,
+            file_path: Path,
+            destination_host: str,
+            destination_port: int,
+            remote_name: str | None = None,
+            stop_requested: object | None = None,
+            local_sha256_override: bytes | None = None,
+            **_kwargs: object,
+        ) -> SimpleNamespace:
+            nonlocal call_count
+            call_count += 1
+            checksum_overrides.append(local_sha256_override)
+            if call_count == 1:
+                # Allow prefetch worker to finish and populate cache.
+                time.sleep(0.1)
+            return SimpleNamespace(
+                transfer_id_hex=f"{call_count:032x}",
+                total_chunks=1,
+                repaired_chunks=0,
+                repair_rounds=0,
+                completed=True,
+            )
+
+        def query_remote_file(self, **kwargs: object) -> object:
+            raise AssertionError("query_remote_file should not be called without --skip-unchanged")
+
+    monkeypatch.setattr(cli_module, "SpaceSyncSender", FakeSender)
+    parser = _build_rsync_parser()
+    args = parser.parse_args(
+        [
+            "-r",
+            str(source_dir),
+            "127.0.0.1:./",
+            "--destination",
+            "127.0.0.2:./",
+            "--open-loop-max-rounds",
+            "1",
+        ]
+    )
+    exit_code = cli_module._run_sync(args)
+    assert exit_code == 0
+    assert call_count == 2
+    assert checksum_overrides[1] is not None
+    assert len(checksum_overrides[1] or b"") == 32
+
+
+def test_run_sync_feedback_revisits_incomplete_transfers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "payload"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "a.bin").write_bytes(b"a" * 1024)
+    (source_dir / "b.bin").write_bytes(b"b" * 1024)
+
+    calls: list[dict[str, object]] = []
+
+    class FakeSender:
+        def __init__(self, config: object) -> None:
+            self.config = config
+            self._auto_feedback_active = True
+
+        def send_file(
+            self,
+            file_path: Path,
+            destination_host: str,
+            destination_port: int,
+            remote_name: str | None = None,
+            stop_requested: object | None = None,
+            transfer_id: bytes | None = None,
+            send_initial_data: bool = True,
+            max_repair_rounds_override: int | None = None,
+            max_feedback_seconds_override: float | None = None,
+            max_feedback_total_rounds_override: int | None = None,
+        ) -> SimpleNamespace:
+            calls.append(
+                {
+                    "remote_name": remote_name,
+                    "transfer_id": transfer_id,
+                    "send_initial_data": send_initial_data,
+                    "max_repair_rounds_override": max_repair_rounds_override,
+                    "max_feedback_seconds_override": max_feedback_seconds_override,
+                    "max_feedback_total_rounds_override": max_feedback_total_rounds_override,
+                }
+            )
+            if send_initial_data and remote_name == "a.bin":
+                return SimpleNamespace(
+                    transfer_id_hex="11" * 16,
+                    total_chunks=10,
+                    repaired_chunks=2,
+                    repair_rounds=1,
+                    completed=False,
+                )
+            return SimpleNamespace(
+                transfer_id_hex=("11" * 16) if remote_name == "a.bin" else ("22" * 16),
+                total_chunks=10,
+                repaired_chunks=4,
+                repair_rounds=2,
+                completed=True,
+            )
+
+        def query_remote_file(self, **kwargs: object) -> object:
+            raise AssertionError("query_remote_file should not be called without --skip-unchanged")
+
+    monkeypatch.setattr(cli_module, "SpaceSyncSender", FakeSender)
+    parser = _build_rsync_parser()
+    args = parser.parse_args(
+        [
+            "-r",
+            str(source_dir),
+            "127.0.0.1:./",
+            "--revisit-incomplete-passes",
+            "2",
+            "--revisit-max-rounds-per-pass",
+            "3",
+            "--open-loop-max-rounds",
+            "1",
+        ]
+    )
+    exit_code = cli_module._run_sync(args)
+    assert exit_code == 0
+    revisit_calls = [call for call in calls if call["send_initial_data"] is False]
+    primary_calls = [call for call in calls if call["send_initial_data"] is True]
+    assert primary_calls
+    assert primary_calls[0]["max_feedback_seconds_override"] == pytest.approx(8.0)
+    assert primary_calls[0]["max_feedback_total_rounds_override"] == 64
+    assert len(revisit_calls) >= 1
+    assert revisit_calls[0]["transfer_id"] == bytes.fromhex("11" * 16)
+    assert revisit_calls[0]["max_repair_rounds_override"] == 3
+    assert revisit_calls[0]["max_feedback_seconds_override"] == pytest.approx(0.0)
+    assert revisit_calls[0]["max_feedback_total_rounds_override"] == 0
+
+
+def test_run_sync_revisit_prioritizes_current_then_checks_others(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "payload"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "a.bin").write_bytes(b"a" * 1024)
+    (source_dir / "b.bin").write_bytes(b"b" * 1024)
+
+    call_order: list[tuple[str, bool]] = []
+    revisit_counts: dict[str, int] = {"a.bin": 0, "b.bin": 0}
+
+    class FakeSender:
+        def __init__(self, config: object) -> None:
+            self.config = config
+            self._auto_feedback_active = True
+
+        def send_file(
+            self,
+            file_path: Path,
+            destination_host: str,
+            destination_port: int,
+            remote_name: str | None = None,
+            stop_requested: object | None = None,
+            transfer_id: bytes | None = None,
+            send_initial_data: bool = True,
+            **_kwargs: object,
+        ) -> SimpleNamespace:
+            assert remote_name is not None
+            call_order.append((remote_name, send_initial_data))
+            if send_initial_data:
+                return SimpleNamespace(
+                    transfer_id_hex=("aa" * 16) if remote_name == "a.bin" else ("bb" * 16),
+                    total_chunks=10,
+                    repaired_chunks=0,
+                    repair_rounds=0,
+                    completed=False,
+                )
+            revisit_counts[remote_name] += 1
+            return SimpleNamespace(
+                transfer_id_hex=("aa" * 16) if remote_name == "a.bin" else ("bb" * 16),
+                total_chunks=10,
+                repaired_chunks=0,
+                repair_rounds=0,
+                completed=revisit_counts[remote_name] >= 2,
+            )
+
+        def query_remote_file(self, **kwargs: object) -> object:
+            raise AssertionError("query_remote_file should not be called without --skip-unchanged")
+
+    monkeypatch.setattr(cli_module, "SpaceSyncSender", FakeSender)
+    parser = _build_rsync_parser()
+    args = parser.parse_args(
+        [
+            "-r",
+            str(source_dir),
+            "127.0.0.1:./",
+            "--revisit-incomplete-passes",
+            "2",
+            "--revisit-max-rounds-per-pass",
+            "3",
+            "--open-loop-max-rounds",
+            "1",
+        ]
+    )
+    exit_code = cli_module._run_sync(args)
+    assert exit_code == 0
+    # Sequence should include both primary files and revisit coverage for both.
+    primary_calls = [entry for entry in call_order if entry[1] is True]
+    revisit_calls = [entry for entry in call_order if entry[1] is False]
+    assert len(primary_calls) == 2
+    assert len(revisit_calls) >= 2
+    first_primary_name = primary_calls[0][0]
+    second_primary_name = primary_calls[1][0]
+    assert first_primary_name != second_primary_name
+    revisit_names = {name for name, send_initial in revisit_calls if not send_initial}
+    assert first_primary_name in revisit_names
+    assert second_primary_name in revisit_names
+
+
+def test_run_sync_auto_feedback_transition_stops_open_loop_repeats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "payload"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "a.bin").write_bytes(b"a" * 1024)
+
+    send_calls = 0
+
+    class FakeSender:
+        def __init__(self, config: object) -> None:
+            self.config = config
+            self._auto_feedback_active = False
+
+        def send_file(
+            self,
+            file_path: Path,
+            destination_host: str,
+            destination_port: int,
+            remote_name: str | None = None,
+            stop_requested: object | None = None,
+            **_kwargs: object,
+        ) -> SimpleNamespace:
+            nonlocal send_calls
+            send_calls += 1
+            if send_calls == 1:
+                return SimpleNamespace(
+                    transfer_id_hex="11" * 16,
+                    total_chunks=10,
+                    repaired_chunks=0,
+                    repair_rounds=0,
+                    completed=True,
+                )
+            self._auto_feedback_active = True
+            return SimpleNamespace(
+                transfer_id_hex="22" * 16,
+                total_chunks=10,
+                repaired_chunks=5,
+                repair_rounds=2,
+                completed=True,
+            )
+
+        def query_remote_file(self, **kwargs: object) -> object:
+            raise AssertionError("query_remote_file should not be called without --skip-unchanged")
+
+    monkeypatch.setattr(cli_module, "SpaceSyncSender", FakeSender)
+    parser = _build_rsync_parser()
+    args = parser.parse_args(
+        [
+            "-r",
+            str(source_dir),
+            "127.0.0.1:./",
+            "--open-loop-max-rounds",
+            "0",
+        ]
+    )
+    exit_code = cli_module._run_sync(args)
+    assert exit_code == 0
+    assert send_calls == 2
+
+
+def test_run_sync_auto_feedback_idle_demotion_resumes_open_loop_repeats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "payload"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "a.bin").write_bytes(b"a" * 1024)
+
+    send_calls = 0
+
+    class FakeSender:
+        def __init__(self, config: object) -> None:
+            self.config = config
+            self._auto_feedback_active = True
+            self._last_auto_uplink_activity_s = time.monotonic() - 120.0
+
+        def send_file(
+            self,
+            file_path: Path,
+            destination_host: str,
+            destination_port: int,
+            remote_name: str | None = None,
+            stop_requested: object | None = None,
+            **_kwargs: object,
+        ) -> SimpleNamespace:
+            nonlocal send_calls
+            send_calls += 1
+            return SimpleNamespace(
+                transfer_id_hex="11" * 16,
+                total_chunks=10,
+                repaired_chunks=0,
+                repair_rounds=0,
+                completed=True,
+            )
+
+        def query_remote_file(self, **kwargs: object) -> object:
+            raise AssertionError("query_remote_file should not be called without --skip-unchanged")
+
+    monkeypatch.setattr(cli_module, "SpaceSyncSender", FakeSender)
+    parser = _build_rsync_parser()
+    args = parser.parse_args(
+        [
+            "-r",
+            str(source_dir),
+            "127.0.0.1:./",
+            "--open-loop-max-rounds",
+            "2",
+        ]
+    )
+    exit_code = cli_module._run_sync(args)
+    assert exit_code == 0
+    assert send_calls == 2
+
+
+def test_run_sync_defers_revisits_until_feedback_becomes_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "payload"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "a.bin").write_bytes(b"a" * 1024)
+
+    primary_calls = 0
+    revisit_calls = 0
+
+    class FakeSender:
+        def __init__(self, config: object) -> None:
+            self.config = config
+            self._auto_feedback_active = False
+            self._last_auto_uplink_activity_s: float | None = None
+
+        def send_file(
+            self,
+            file_path: Path,
+            destination_host: str,
+            destination_port: int,
+            remote_name: str | None = None,
+            stop_requested: object | None = None,
+            send_initial_data: bool = True,
+            **_kwargs: object,
+        ) -> SimpleNamespace:
+            nonlocal primary_calls, revisit_calls
+            if send_initial_data:
+                primary_calls += 1
+                if primary_calls == 1:
+                    return SimpleNamespace(
+                        transfer_id_hex="11" * 16,
+                        total_chunks=10,
+                        repaired_chunks=0,
+                        repair_rounds=0,
+                        completed=False,
+                    )
+                self._auto_feedback_active = True
+                self._last_auto_uplink_activity_s = time.monotonic()
+                return SimpleNamespace(
+                    transfer_id_hex="22" * 16,
+                    total_chunks=10,
+                    repaired_chunks=2,
+                    repair_rounds=1,
+                    completed=True,
+                )
+            assert self._auto_feedback_active is True
+            revisit_calls += 1
+            return SimpleNamespace(
+                transfer_id_hex="11" * 16,
+                total_chunks=10,
+                repaired_chunks=1,
+                repair_rounds=1,
+                completed=True,
+            )
+
+        def query_remote_file(self, **kwargs: object) -> object:
+            raise AssertionError("query_remote_file should not be called without --skip-unchanged")
+
+    monkeypatch.setattr(cli_module, "SpaceSyncSender", FakeSender)
+    parser = _build_rsync_parser()
+    args = parser.parse_args(
+        [
+            "-r",
+            str(source_dir),
+            "127.0.0.1:./",
+            "--open-loop-max-rounds",
+            "2",
+        ]
+    )
+    exit_code = cli_module._run_sync(args)
+    assert exit_code == 0
+    assert primary_calls == 2
+    assert revisit_calls >= 1
+
+
+def test_run_sync_revisit_no_progress_does_not_consume_pass_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "payload"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "a.bin").write_bytes(b"a" * 1024)
+    (source_dir / "b.bin").write_bytes(b"b" * 1024)
+
+    a_revisit_calls = 0
+
+    class FakeSender:
+        def __init__(self, config: object) -> None:
+            self.config = config
+            self._auto_feedback_active = True
+
+        def send_file(
+            self,
+            file_path: Path,
+            destination_host: str,
+            destination_port: int,
+            remote_name: str | None = None,
+            stop_requested: object | None = None,
+            send_initial_data: bool = True,
+            **_kwargs: object,
+        ) -> SimpleNamespace:
+            nonlocal a_revisit_calls
+            if send_initial_data:
+                if remote_name == "a.bin":
+                    return SimpleNamespace(
+                        transfer_id_hex="11" * 16,
+                        total_chunks=10,
+                        repaired_chunks=0,
+                        repair_rounds=0,
+                        completed=False,
+                    )
+                return SimpleNamespace(
+                    transfer_id_hex="22" * 16,
+                    total_chunks=10,
+                    repaired_chunks=0,
+                    repair_rounds=0,
+                    completed=True,
+                )
+            assert remote_name == "a.bin"
+            a_revisit_calls += 1
+            if a_revisit_calls == 1:
+                # No STATUS-driven repair progress; should not burn revisit pass budget.
+                return SimpleNamespace(
+                    transfer_id_hex="11" * 16,
+                    total_chunks=10,
+                    repaired_chunks=0,
+                    repair_rounds=0,
+                    completed=False,
+                )
+            return SimpleNamespace(
+                transfer_id_hex="11" * 16,
+                total_chunks=10,
+                repaired_chunks=1,
+                repair_rounds=1,
+                completed=True,
+            )
+
+        def query_remote_file(self, **kwargs: object) -> object:
+            raise AssertionError("query_remote_file should not be called without --skip-unchanged")
+
+    monkeypatch.setattr(cli_module, "SpaceSyncSender", FakeSender)
+    parser = _build_rsync_parser()
+    args = parser.parse_args(
+        [
+            "-r",
+            str(source_dir),
+            "127.0.0.1:./",
+            "--revisit-incomplete-passes",
+            "1",
+            "--open-loop-max-rounds",
+            "1",
+        ]
+    )
+    exit_code = cli_module._run_sync(args)
+    assert exit_code == 0
+    assert a_revisit_calls >= 2
 
 
 def test_run_sync_expands_source_wildcards(
@@ -415,6 +1042,7 @@ def test_run_sender_expands_quoted_wildcard(
             destination_port: int,
             remote_name: str | None = None,
             stop_requested: object | None = None,
+            **_kwargs: object,
         ) -> SimpleNamespace:
             send_order.append(file_path.name)
             return SimpleNamespace(
@@ -463,6 +1091,7 @@ def test_run_sender_accepts_multiple_expanded_paths(
             destination_port: int,
             remote_name: str | None = None,
             stop_requested: object | None = None,
+            **_kwargs: object,
         ) -> SimpleNamespace:
             send_order.append(file_path.name)
             return SimpleNamespace(

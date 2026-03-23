@@ -62,3 +62,7 @@ class RepairRequest:
     transfer_id: bytes
     missing_ranges: list[Range]
 
+
+# Compatibility alias: METADATA terminology without changing wire format.
+TransferMetadata = TransferManifest
+

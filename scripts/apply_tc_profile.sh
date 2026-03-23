@@ -34,13 +34,13 @@ set_profile_defaults() {
       DOWN_RATE="50mbit"
       DOWN_DELAY="220ms"
       DOWN_JITTER="10ms"
-      DOWN_LOSS="2.0%"
-      DOWN_CORRUPT="0.03%"
+      DOWN_LOSS="0.01%"
+      DOWN_CORRUPT="0.003%"
       UP_RATE="256kbit"
       UP_DELAY="220ms"
       UP_JITTER="25ms"
-      UP_LOSS="2.0%"
-      UP_CORRUPT="0.03%"
+      UP_LOSS="0.02%"
+      UP_CORRUPT="0.003%"
       ;;
     leo_nominal)
       DOWN_RATE="50mbit"

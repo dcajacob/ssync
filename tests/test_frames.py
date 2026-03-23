@@ -3,24 +3,20 @@ from ssync.space_sync.frames import (
     TransferStatus,
     decode_beacon,
     decode_data_chunk,
-    decode_file_info_request,
     decode_file_info_response,
     decode_frame,
     decode_manifest,
-    decode_repair_request,
+    decode_metadata,
     decode_status,
-    decode_transfer_complete,
     encode_beacon,
     encode_data_chunk,
-    encode_file_info_request,
     encode_file_info_response,
     encode_manifest,
-    encode_repair_request,
+    encode_metadata,
     encode_status,
-    encode_transfer_complete,
 )
-from ssync.space_sync.manifest import RepairRequest, TransferManifest
-from ssync.space_sync.types import BeaconRole, FrameType, RemoteFileInfo, TransferState
+from ssync.space_sync.manifest import TransferManifest
+from ssync.space_sync.types import BeaconRole, FrameType, RemoteFileInfo, StatusKind, TransferState
 
 
 def test_manifest_frame_round_trip() -> None:
@@ -35,8 +31,25 @@ def test_manifest_frame_round_trip() -> None:
     )
     raw = encode_manifest(manifest)
     parsed = decode_frame(raw)
-    assert parsed.frame_type == FrameType.MANIFEST
+    assert parsed.frame_type == FrameType.METADATA
     decoded = decode_manifest(parsed.payload)
+    assert decoded == manifest
+
+
+def test_metadata_alias_round_trip() -> None:
+    manifest = TransferManifest(
+        transfer_id=b"\x11" * 16,
+        file_name="payload.bin",
+        file_size=1024,
+        chunk_size=256,
+        total_chunks=4,
+        sha256=b"\x22" * 32,
+        metadata={1: b"meta"},
+    )
+    raw = encode_metadata(manifest)
+    parsed = decode_frame(raw)
+    assert parsed.frame_type == FrameType.METADATA
+    decoded = decode_metadata(parsed.payload)
     assert decoded == manifest
 
 
@@ -75,15 +88,8 @@ def test_manifest_validation_rejects_inconsistent_total_chunks() -> None:
         raise AssertionError("expected manifest validation failure")
 
 
-def test_file_info_request_and_response_round_trip() -> None:
-    request_raw = encode_file_info_request("nested/file.bin", include_checksum=True)
-    parsed_request = decode_frame(request_raw)
-    assert parsed_request.frame_type == FrameType.FILE_INFO_REQUEST
-    remote_path, include_checksum = decode_file_info_request(parsed_request.payload)
-    assert remote_path == "nested/file.bin"
-    assert include_checksum is True
-
-    response_raw = encode_file_info_response(
+def test_file_info_response_payload_round_trip() -> None:
+    response_payload = encode_file_info_response(
         RemoteFileInfo(
             path="nested/file.bin",
             exists=True,
@@ -92,9 +98,7 @@ def test_file_info_request_and_response_round_trip() -> None:
             sha256=b"\xAA" * 32,
         )
     )
-    parsed_response = decode_frame(response_raw)
-    assert parsed_response.frame_type == FrameType.FILE_INFO_RESPONSE
-    response = decode_file_info_response(parsed_response.payload)
+    response = decode_file_info_response(response_payload)
     assert response.path == "nested/file.bin"
     assert response.exists is True
     assert response.size == 123
@@ -102,10 +106,11 @@ def test_file_info_request_and_response_round_trip() -> None:
     assert response.sha256 == b"\xAA" * 32
 
 
-def test_status_and_repair_round_trip() -> None:
+def test_status_transfer_round_trip() -> None:
     status_raw = encode_status(
         TransferStatus(
             transfer_id=b"\xBB" * 16,
+            kind=StatusKind.TRANSFER,
             state=TransferState.INCOMPLETE,
             missing_ranges=[(2, 5), (8, 9)],
         )
@@ -114,19 +119,28 @@ def test_status_and_repair_round_trip() -> None:
     assert status_decoded.transfer_id == b"\xBB" * 16
     assert status_decoded.missing_ranges == [(2, 5), (8, 9)]
 
-    request_raw = encode_repair_request(
-        RepairRequest(transfer_id=b"\xCC" * 16, missing_ranges=[(1, 2), (6, 7)])
+def test_status_file_info_response_round_trip() -> None:
+    status_raw = encode_status(
+        TransferStatus(
+            transfer_id=b"\xCC" * 16,
+            kind=StatusKind.FILE_INFO_RESPONSE,
+            state=TransferState.COMPLETE,
+            missing_ranges=[],
+            file_info=RemoteFileInfo(
+                path="nested/file.bin",
+                exists=True,
+                size=11,
+                mtime_ns=22,
+                sha256=b"\xAB" * 32,
+            ),
+            query_token=b"tok-1",
+        )
     )
-    request_decoded = decode_repair_request(decode_frame(request_raw).payload)
-    assert request_decoded.transfer_id == b"\xCC" * 16
-    assert request_decoded.missing_ranges == [(1, 2), (6, 7)]
-
-
-def test_transfer_complete_round_trip() -> None:
-    raw = encode_transfer_complete(b"\xDD" * 16)
-    parsed = decode_frame(raw)
-    assert parsed.frame_type == FrameType.TRANSFER_COMPLETE
-    assert decode_transfer_complete(parsed.payload) == b"\xDD" * 16
+    status_decoded = decode_status(decode_frame(status_raw).payload)
+    assert status_decoded.kind == StatusKind.FILE_INFO_RESPONSE
+    assert status_decoded.query_token == b"tok-1"
+    assert status_decoded.file_info is not None
+    assert status_decoded.file_info.path == "nested/file.bin"
 
 
 def test_beacon_round_trip() -> None:

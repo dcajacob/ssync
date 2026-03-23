@@ -12,12 +12,9 @@ from ssync.space_sync.frames import (
     HEADER_STRUCT,
     decode_frame,
     decode_status,
-    decode_transfer_complete,
     encode_beacon,
     encode_data_chunk,
-    encode_fin,
     encode_manifest,
-    encode_repair_done,
 )
 from ssync.space_sync.manifest import TransferManifest
 from ssync.space_sync.receiver import SpaceSyncReceiver
@@ -55,6 +52,31 @@ def _wait_for_predicate(predicate: object, timeout_s: float = 3.0) -> bool:
     return False
 
 
+def _wait_for_ipc_events(
+    sock: socket.socket,
+    *,
+    min_events: int,
+    timeout_s: float = 2.0,
+) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline and len(events) < min_events:
+        try:
+            payload = sock.recv(65535)
+        except (BlockingIOError, TimeoutError):
+            time.sleep(0.02)
+            continue
+        if not payload:
+            continue
+        try:
+            decoded = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(decoded, dict):
+            events.append(decoded)
+    return events
+
+
 def test_open_loop_local_transfer(tmp_path: Path) -> None:
     receiver_dir = tmp_path / "rx-open"
     receiver = SpaceSyncReceiver(
@@ -77,6 +99,102 @@ def test_open_loop_local_transfer(tmp_path: Path) -> None:
         target_path = receiver_dir / source_path.name
         assert _wait_for_file(target_path)
         assert target_path.read_bytes() == source_payload
+        part_path = receiver_dir / f".{result.transfer_id_hex}.part"
+        assert not part_path.exists()
+    finally:
+        receiver.stop()
+
+
+def test_receiver_emits_monitor_ipc_events(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-ipc-events"
+    ipc_socket_path = tmp_path / "ssync-monitor-test.sock"
+    monitor_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    monitor_sock.bind(str(ipc_socket_path))
+    monitor_sock.setblocking(False)
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(
+            output_dir=receiver_dir,
+            enable_feedback=True,
+            monitor_ipc_socket=ipc_socket_path,
+        ),
+    )
+    receiver.start()
+    try:
+        source_path = tmp_path / "source-ipc.bin"
+        source_path.write_bytes(b"ipc-events-" * 8_000)
+        sender = SpaceSyncSender(
+            config=SenderConfig(
+                chunk_size=256,
+                enable_feedback=True,
+                feedback_wait_s=0.2,
+                max_repair_rounds=1,
+            )
+        )
+        sender.send_file(source_path, "127.0.0.1", receiver.bind_port)
+        events = _wait_for_ipc_events(monitor_sock, min_events=2, timeout_s=3.0)
+        assert events
+        event_types = {str(item.get("type", "")) for item in events}
+        assert "transfer_update" in event_types
+        assert ("beacon_rx" in event_types) or ("beacon_tx" in event_types)
+    finally:
+        receiver.stop()
+        monitor_sock.close()
+        try:
+            ipc_socket_path.unlink()
+        except OSError:
+            pass
+
+
+def test_receiver_monitor_ipc_cleans_up_stale_socket_path(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-ipc-stale"
+    ipc_socket_path = tmp_path / "ssync-monitor-stale.sock"
+    stale_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    stale_sock.bind(str(ipc_socket_path))
+    stale_sock.close()
+    assert ipc_socket_path.exists()
+
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(
+            output_dir=receiver_dir,
+            enable_feedback=True,
+            monitor_ipc_socket=ipc_socket_path,
+        ),
+    )
+    receiver._publish_monitor_event({"type": "transfer_update", "transfer_id_hex": "abc"})
+    assert not ipc_socket_path.exists()
+
+
+def test_feedback_zero_chunk_send_returns_immediately(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-empty-feedback"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(output_dir=receiver_dir, enable_feedback=True),
+    )
+    receiver.start()
+    try:
+        source_path = tmp_path / "empty.bin"
+        source_path.write_bytes(b"")
+        sender = SpaceSyncSender(
+            config=SenderConfig(
+                enable_feedback=True,
+                feedback_wait_s=0.2,
+                manifest_repeats=1,
+            )
+        )
+        start = time.monotonic()
+        result = sender.send_file(source_path, "127.0.0.1", receiver.bind_port)
+        elapsed = time.monotonic() - start
+        assert result.completed is True
+        assert result.total_chunks == 0
+        assert elapsed < 0.5
+        target_path = receiver_dir / source_path.name
+        assert _wait_for_file(target_path)
+        assert target_path.read_bytes() == b""
         part_path = receiver_dir / f".{result.transfer_id_hex}.part"
         assert not part_path.exists()
     finally:
@@ -138,13 +256,9 @@ def test_receiver_short_circuits_existing_complete_file(tmp_path: Path) -> None:
             source_addr = sender_sock.getsockname()
             receiver._prepare_transfer(receiver_sock, manifest, source_addr)
             first_raw, _ = sender_sock.recvfrom(65535)
-            second_raw, _ = sender_sock.recvfrom(65535)
 
     first = decode_frame(first_raw)
-    second = decode_frame(second_raw)
     assert first.frame_type == FrameType.STATUS
-    assert second.frame_type == FrameType.TRANSFER_COMPLETE
-    assert decode_transfer_complete(second.payload) == manifest.transfer_id
     assert manifest.transfer_id not in receiver._transfers
 
 
@@ -177,6 +291,43 @@ def test_receiver_advertises_incomplete_state_on_repeated_manifest(tmp_path: Pat
     assert status.transfer_id == manifest.transfer_id
     assert status.state == TransferState.INCOMPLETE
     assert status.missing_ranges
+
+
+def test_receiver_replays_pre_metadata_buffered_chunks(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-pre-metadata"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(output_dir=receiver_dir, enable_feedback=True),
+    )
+    payload = b"buffer-before-metadata-" * 128
+    manifest = TransferManifest.from_bytes(raw=payload, file_name="late/join.bin", chunk_size=64)
+    first_chunk = payload[: manifest.chunk_size]
+    remaining = [
+        payload[offset : offset + manifest.chunk_size]
+        for offset in range(manifest.chunk_size, len(payload), manifest.chunk_size)
+    ]
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver_sock:
+        receiver_sock.bind(("127.0.0.1", 0))
+        source_addr = ("127.0.0.1", 22000)
+        receiver._accept_data(
+            receiver_sock,
+            manifest.transfer_id,
+            0,
+            first_chunk,
+            source_addr=source_addr,
+        )
+        receiver._prepare_transfer(receiver_sock, manifest, source_addr)
+        with receiver._lock:
+            transfer = receiver._transfers[manifest.transfer_id]
+            assert transfer.tracker.received_count() == 1
+        for index, chunk in enumerate(remaining, start=1):
+            receiver._accept_data(receiver_sock, manifest.transfer_id, index, chunk)
+
+    target = receiver_dir / "late" / "join.bin"
+    assert target.exists()
+    assert target.read_bytes() == payload
 
 
 def test_receiver_reuses_partial_state_across_transfer_ids(tmp_path: Path) -> None:
@@ -219,7 +370,6 @@ def test_receiver_reuses_partial_state_across_transfer_ids(tmp_path: Path) -> No
             assert resumed.tracker.received_count() == 1
         for index, chunk in enumerate(remaining_chunks, start=1):
             receiver._accept_data(receiver_sock, manifest2.transfer_id, index, chunk)
-        receiver._on_fin(receiver_sock, manifest2.transfer_id)
 
     target = receiver_dir / "resume" / "chained.bin"
     assert target.exists()
@@ -578,7 +728,6 @@ def test_receiver_recovers_incomplete_transfer_after_restart(tmp_path: Path) -> 
                     encode_data_chunk(manifest.transfer_id, chunk_index, payload),
                     destination,
                 )
-            sock.sendto(encode_fin(manifest.transfer_id), destination)
         time.sleep(0.3)
     finally:
         receiver.stop()
@@ -606,7 +755,6 @@ def test_receiver_recovers_incomplete_transfer_after_restart(tmp_path: Path) -> 
                 ),
                 destination,
             )
-            sock.sendto(encode_repair_done(manifest.transfer_id), destination)
         target_path = receiver_dir / "resumed.bin"
         assert _wait_for_file(target_path, timeout_s=4.0)
         assert target_path.read_bytes() == source_payload
@@ -706,6 +854,52 @@ def test_receiver_chains_post_fin_repairs_without_periodic_wait(tmp_path: Path) 
         receiver.stop()
 
 
+def test_receiver_keeps_stale_incomplete_transfer_for_resume(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-stale-incomplete-retained"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(
+            output_dir=receiver_dir,
+            enable_feedback=True,
+            transfer_inactivity_timeout_s=0.5,
+        ),
+    )
+    receiver.start()
+    try:
+        source_path = tmp_path / "source-stale-retain.bin"
+        source_payload = b"retain-stale-" * 80_000
+        source_path.write_bytes(source_payload)
+        sender = SpaceSyncSender(
+            config=SenderConfig(
+                chunk_size=256,
+                enable_feedback=False,
+            )
+        )
+        stop_deadline = time.monotonic() + 0.02
+        result = sender.send_file(
+            source_path,
+            "127.0.0.1",
+            receiver.bind_port,
+            stop_requested=lambda: time.monotonic() >= stop_deadline,
+        )
+        assert result.completed is False
+        journal_path = receiver_dir / ".ssync-journal.json"
+        assert _wait_for_file(journal_path, timeout_s=2.0)
+        time.sleep(0.8)
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        transfers = journal.get("transfers", [])
+        assert isinstance(transfers, list)
+        assert any(
+            isinstance(item, dict)
+            and isinstance(item.get("manifest"), dict)
+            and item["manifest"].get("file_name") == source_path.name
+            for item in transfers
+        )
+    finally:
+        receiver.stop()
+
+
 def test_receiver_completed_transfers_has_single_entry_per_transfer(tmp_path: Path) -> None:
     receiver_dir = tmp_path / "rx-single-completed-entry"
     receiver = SpaceSyncReceiver(
@@ -749,6 +943,145 @@ def test_receiver_completed_transfers_has_single_entry_per_transfer(tmp_path: Pa
         receiver.stop()
 
 
+def test_feedback_revisit_completes_transfer_after_primary_incomplete(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-revisit"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(
+            output_dir=receiver_dir,
+            enable_feedback=True,
+            max_repair_chunks_per_request=128,
+            transfer_inactivity_timeout_s=20.0,
+        ),
+    )
+    receiver.start()
+    try:
+        source_path = tmp_path / "source-revisit.bin"
+        source_payload = (b"revisit-path-" * 64_000)[:524_288]
+        source_path.write_bytes(source_payload)
+
+        first_sender = SpaceSyncSender(
+            config=SenderConfig(
+                chunk_size=256,
+                enable_feedback=True,
+                drop_every_nth_data=2,
+                max_repair_rounds=1,
+                max_feedback_idle_timeouts=2,
+                feedback_wait_s=0.15,
+            )
+        )
+        stop_deadline = time.monotonic() + 0.03
+        first_result = first_sender.send_file(
+            source_path,
+            "127.0.0.1",
+            receiver.bind_port,
+            stop_requested=lambda: time.monotonic() >= stop_deadline,
+        )
+        assert first_result.completed is False
+
+        second_sender = SpaceSyncSender(
+            config=SenderConfig(
+                chunk_size=256,
+                enable_feedback=True,
+                drop_every_nth_data=0,
+                max_repair_rounds=0,
+                max_feedback_idle_timeouts=20,
+                feedback_wait_s=0.15,
+            )
+        )
+        revisit_result = second_sender.send_file(
+            source_path,
+            "127.0.0.1",
+            receiver.bind_port,
+            transfer_id=bytes.fromhex(first_result.transfer_id_hex),
+            send_initial_data=False,
+            max_repair_rounds_override=0,
+        )
+        assert revisit_result.completed is True
+        assert revisit_result.transfer_id_hex == first_result.transfer_id_hex
+
+        target_path = receiver_dir / source_path.name
+        assert _wait_for_file(target_path, timeout_s=6.0)
+        assert target_path.read_bytes() == source_payload
+    finally:
+        receiver.stop()
+
+
+def test_receiver_adaptive_leading_hole_prioritizes_contiguous_prefix(tmp_path: Path) -> None:
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=0,
+        config=ReceiverConfig(
+            output_dir=tmp_path,
+            enable_feedback=True,
+            max_repair_chunks_per_request=256,
+            adaptive_leading_hole_boost=True,
+            leading_hole_start_threshold_chunks=512,
+            leading_hole_min_span_chunks=2048,
+            leading_hole_boost_multiplier=4,
+            leading_hole_max_repair_chunks_per_request=4096,
+        ),
+    )
+    manifest = TransferManifest(
+        transfer_id=b"\xAA" * 16,
+        file_name="large.bin",
+        file_size=10000 * 1024,
+        chunk_size=1024,
+        total_chunks=10000,
+        sha256=b"\x01" * 32,
+        metadata={},
+    )
+    transfer = receiver_module._TransferStateData(
+        manifest=manifest,
+        part_path=tmp_path / ".part",
+        final_path=tmp_path / "large.bin",
+        tracker=receiver_module.ChunkTracker(total_chunks=manifest.total_chunks),
+        source_addr=("127.0.0.1", 9000),
+        highest_chunk_seen=6000,
+    )
+    missing_ranges = [(0, 5000), (7000, 7010)]
+    limited = receiver._limit_missing_ranges_for_transfer(transfer, missing_ranges)
+    assert limited == [(0, 1024)]
+
+
+def test_receiver_inflight_progress_can_release_early(tmp_path: Path) -> None:
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=0,
+        config=ReceiverConfig(
+            output_dir=tmp_path,
+            enable_feedback=True,
+            periodic_repair_request_s=0.5,
+        ),
+    )
+    manifest = TransferManifest(
+        transfer_id=b"\xBB" * 16,
+        file_name="progress.bin",
+        file_size=4000 * 1024,
+        chunk_size=1024,
+        total_chunks=4000,
+        sha256=b"\x02" * 32,
+        metadata={},
+    )
+    tracker = receiver_module.ChunkTracker.from_received_ranges(4000, [(0, 1192)])
+    transfer = receiver_module._TransferStateData(
+        manifest=manifest,
+        part_path=tmp_path / ".progress.part",
+        final_path=tmp_path / "progress.bin",
+        tracker=tracker,
+        source_addr=("127.0.0.1", 9000),
+        repair_request_in_flight=True,
+        received_count_at_last_request=1000,
+        requested_chunks_at_last_request=256,
+        last_periodic_repair_request_s=10.0,
+    )
+    allowed = receiver._can_send_repair_request(transfer, now=10.6)
+    assert allowed is True
+    assert transfer.repair_request_in_flight is False
+    assert transfer.last_periodic_repair_request_s == pytest.approx(0.0)
+
+
 def test_hash_mismatch_removes_part_file(tmp_path: Path) -> None:
     receiver_dir = tmp_path / "rx-hash-mismatch"
     bind_port = _free_udp_port()
@@ -788,7 +1121,6 @@ def test_hash_mismatch_removes_part_file(tmp_path: Path) -> None:
                         encode_data_chunk(manifest.transfer_id, chunk_index, chunk),
                         destination,
                     )
-            sock.sendto(encode_fin(manifest.transfer_id), destination)
 
         assert _wait_for_predicate(lambda: bool(receiver.completed_transfers), timeout_s=3.0)
         final_path = receiver_dir / source_path.name

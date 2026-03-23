@@ -64,8 +64,12 @@ Sync a directory tree to a destination root path:
 uv run ssync -r ./payloads 127.0.0.1:missions/pass-001/ --dest-port 9000
 ```
 
-The `sync` command enables repair feedback by default. Use `--no-feedback` for strict
-open-loop behavior.
+The top-level `ssync SRC DEST` workflow enables auto feedback discovery by default:
+it starts open-loop, promotes to feedback when uplink packets/beacons are observed,
+and can fall back to open-loop if uplink goes idle. Use `--feedback` or
+`--no-feedback` to force either mode.
+- Default auto-feedback demotion window is `60s` of uplink inactivity
+  (`--auto-feedback-idle-timeout-s`).
 
 Rsync-style convenience options:
 
@@ -80,8 +84,7 @@ uv run ssync -r --include "*.txt" --exclude "tmp/*" ./payloads 127.0.0.1:mission
 uv run ssync -r --skip-unchanged --checksum ./payloads 127.0.0.1:missions/pass-001/
 ```
 
-Compatibility note: `uv run ssync sync SRC DEST` still works as an alias, but
-`uv run ssync SRC DEST` is now the primary form.
+`uv run ssync sync SRC DEST` is deprecated; use `uv run ssync SRC DEST`.
 
 By default, sync does not pre-query the destination; it streams files immediately.
 Use `--skip-unchanged` (optionally with `--checksum`) when you want pre-transfer
@@ -91,6 +94,8 @@ Open-loop behavior (`--no-feedback`) is round-based and continuous by default:
 once the file set is finished, `ssync` starts another round. It keeps a persistent
 send-state file (`.ssync-open-loop-state.json`) with retransmission counts and
 orders each round so files with the lowest retransmission count are sent first.
+When feedback becomes active, a revisit worker services queued incomplete
+transfers on a `50ms` poll interval and prioritizes the current transfer first.
 
 ```bash
 # run open-loop continuously
@@ -111,7 +116,30 @@ Feedback mode timing controls:
 
 ```bash
 uv run ssync send ./example.bin --dest-port 9000 --feedback \
-  --feedback-wait-s 3.0 --max-feedback-idle-timeouts 10 --max-repair-rounds 32
+  --feedback-wait-s 3.0 --max-feedback-idle-timeouts 10 --max-repair-rounds 32 \
+  --repair-worker-max-chunks-per-burst 256 \
+  --initial-pass-repair-max-chunks-per-burst 16
+```
+
+Use `--initial-pass-repair-max-chunks-per-burst` to keep first-pass forward data
+dominant while still servicing queued repairs in near-real-time.
+
+Sync-mode checksum prefetch:
+
+- `ssync` starts one background checksum worker that precomputes SHA-256 for
+  upcoming source files in planned send order to reduce inter-file startup gaps.
+- Prefetch is intentionally bounded to one hash at a time (no hash fan-out) to
+  avoid uncontrolled CPU/IO amplification on large trees.
+- Prefetched hashes are used only when `(path, size, mtime_ns)` still match at
+  send time; otherwise sender falls back to inline hashing.
+- Sender waits at most about `0.2s` for an in-flight prefetch result before
+  falling back to inline hashing, so transfer progress is not blocked by prefetch.
+
+Periodic transfer metadata is enabled by default every 10 seconds:
+
+```bash
+uv run ssync send ./example.bin --dest-port 9000 --feedback \
+  --periodic-metadata-interval-s 10.0 --periodic-metadata-every-n-chunks 1024
 ```
 
 Availability beacons (default every second; `0` disables):
@@ -121,14 +149,30 @@ uv run ssyncd --bind-port 9000 --beacon-interval-s 1.0
 uv run ssync send ./example.bin --dest-port 9000 --feedback --beacon-interval-s 1.0
 ```
 
+Pre-metadata buffering controls on receiver/server:
+
+```bash
+uv run ssync receive --bind-port 9000 --feedback \
+  --pre-metadata-max-pending-bytes 8388608 \
+  --pre-metadata-max-pending-bytes-per-transfer 524288 \
+  --pre-metadata-max-pending-transfers 128 \
+  --pre-metadata-ttl-s 30
+```
+
 Receiver state advertisement:
 
-- On repeated `MANIFEST`, receiver may advertise current `STATUS(INCOMPLETE)` with
+- On repeated `METADATA`, receiver may advertise current `STATUS(INCOMPLETE)` with
   bounded missing ranges to help sender prioritize immediate repairs.
+- Receiver emits `STATUS(INCOMPLETE)` as the repair signal.
+- In feedback mode, sender enqueues incoming `STATUS(INCOMPLETE)` requests and
+  services repairs concurrently during forward data streaming using bounded
+  repair bursts.
 - If destination already has a hash-matching completed file, receiver short-circuits
   with `STATUS(COMPLETE)` and sender exits early.
-- During post-`FIN` feedback wait, sender retries `MANIFEST` + `FIN` on relevant
-  idle windows to recover from control-frame loss on impaired links.
+- During feedback wait, sender retries `METADATA` on relevant idle windows to recover
+  control-context loss on impaired links.
+- Receiver can buffer bounded unknown-transfer data chunks before metadata arrives;
+  once metadata appears, buffered chunks are replayed and missing ranges are advertised.
 
 Simulate loss to exercise repair:
 
@@ -186,6 +230,32 @@ The monitor reads receiver journal state and shows active transfer progress,
 range counts, smoothed receive throughput, and a 2D hole map for the selected
 transfer (`█` full, `▒` partial, `·` missing). Use up/down (or `j`/`k`) to
 change selection and `q` to quit.
+
+Monitor live IPC (default hybrid mode):
+
+- `ssyncd`/receiver publishes live monitor events over a Unix datagram socket.
+- Monitor subscribes to this socket for low-latency updates (including beacon
+  strobes) and falls back to journal polling if IPC is unavailable.
+- Default socket path is `<output-dir>/.ssync-monitor.sock` (or
+  `<root-dir>/.ssync-monitor.sock` for `ssyncd`).
+- If IPC is missing/unavailable, receiver continues transfer behavior and monitor
+  remains functional via journal polling fallback.
+- If a stale datagram socket path is detected (for example, after monitor crash),
+  receiver best-effort removes the stale socket path so monitor restart can re-bind.
+- Recommended operational model on shared hosts: keep receiver output/root
+  directories private (for example `0700`) so local IPC visibility stays scoped.
+
+```bash
+# destination daemon publishes monitor IPC here by default:
+uv run ssyncd --root-dir ./received
+
+# monitor subscribes to the matching default socket path:
+uv run ssync monitor --output-dir ./received
+
+# optional explicit socket override:
+uv run ssyncd --root-dir ./received --monitor-ipc-socket /tmp/ssync-monitor.sock
+uv run ssync monitor --output-dir ./received --monitor-ipc-socket /tmp/ssync-monitor.sock
+```
 
 Traffic emulation with `tc`/`netem`:
 

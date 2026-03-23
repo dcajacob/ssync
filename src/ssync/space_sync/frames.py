@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
-from typing import cast
 
-from .manifest import RepairRequest, TransferManifest
+from .manifest import TransferManifest
 from .ranges import decode_ranges, encode_ranges
 from .types import (
     MAX_FILE_NAME_BYTES,
@@ -18,16 +17,16 @@ from .types import (
     BeaconRole,
     FrameType,
     RemoteFileInfo,
+    StatusKind,
     TransferState,
 )
 
 HEADER_STRUCT = struct.Struct("!2sBBBBI")
 MANIFEST_FIXED_STRUCT = struct.Struct(f"!{TRANSFER_ID_SIZE}sQII{SHA256_SIZE}sH")
+METADATA_FIXED_STRUCT = MANIFEST_FIXED_STRUCT
 DATA_FIXED_STRUCT = struct.Struct(f"!{TRANSFER_ID_SIZE}sIH")
-FIN_STRUCT = struct.Struct(f"!{TRANSFER_ID_SIZE}s")
-STATUS_FIXED_STRUCT = struct.Struct(f"!{TRANSFER_ID_SIZE}sBH")
+STATUS_FIXED_STRUCT = struct.Struct(f"!{TRANSFER_ID_SIZE}sBBH")
 TLV_HEADER_STRUCT = struct.Struct("!BH")
-FILE_INFO_REQUEST_FIXED_STRUCT = struct.Struct("!BH")
 FILE_INFO_RESPONSE_FIXED_STRUCT = struct.Struct(f"!BBQQ{SHA256_SIZE}sH")
 BEACON_STRUCT = struct.Struct(f"!B{TRANSFER_ID_SIZE}s")
 KNOWN_FRAME_TYPE_VALUES = {item.value for item in FrameType}
@@ -51,8 +50,11 @@ class DataChunk:
 @dataclass(slots=True)
 class TransferStatus:
     transfer_id: bytes
+    kind: StatusKind
     state: TransferState
     missing_ranges: list[tuple[int, int]]
+    file_info: RemoteFileInfo | None = None
+    query_token: bytes | None = None
 
 
 def encode_frame(frame_type: FrameType, payload: bytes, flags: int = 0) -> bytes:
@@ -142,7 +144,7 @@ def encode_manifest(manifest: TransferManifest) -> bytes:
         len(file_name_bytes),
     )
     tail = file_name_bytes + struct.pack("!H", len(tlv_bytes)) + tlv_bytes
-    return encode_frame(FrameType.MANIFEST, fixed + tail)
+    return encode_frame(FrameType.METADATA, fixed + tail)
 
 
 def decode_manifest(payload: bytes) -> TransferManifest:
@@ -186,6 +188,14 @@ def decode_manifest(payload: bytes) -> TransferManifest:
     )
 
 
+def encode_metadata(metadata: TransferManifest) -> bytes:
+    return encode_manifest(metadata)
+
+
+def decode_metadata(payload: bytes) -> TransferManifest:
+    return decode_manifest(payload)
+
+
 def encode_data_chunk(transfer_id: bytes, chunk_index: int, chunk_payload: bytes) -> bytes:
     if len(chunk_payload) > 65535:
         raise ValueError("Chunk payload too large")
@@ -207,86 +217,68 @@ def decode_data_chunk(payload: bytes) -> DataChunk:
     )
 
 
-def encode_fin(transfer_id: bytes) -> bytes:
-    return encode_frame(FrameType.FIN, FIN_STRUCT.pack(transfer_id))
-
-
-def decode_fin(payload: bytes) -> bytes:
-    if len(payload) != FIN_STRUCT.size:
-        raise ValueError("FIN payload size mismatch")
-    return cast(bytes, FIN_STRUCT.unpack(payload)[0])
-
-
 def encode_status(status: TransferStatus) -> bytes:
-    if len(status.missing_ranges) > MAX_RANGES_PER_FRAME:
-        raise ValueError("Too many ranges in STATUS")
-    ranges_payload = encode_ranges(status.missing_ranges)
+    if status.kind == StatusKind.TRANSFER:
+        if len(status.missing_ranges) > MAX_RANGES_PER_FRAME:
+            raise ValueError("Too many ranges in STATUS")
+        ranges_payload = encode_ranges(status.missing_ranges)
+        tail = ranges_payload
+    elif status.kind == StatusKind.FILE_INFO_RESPONSE:
+        if status.file_info is None:
+            raise ValueError("file_info required for FILE_INFO_RESPONSE status")
+        file_info_payload = encode_file_info_response(status.file_info)
+        token = status.query_token or b""
+        if len(token) > 255:
+            raise ValueError("query token too large")
+        tail = struct.pack("!B", len(token)) + token + file_info_payload
+        ranges_payload = b""
+    else:
+        raise ValueError("Unknown STATUS kind")
     fixed = STATUS_FIXED_STRUCT.pack(
         status.transfer_id,
+        int(status.kind),
         int(status.state),
         len(ranges_payload) // 8,
     )
-    return encode_frame(FrameType.STATUS, fixed + ranges_payload)
+    return encode_frame(FrameType.STATUS, fixed + tail)
 
 
 def decode_status(payload: bytes) -> TransferStatus:
     if len(payload) < STATUS_FIXED_STRUCT.size:
         raise ValueError("Status payload too short")
-    transfer_id, raw_state, range_count = STATUS_FIXED_STRUCT.unpack_from(payload, 0)
+    transfer_id, raw_kind, raw_state, range_count = STATUS_FIXED_STRUCT.unpack_from(payload, 0)
+    cursor = STATUS_FIXED_STRUCT.size
+    kind = StatusKind(raw_kind)
     if range_count > MAX_RANGES_PER_FRAME:
         raise ValueError("STATUS range count too large")
-    ranges_payload = payload[STATUS_FIXED_STRUCT.size :]
-    if len(ranges_payload) != range_count * 8:
-        raise ValueError("Status range count mismatch")
+    if kind == StatusKind.TRANSFER:
+        ranges_payload = payload[cursor:]
+        if len(ranges_payload) != range_count * 8:
+            raise ValueError("Status range count mismatch")
+        return TransferStatus(
+            transfer_id=transfer_id,
+            kind=kind,
+            state=TransferState(raw_state),
+            missing_ranges=decode_ranges(ranges_payload),
+        )
+    if len(payload) - cursor < 1:
+        raise ValueError("Status file-info payload missing token size")
+    token_size = payload[cursor]
+    cursor += 1
+    if len(payload) - cursor < token_size:
+        raise ValueError("Status file-info payload token size mismatch")
+    query_token = payload[cursor : cursor + token_size]
+    cursor += token_size
+    file_info_frame_payload = payload[cursor:]
+    file_info = decode_file_info_response(file_info_frame_payload)
     return TransferStatus(
         transfer_id=transfer_id,
+        kind=kind,
         state=TransferState(raw_state),
-        missing_ranges=decode_ranges(ranges_payload),
+        missing_ranges=[],
+        file_info=file_info,
+        query_token=query_token or None,
     )
-
-
-def encode_repair_request(request: RepairRequest) -> bytes:
-    if len(request.missing_ranges) > MAX_RANGES_PER_FRAME:
-        raise ValueError("Too many ranges in REPAIR_REQUEST")
-    ranges_payload = encode_ranges(request.missing_ranges)
-    payload = (
-        FIN_STRUCT.pack(request.transfer_id)
-        + struct.pack("!H", len(ranges_payload) // 8)
-        + ranges_payload
-    )
-    return encode_frame(FrameType.REPAIR_REQUEST, payload)
-
-
-def decode_repair_request(payload: bytes) -> RepairRequest:
-    if len(payload) < FIN_STRUCT.size + 2:
-        raise ValueError("Repair request payload too short")
-    transfer_id = FIN_STRUCT.unpack_from(payload, 0)[0]
-    range_count = struct.unpack_from("!H", payload, FIN_STRUCT.size)[0]
-    if range_count > MAX_RANGES_PER_FRAME:
-        raise ValueError("Repair request range count too large")
-    ranges_payload = payload[FIN_STRUCT.size + 2 :]
-    if len(ranges_payload) != range_count * 8:
-        raise ValueError("Repair request range count mismatch")
-    return RepairRequest(
-        transfer_id=transfer_id,
-        missing_ranges=decode_ranges(ranges_payload),
-    )
-
-
-def encode_repair_done(transfer_id: bytes) -> bytes:
-    return encode_frame(FrameType.REPAIR_DONE, FIN_STRUCT.pack(transfer_id))
-
-
-def decode_repair_done(payload: bytes) -> bytes:
-    return decode_fin(payload)
-
-
-def encode_transfer_complete(transfer_id: bytes) -> bytes:
-    return encode_frame(FrameType.TRANSFER_COMPLETE, FIN_STRUCT.pack(transfer_id))
-
-
-def decode_transfer_complete(payload: bytes) -> bytes:
-    return decode_fin(payload)
 
 
 def encode_beacon(role: BeaconRole, transfer_id: bytes) -> bytes:
@@ -300,32 +292,6 @@ def decode_beacon(payload: bytes) -> tuple[BeaconRole, bytes]:
         raise ValueError("Beacon payload size mismatch")
     raw_role, transfer_id = BEACON_STRUCT.unpack(payload)
     return BeaconRole(raw_role), transfer_id
-
-
-def encode_file_info_request(path: str, include_checksum: bool) -> bytes:
-    path_bytes = path.encode("utf-8")
-    if not path_bytes:
-        raise ValueError("Remote path must not be empty")
-    if len(path_bytes) > MAX_FILE_NAME_BYTES:
-        raise ValueError("Remote path too long")
-    payload = (
-        FILE_INFO_REQUEST_FIXED_STRUCT.pack(1 if include_checksum else 0, len(path_bytes))
-        + path_bytes
-    )
-    return encode_frame(FrameType.FILE_INFO_REQUEST, payload)
-
-
-def decode_file_info_request(payload: bytes) -> tuple[str, bool]:
-    if len(payload) < FILE_INFO_REQUEST_FIXED_STRUCT.size:
-        raise ValueError("File info request payload too short")
-    checksum_requested, path_size = FILE_INFO_REQUEST_FIXED_STRUCT.unpack_from(payload, 0)
-    path_bytes = payload[FILE_INFO_REQUEST_FIXED_STRUCT.size :]
-    if len(path_bytes) != path_size:
-        raise ValueError("File info request path size mismatch")
-    path = path_bytes.decode("utf-8")
-    if not path:
-        raise ValueError("File info request path must not be empty")
-    return path, bool(checksum_requested)
 
 
 def encode_file_info_response(file_info: RemoteFileInfo) -> bytes:
@@ -348,7 +314,7 @@ def encode_file_info_response(file_info: RemoteFileInfo) -> bytes:
         )
         + path_bytes
     )
-    return encode_frame(FrameType.FILE_INFO_RESPONSE, payload)
+    return payload
 
 
 def decode_file_info_response(payload: bytes) -> RemoteFileInfo:
