@@ -8,3 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
+.ssync-open-loop-state.json
+received/
+*.log
+tcpdump.log
+demo.bin
+docs/protocol-sequence-diagrams.md
+.vscode/
