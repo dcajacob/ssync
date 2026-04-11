@@ -484,6 +484,13 @@ class SpaceSyncReceiver:
             return
         if transfer.tracker.received_count() <= 0:
             return
+        now = time.monotonic()
+        if (
+            transfer.last_activity_s > 0
+            and now - transfer.last_activity_s < 0.5
+            and transfer.tracker.received_count() < transfer.manifest.total_chunks
+        ):
+            return
         missing_ranges = transfer.tracker.missing_ranges()
         requestable_ranges = self._limit_missing_ranges(missing_ranges)
         state = (
@@ -640,7 +647,6 @@ class SpaceSyncReceiver:
                     chunk_index + 1,
                     transfer.manifest.total_chunks,
                 )
-            self._maybe_send_periodic_repair_request(sock, transfer)
             if transfer.manifest.total_chunks > 0 and (
                 transfer.tracker.received_count() >= transfer.manifest.total_chunks
             ):
