@@ -64,6 +64,7 @@ class _TransferStateData:
     received_count_at_last_request: int = 0
     requested_chunks_at_last_request: int = 0
     last_activity_s: float = 0.0
+    last_data_s: float = 0.0
     mapped_stream: BinaryIO | None = None
     mapped_file: mmap.mmap | None = None
     mmap_dirty: bool = False
@@ -107,6 +108,7 @@ class SpaceSyncReceiver:
             tuple[bytes, tuple[str, int]]
         ] = queue_mod.Queue(maxsize=4096)
         self._send_thread: threading.Thread | None = None
+        self._repair_timer_thread: threading.Thread | None = None
         self._tx_sock: socket.socket | None = None
         self._journal_dirty = False
         self._last_journal_flush_s = 0.0
@@ -174,6 +176,13 @@ class SpaceSyncReceiver:
             daemon=True,
         )
         self._send_thread.start()
+        if self.config.enable_feedback and self.config.periodic_repair_request_s > 0:
+            self._repair_timer_thread = threading.Thread(
+                target=self._run_repair_timer,
+                name="ssync-repair-timer",
+                daemon=True,
+            )
+            self._repair_timer_thread.start()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -183,6 +192,8 @@ class SpaceSyncReceiver:
             self._maintenance_thread.join(timeout=2.0)
         if self._finalize_thread:
             self._finalize_thread.join(timeout=5.0)
+        if self._repair_timer_thread:
+            self._repair_timer_thread.join(timeout=2.0)
         if self._send_thread:
             self._send_thread.join(timeout=2.0)
         if self._tx_sock is not None:
@@ -486,8 +497,8 @@ class SpaceSyncReceiver:
             return
         now = time.monotonic()
         if (
-            transfer.last_activity_s > 0
-            and now - transfer.last_activity_s < 0.5
+            transfer.last_data_s > 0
+            and now - transfer.last_data_s < self.config.forward_stream_quiet_s
             and transfer.tracker.received_count() < transfer.manifest.total_chunks
         ):
             return
@@ -633,7 +644,9 @@ class SpaceSyncReceiver:
             changed = transfer.tracker.add(chunk_index)
             if changed and chunk_index < transfer.highest_chunk_seen:
                 transfer.backfill_chunks += 1
-            transfer.last_activity_s = time.monotonic()
+            now_data = time.monotonic()
+            transfer.last_activity_s = now_data
+            transfer.last_data_s = now_data
             if chunk_index > transfer.highest_chunk_seen:
                 transfer.highest_chunk_seen = chunk_index
             transfer.last_chunk_seen = chunk_index
@@ -1550,6 +1563,33 @@ class SpaceSyncReceiver:
         if isinstance(value, str):
             return float(value)
         return default
+
+    def _run_repair_timer(self) -> None:
+        """Fire periodic repair requests on a wall-clock timer, independent of
+        whether the main ``recvfrom()`` loop is busy with sustained inbound
+        DATA traffic.  Skips transfers whose forward stream is still active
+        to avoid lock contention with the hot ``_accept_data`` path."""
+        interval = self.config.periodic_repair_request_s
+        quiet = self.config.forward_stream_quiet_s
+        while not self._stop_event.is_set():
+            self._stop_event.wait(timeout=interval)
+            if self._stop_event.is_set():
+                break
+            now = time.monotonic()
+            with self._lock:
+                active_transfers = list(self._transfers.values())
+            for transfer in active_transfers:
+                with self._lock:
+                    if transfer.done or transfer.finalized:
+                        continue
+                    if (
+                        transfer.last_data_s > 0
+                        and now - transfer.last_data_s < quiet
+                        and transfer.tracker.received_count()
+                        < transfer.manifest.total_chunks
+                    ):
+                        continue
+                    self._maybe_send_periodic_repair_request(None, transfer)
 
     def _run_send_worker(self) -> None:
         while not self._stop_event.is_set():

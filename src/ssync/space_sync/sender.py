@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import queue
+import random
 import socket
 import threading
 import time
@@ -587,6 +588,9 @@ class SpaceSyncSender:
                         should_drop = (
                             self.config.drop_every_nth_data > 0
                             and (chunk_index + 1) % self.config.drop_every_nth_data == 0
+                        ) or (
+                            self.config.drop_rate > 0
+                            and random.random() < self.config.drop_rate
                         )
                         if should_drop:
                             dropped += 1

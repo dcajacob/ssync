@@ -69,6 +69,7 @@ class SenderConfig:
     max_repair_rounds: int = 32
     max_feedback_idle_timeouts: int = 2
     drop_every_nth_data: int = 0
+    drop_rate: float = 0.0
     max_data_rate_bps: int = 0
     midstream_repair_max_rounds_per_poll: int = 1
     midstream_repair_max_chunks_per_poll: int = 512
@@ -114,6 +115,7 @@ class ReceiverConfig:
     pre_metadata_max_pending_bytes_per_transfer: int = 512 * 1024
     pre_metadata_max_pending_transfers: int = 128
     pre_metadata_ttl_s: float = 30.0
+    forward_stream_quiet_s: float = 0.5
     monitor_ipc_socket: Path | None = None
 
 

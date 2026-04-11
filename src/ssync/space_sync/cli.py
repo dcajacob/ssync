@@ -240,6 +240,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0,
         help="Test helper: drop every nth data frame",
     )
+    send.add_argument(
+        "--drop-rate",
+        type=float,
+        default=0.0,
+        help="Test helper: random drop probability (0.0-1.0)",
+    )
     send.add_argument("--inter-packet-delay-s", type=float, default=0.0002)
     send.add_argument(
         "--max-data-rate-bps",
@@ -627,6 +633,12 @@ def _add_sync_args(parser: argparse.ArgumentParser) -> None:
         default=0,
         help="Test helper: drop every nth data frame",
     )
+    parser.add_argument(
+        "--drop-rate",
+        type=float,
+        default=0.0,
+        help="Test helper: random drop probability (0.0-1.0)",
+    )
     parser.add_argument("--inter-packet-delay-s", type=float, default=0.0002)
     parser.add_argument(
         "--max-data-rate-bps",
@@ -910,6 +922,7 @@ def _run_sender(args: argparse.Namespace) -> int:
             max_repair_rounds=args.max_repair_rounds,
             max_feedback_idle_timeouts=args.max_feedback_idle_timeouts,
             drop_every_nth_data=args.drop_every_nth_data,
+            drop_rate=max(0.0, min(1.0, args.drop_rate)),
             max_data_rate_bps=max(0, args.max_data_rate_bps),
             midstream_repair_max_rounds_per_poll=max(
                 0, args.midstream_repair_max_rounds_per_poll
@@ -1246,6 +1259,7 @@ def _run_sync(args: argparse.Namespace) -> int:
             max_repair_rounds=args.max_repair_rounds,
             max_feedback_idle_timeouts=args.max_feedback_idle_timeouts,
             drop_every_nth_data=args.drop_every_nth_data,
+            drop_rate=max(0.0, min(1.0, args.drop_rate)),
             max_data_rate_bps=max(0, args.max_data_rate_bps),
             midstream_repair_max_rounds_per_poll=max(
                 0, args.midstream_repair_max_rounds_per_poll

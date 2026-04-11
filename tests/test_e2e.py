@@ -283,7 +283,7 @@ def test_receiver_advertises_incomplete_state_on_repeated_manifest(tmp_path: Pat
             with receiver._lock:
                 transfer = receiver._transfers[manifest.transfer_id]
                 transfer.tracker.add(0)
-                transfer.last_activity_s = 0
+                transfer.last_data_s = 0
             receiver._prepare_transfer(receiver_sock, manifest, source_addr)
             response_raw, _ = sender_sock.recvfrom(65535)
 
