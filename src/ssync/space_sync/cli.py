@@ -162,6 +162,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Receiver beacon interval in seconds (0 disables beacons)",
     )
     recv.add_argument(
+        "--forward-stream-quiet-s",
+        type=float,
+        default=0.5,
+        help="Seconds of DATA silence before allowing state advertisements during forward streaming",
+    )
+    recv.add_argument(
         "--pre-metadata-max-pending-bytes",
         type=int,
         default=8 * 1024 * 1024,
@@ -514,6 +520,12 @@ def _add_server_args(parser: argparse.ArgumentParser) -> None:
         help="Receiver beacon interval in seconds (0 disables beacons)",
     )
     parser.add_argument(
+        "--forward-stream-quiet-s",
+        type=float,
+        default=0.5,
+        help="Seconds of DATA silence before allowing state advertisements during forward streaming",
+    )
+    parser.add_argument(
         "--pre-metadata-max-pending-bytes",
         type=int,
         default=8 * 1024 * 1024,
@@ -776,6 +788,7 @@ def _run_receiver_common(
     socket_rcvbuf_bytes: int,
     journal_flush_interval_s: float,
     beacon_interval_s: float,
+    forward_stream_quiet_s: float,
     monitor_ipc_socket: Path | None,
     pre_metadata_max_pending_bytes: int,
     pre_metadata_max_pending_bytes_per_transfer: int,
@@ -811,6 +824,7 @@ def _run_receiver_common(
             socket_rcvbuf_bytes=max(0, socket_rcvbuf_bytes),
             journal_flush_interval_s=max(0.0, journal_flush_interval_s),
             beacon_interval_s=max(0.0, beacon_interval_s),
+            forward_stream_quiet_s=max(0.0, forward_stream_quiet_s),
             monitor_ipc_socket=resolved_monitor_ipc_socket,
             pre_metadata_max_pending_bytes=max(0, pre_metadata_max_pending_bytes),
             pre_metadata_max_pending_bytes_per_transfer=max(
@@ -861,6 +875,7 @@ def _run_receiver(args: argparse.Namespace) -> int:
         socket_rcvbuf_bytes=args.socket_rcvbuf_bytes,
         journal_flush_interval_s=args.journal_flush_interval_s,
         beacon_interval_s=args.beacon_interval_s,
+        forward_stream_quiet_s=args.forward_stream_quiet_s,
         monitor_ipc_socket=args.monitor_ipc_socket,
         pre_metadata_max_pending_bytes=args.pre_metadata_max_pending_bytes,
         pre_metadata_max_pending_bytes_per_transfer=(
@@ -894,6 +909,7 @@ def _run_server(args: argparse.Namespace) -> int:
         socket_rcvbuf_bytes=args.socket_rcvbuf_bytes,
         journal_flush_interval_s=args.journal_flush_interval_s,
         beacon_interval_s=args.beacon_interval_s,
+        forward_stream_quiet_s=args.forward_stream_quiet_s,
         monitor_ipc_socket=args.monitor_ipc_socket,
         pre_metadata_max_pending_bytes=args.pre_metadata_max_pending_bytes,
         pre_metadata_max_pending_bytes_per_transfer=(

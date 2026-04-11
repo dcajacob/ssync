@@ -533,6 +533,7 @@ def _render_monitor(
     completed_count: int,
     completed_size: int,
     cumulative_repairs: int = 0,
+    backfill_baseline_by_id: dict[str, int] | None = None,
     overall_mode: tuple[str, str] | None = None,
 ) -> Group:
     if overall_mode is None:
@@ -546,7 +547,11 @@ def _render_monitor(
     summary.append(str(completed_count), style="cyan")
     summary.append("  completed_bytes=", style="bold")
     summary.append(_format_bytes(completed_size), style="cyan")
-    active_backfill = sum(s.backfill_chunks for s in snapshots)
+    _baselines = backfill_baseline_by_id or {}
+    active_backfill = sum(
+        max(0, s.backfill_chunks - _baselines.get(s.transfer_id_hex, 0))
+        for s in snapshots
+    )
     total_backfill = cumulative_repairs + active_backfill
     if total_backfill > 0 or cumulative_repairs > 0:
         summary.append("  repairs=", style="bold")
@@ -628,8 +633,11 @@ def _render_monitor(
             f"{selected.progress_ratio * 100.0:5.1f}%",
             style="cyan",
         )
-        if selected.backfill_chunks > 0:
-            detail_header.append(f"  repairs={selected.backfill_chunks}", style="red")
+        selected_repairs = max(
+            0, selected.backfill_chunks - _baselines.get(selected.transfer_id_hex, 0)
+        )
+        if selected_repairs > 0:
+            detail_header.append(f"  repairs={selected_repairs}", style="red")
         detail_map = _build_hole_map_2d(
             selected,
             width=_DETAIL_MAP_WIDTH,
@@ -738,6 +746,7 @@ def run_monitor_tui(
     snapshots: list[TransferSnapshot] = []
     previous_active_ids: set[str] = set()
     last_backfill_by_id: dict[str, int] = {}
+    backfill_baseline_by_id: dict[str, int] = {}
     cumulative_repairs: int = 0
     displayed_mode: tuple[str, str] = ("IDLE", "grey58")
     displayed_mode_since_s = time.monotonic()
@@ -802,7 +811,9 @@ def run_monitor_tui(
                         for stale_id in stale_ids:
                             transfer_history.pop(stale_id, None)
                             throughput_bps.pop(stale_id, None)
-                            cumulative_repairs += last_backfill_by_id.pop(stale_id, 0)
+                            raw = last_backfill_by_id.pop(stale_id, 0)
+                            baseline = backfill_baseline_by_id.pop(stale_id, 0)
+                            cumulative_repairs += max(0, raw - baseline)
                         for snapshot in snapshots:
                             last_backfill_by_id[snapshot.transfer_id_hex] = snapshot.backfill_chunks
                         selected_index = _autoselect_new_transfer_index(
@@ -837,6 +848,10 @@ def run_monitor_tui(
                     if key == "reset":
                         cumulative_repairs = 0
                         last_backfill_by_id.clear()
+                        backfill_baseline_by_id = {
+                            s.transfer_id_hex: s.backfill_chunks
+                            for s in snapshots
+                        }
                         render_needed = True
                     if key == "up":
                         selected_index -= 1
@@ -859,6 +874,7 @@ def run_monitor_tui(
                             completed_count=completed_count,
                             completed_size=completed_size,
                             cumulative_repairs=cumulative_repairs,
+                            backfill_baseline_by_id=backfill_baseline_by_id,
                             overall_mode=displayed_mode,
                         ),
                         refresh=True,
