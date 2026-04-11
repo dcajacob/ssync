@@ -1051,7 +1051,20 @@ def _collect_sync_items(
     if source.is_dir():
         if not recursive:
             raise ValueError("source is a directory; use -r/--recursive")
-        files = sorted(path for path in source.rglob("*") if path.is_file())
+        files: list[Path] = []
+        for dirpath, _dirnames, filenames in os.walk(source, onerror=lambda err: print(
+            f'rsync: send_files failed to open "{err.filename}": '
+            f"{err.strerror} ({err.errno})",
+            file=sys.stderr,
+        )):
+            for fname in filenames:
+                fpath = Path(dirpath) / fname
+                try:
+                    if fpath.is_file():
+                        files.append(fpath)
+                except OSError:
+                    pass
+        files.sort()
         items: list[tuple[Path, str]] = []
         for file_path in files:
             relative = file_path.relative_to(source).as_posix()
@@ -1704,6 +1717,14 @@ def _run_sync(args: argparse.Namespace) -> int:
                                 max_feedback_seconds_override=args.primary_feedback_max_seconds,
                                 max_feedback_total_rounds_override=args.primary_feedback_max_rounds,
                             )
+                    except PermissionError as exc:
+                        print(
+                            f'rsync: send_files failed to open "{source_file}": '
+                            f"{exc.strerror} ({exc.errno})",
+                            file=sys.stderr,
+                        )
+                        skipped_count += 1
+                        continue
                     finally:
                         with revisit_lock:
                             current_primary_revisit_key = None
