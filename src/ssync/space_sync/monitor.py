@@ -548,9 +548,11 @@ def _render_monitor(
     summary.append(_format_bytes(completed_size), style="cyan")
     active_backfill = sum(s.backfill_chunks for s in snapshots)
     total_backfill = cumulative_repairs + active_backfill
-    if total_backfill > 0:
+    if total_backfill > 0 or cumulative_repairs > 0:
         summary.append("  repairs=", style="bold")
         summary.append(str(total_backfill), style="red")
+        if cumulative_repairs > 0 and active_backfill > 0:
+            summary.append(f" (file={active_backfill} prev={cumulative_repairs})", style="grey70")
     summary.append("  mode=", style="bold")
     summary.append(overall_mode_label, style=overall_mode_style)
     now_s = time.monotonic()
@@ -595,7 +597,7 @@ def _render_monitor(
     if not snapshots:
         table.add_row("No active transfers", "-", "-", "-", "-", "-")
 
-    help_line = Text("Press q to quit", style="grey62")
+    help_line = Text("q=quit  r=reset counters", style="grey62")
     header = Panel(
         Group(
             Text("Space Sync Receiver Monitor", style="bold"),
@@ -626,6 +628,8 @@ def _render_monitor(
             f"{selected.progress_ratio * 100.0:5.1f}%",
             style="cyan",
         )
+        if selected.backfill_chunks > 0:
+            detail_header.append(f"  repairs={selected.backfill_chunks}", style="red")
         detail_map = _build_hole_map_2d(
             selected,
             width=_DETAIL_MAP_WIDTH,
@@ -698,6 +702,8 @@ class _KeyReader:
             return "up"
         if decoded.lower() in {"j"}:
             return "down"
+        if decoded.lower() in {"r"}:
+            return "reset"
         return None
 
 
@@ -828,6 +834,10 @@ def run_monitor_tui(
                     key = keys.poll(timeout_s=poll_timeout_s)
                     if key == "quit":
                         return 0
+                    if key == "reset":
+                        cumulative_repairs = 0
+                        last_backfill_by_id.clear()
+                        render_needed = True
                     if key == "up":
                         selected_index -= 1
                         render_needed = True
