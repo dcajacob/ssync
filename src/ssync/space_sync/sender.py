@@ -894,6 +894,10 @@ class SpaceSyncSender:
             try:
                 sock.sendto(payload, destination)
                 return True
+            except BlockingIOError:
+                if self._should_stop(stop_requested):
+                    return False
+                time.sleep(0.001)
             except TimeoutError:
                 if self._should_stop(stop_requested):
                     return False
@@ -917,7 +921,10 @@ class SpaceSyncSender:
         now = time.monotonic()
         if last_beacon_s > 0 and now - last_beacon_s < self.config.beacon_interval_s:
             return last_beacon_s
-        sock.sendto(encode_beacon(BeaconRole.SENDER, transfer_id), destination)
+        try:
+            sock.sendto(encode_beacon(BeaconRole.SENDER, transfer_id), destination)
+        except BlockingIOError:
+            return last_beacon_s
         return now
 
     def _maybe_send_periodic_metadata(
@@ -939,7 +946,10 @@ class SpaceSyncSender:
         )
         if not interval_due and not chunk_due:
             return last_metadata_s, chunks_since_metadata
-        sock.sendto(encode_metadata(manifest), destination)
+        try:
+            sock.sendto(encode_metadata(manifest), destination)
+        except BlockingIOError:
+            return last_metadata_s, chunks_since_metadata
         return time.monotonic(), 0
 
     def query_remote_file(
@@ -1025,10 +1035,15 @@ class SpaceSyncSender:
             chunk_payload = chunk_reader(chunk_index)
             if not chunk_payload:
                 continue
-            sock.sendto(
-                encode_data_chunk(manifest.transfer_id, chunk_index, chunk_payload),
-                destination,
-            )
+            while True:
+                try:
+                    sock.sendto(
+                        encode_data_chunk(manifest.transfer_id, chunk_index, chunk_payload),
+                        destination,
+                    )
+                    break
+                except BlockingIOError:
+                    time.sleep(0.001)
             paced_data_bytes = self._apply_rate_limit(
                 paced_start_s=paced_start_s,
                 paced_data_bytes=paced_data_bytes,
