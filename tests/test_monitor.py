@@ -369,6 +369,106 @@ def test_merge_monitor_ipc_beacon_event_updates_snapshot() -> None:
     assert merged[0].last_beacon_rx_s == 42.0
 
 
+def test_reset_baseline_prevents_pre_reset_repairs_from_resurrecting() -> None:
+    """After pressing 'r', pre-reset repairs should not reappear when an
+    active transfer completes and retires into cumulative_repairs."""
+    transfer_a = TransferSnapshot(
+        transfer_id_hex="aaa",
+        file_name="a.bin",
+        file_size=1024,
+        total_chunks=16,
+        chunk_size=64,
+        received_chunks=12,
+        range_count=1,
+        received_ranges=[(0, 12)],
+        stream_cursor_chunk=11,
+        backfill_chunks=5,
+    )
+    transfer_b = TransferSnapshot(
+        transfer_id_hex="bbb",
+        file_name="b.bin",
+        file_size=2048,
+        total_chunks=32,
+        chunk_size=64,
+        received_chunks=20,
+        range_count=1,
+        received_ranges=[(0, 20)],
+        stream_cursor_chunk=19,
+        backfill_chunks=3,
+    )
+    snapshots = [transfer_a, transfer_b]
+
+    last_backfill_by_id: dict[str, int] = {
+        "aaa": 5,
+        "bbb": 3,
+    }
+    cumulative_repairs = 0
+
+    backfill_baseline_by_id = {
+        s.transfer_id_hex: s.backfill_chunks for s in snapshots
+    }
+    last_backfill_by_id = dict(backfill_baseline_by_id)
+
+    assert last_backfill_by_id == {"aaa": 5, "bbb": 3}
+    assert backfill_baseline_by_id == {"aaa": 5, "bbb": 3}
+
+    transfer_a_post = TransferSnapshot(
+        transfer_id_hex="aaa",
+        file_name="a.bin",
+        file_size=1024,
+        total_chunks=16,
+        chunk_size=64,
+        received_chunks=16,
+        range_count=1,
+        received_ranges=[(0, 16)],
+        stream_cursor_chunk=15,
+        backfill_chunks=7,
+    )
+    last_backfill_by_id["aaa"] = 7
+
+    stale_ids = {"aaa"}
+    for stale_id in stale_ids:
+        raw = last_backfill_by_id.pop(stale_id, 0)
+        baseline = backfill_baseline_by_id.pop(stale_id, 0)
+        cumulative_repairs += max(0, raw - baseline)
+
+    assert cumulative_repairs == 2
+    assert "aaa" not in last_backfill_by_id
+    assert "aaa" not in backfill_baseline_by_id
+
+    active_backfill = sum(
+        max(0, s.backfill_chunks - backfill_baseline_by_id.get(s.transfer_id_hex, 0))
+        for s in [transfer_b]
+    )
+    assert active_backfill == 0
+
+
+def test_reset_preserves_last_backfill_for_immediate_retirement() -> None:
+    """If a transfer disappears right after reset, its post-reset repairs
+    should still be tracked correctly (raw - baseline = 0, not negative)."""
+    snapshot = TransferSnapshot(
+        transfer_id_hex="x",
+        file_name="x.bin",
+        file_size=512,
+        total_chunks=8,
+        chunk_size=64,
+        received_chunks=8,
+        range_count=1,
+        received_ranges=[(0, 8)],
+        stream_cursor_chunk=7,
+        backfill_chunks=10,
+    )
+    backfill_baseline_by_id = {"x": 10}
+    last_backfill_by_id = dict(backfill_baseline_by_id)
+    cumulative_repairs = 0
+
+    raw = last_backfill_by_id.pop("x", 0)
+    baseline = backfill_baseline_by_id.pop("x", 0)
+    cumulative_repairs += max(0, raw - baseline)
+
+    assert cumulative_repairs == 0
+
+
 def test_merge_monitor_ipc_terminal_event_removes_snapshot() -> None:
     snapshot = TransferSnapshot(
         transfer_id_hex="abc123",

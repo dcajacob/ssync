@@ -847,11 +847,11 @@ def run_monitor_tui(
                         return 0
                     if key == "reset":
                         cumulative_repairs = 0
-                        last_backfill_by_id.clear()
                         backfill_baseline_by_id = {
                             s.transfer_id_hex: s.backfill_chunks
                             for s in snapshots
                         }
+                        last_backfill_by_id = dict(backfill_baseline_by_id)
                         render_needed = True
                     if key == "up":
                         selected_index -= 1

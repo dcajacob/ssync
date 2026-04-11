@@ -230,6 +230,24 @@ def test_parser_supports_monitor_subcommand() -> None:
     assert args.log_level == "WARNING"
 
 
+def test_parser_supports_forward_stream_quiet_s_flag() -> None:
+    parser = _build_parser()
+    recv_default = parser.parse_args(["receive"])
+    assert recv_default.forward_stream_quiet_s == pytest.approx(0.5)
+    recv_custom = parser.parse_args(["receive", "--forward-stream-quiet-s", "1.25"])
+    assert recv_custom.forward_stream_quiet_s == pytest.approx(1.25)
+    ssyncd_default = parser.parse_args(["ssyncd"])
+    assert ssyncd_default.forward_stream_quiet_s == pytest.approx(0.5)
+    ssyncd_custom = parser.parse_args(["ssyncd", "--forward-stream-quiet-s", "0.1"])
+    assert ssyncd_custom.forward_stream_quiet_s == pytest.approx(0.1)
+
+
+def test_ssyncd_parser_accepts_forward_stream_quiet_s() -> None:
+    parser = _build_ssyncd_parser()
+    args = parser.parse_args(["--forward-stream-quiet-s", "2.0"])
+    assert args.forward_stream_quiet_s == pytest.approx(2.0)
+
+
 def test_ssyncd_parser_accepts_server_args() -> None:
     parser = _build_ssyncd_parser()
     args = parser.parse_args(["--bind-port", "9011", "--root-dir", "./rx"])
