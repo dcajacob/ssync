@@ -1053,7 +1053,7 @@ def _collect_sync_items(
             raise ValueError("source is a directory; use -r/--recursive")
         files: list[Path] = []
         for dirpath, _dirnames, filenames in os.walk(source, onerror=lambda err: print(
-            f'rsync: send_files failed to open "{err.filename}": '
+            f'ssync: send_files failed to open "{err.filename}": '
             f"{err.strerror} ({err.errno})",
             file=sys.stderr,
         )):
@@ -1719,7 +1719,7 @@ def _run_sync(args: argparse.Namespace) -> int:
                             )
                     except PermissionError as exc:
                         print(
-                            f'rsync: send_files failed to open "{source_file}": '
+                            f'ssync: send_files failed to open "{source_file}": '
                             f"{exc.strerror} ({exc.errno})",
                             file=sys.stderr,
                         )
