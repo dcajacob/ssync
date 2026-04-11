@@ -6,6 +6,7 @@ import json
 import logging
 import mmap
 import os
+import queue as queue_mod
 import shutil
 import socket
 import stat
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from .frames import (
+    BEACON_PEER_AGE_NEVER,
     TransferStatus,
     decode_beacon,
     decode_data_chunk,
@@ -50,6 +52,7 @@ class _TransferStateData:
     final_path: Path
     tracker: ChunkTracker
     source_addr: tuple[str, int]
+    reply_addr: tuple[str, int] | None = None
     done: bool = False
     finalized: bool = False
     hash_mismatch: bool = False
@@ -67,6 +70,8 @@ class _TransferStateData:
     last_mmap_flush_s: float = 0.0
     last_beacon_s: float = 0.0
     last_beacon_rx_s: float = 0.0
+    last_sender_peer_age_ms: int = BEACON_PEER_AGE_NEVER
+    backfill_chunks: int = 0
     last_monitor_publish_s: float = 0.0
 
 
@@ -94,6 +99,15 @@ class SpaceSyncReceiver:
         self._completed: list[ReceivedTransferInfo] = []
         self._thread: threading.Thread | None = None
         self._maintenance_thread: threading.Thread | None = None
+        self._finalize_thread: threading.Thread | None = None
+        self._finalize_queue: queue_mod.Queue[
+            tuple[socket.socket, _TransferStateData, list[tuple[int, int]]]
+        ] = queue_mod.Queue()
+        self._send_queue: queue_mod.Queue[
+            tuple[bytes, tuple[str, int]]
+        ] = queue_mod.Queue(maxsize=4096)
+        self._send_thread: threading.Thread | None = None
+        self._tx_sock: socket.socket | None = None
         self._journal_dirty = False
         self._last_journal_flush_s = 0.0
         self._completed_hash_cache: dict[Path, tuple[int, int, bytes]] = {}
@@ -146,6 +160,20 @@ class SpaceSyncReceiver:
             daemon=True,
         )
         self._maintenance_thread.start()
+        self._finalize_thread = threading.Thread(
+            target=self._run_finalize_worker,
+            name="ssync-finalize-worker",
+            daemon=True,
+        )
+        self._finalize_thread.start()
+        self._tx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._tx_sock.setblocking(False)
+        self._send_thread = threading.Thread(
+            target=self._run_send_worker,
+            name="ssync-send-worker",
+            daemon=True,
+        )
+        self._send_thread.start()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -153,6 +181,16 @@ class SpaceSyncReceiver:
             self._thread.join(timeout=2.0)
         if self._maintenance_thread:
             self._maintenance_thread.join(timeout=2.0)
+        if self._finalize_thread:
+            self._finalize_thread.join(timeout=5.0)
+        if self._send_thread:
+            self._send_thread.join(timeout=2.0)
+        if self._tx_sock is not None:
+            try:
+                self._tx_sock.close()
+            except OSError:
+                pass
+            self._tx_sock = None
         with self._lock:
             for transfer in self._transfers.values():
                 self._close_transfer_mmap(transfer)
@@ -241,7 +279,7 @@ class SpaceSyncReceiver:
             return
         if frame_type == FrameType.BEACON:
             try:
-                _role, transfer_id = decode_beacon(payload)
+                _role, transfer_id, peer_age = decode_beacon(payload)
             except ValueError:
                 return
             with self._lock:
@@ -251,6 +289,7 @@ class SpaceSyncReceiver:
                 transfer.source_addr = source_addr
                 transfer.last_activity_s = time.monotonic()
                 transfer.last_beacon_rx_s = transfer.last_activity_s
+                transfer.last_sender_peer_age_ms = peer_age
                 self._mark_journal_dirty_locked()
                 self._publish_beacon_event_locked(
                     transfer,
@@ -281,7 +320,7 @@ class SpaceSyncReceiver:
                             missing_ranges=[],
                         )
                     ),
-                    source_addr,
+                    self._reply_addr_for(manifest, source_addr),
                     reason="short_circuit_status_complete",
                 )
             LOGGER.debug(
@@ -303,6 +342,7 @@ class SpaceSyncReceiver:
                     # Collision policy: ignore conflicting manifest for same transfer ID.
                     return
                 existing.source_addr = source_addr
+                existing.reply_addr = self._reply_addr_for(manifest, source_addr)
                 self._maybe_advertise_receiver_state(sock, existing)
                 self._publish_transfer_update_locked(existing, force=True)
                 return
@@ -329,18 +369,21 @@ class SpaceSyncReceiver:
                         manifest.total_chunks,
                     )
                 transfer.source_addr = source_addr
+                transfer.reply_addr = self._reply_addr_for(manifest, source_addr)
                 self._maybe_advertise_receiver_state(sock, transfer)
                 self._publish_transfer_update_locked(transfer, force=True)
                 return
             if not part_path.exists():
                 with part_path.open("wb") as stream:
                     stream.truncate(manifest.file_size)
+            reply = self._reply_addr_for(manifest, source_addr)
             self._transfers[manifest.transfer_id] = _TransferStateData(
                 manifest=manifest,
                 part_path=part_path,
                 final_path=final_path,
                 tracker=ChunkTracker(total_chunks=manifest.total_chunks),
                 source_addr=source_addr,
+                reply_addr=reply,
                 last_activity_s=time.monotonic(),
             )
             self._transfer_ids_by_signature[self._manifest_signature(manifest)] = (
@@ -366,7 +409,7 @@ class SpaceSyncReceiver:
         if transfer_to_finalize is not None:
             # Empty files have no DATA frames and should complete as soon as
             # metadata is accepted instead of waiting for inactivity timeout.
-            self._finalize_transfer(sock, transfer_to_finalize, [])
+            self._queue_finalization(sock, transfer_to_finalize, [])
             return
         if buffered_chunks:
             LOGGER.debug(
@@ -458,7 +501,7 @@ class SpaceSyncReceiver:
                     missing_ranges=requestable_ranges,
                 )
             ),
-            transfer.source_addr,
+            self._effective_reply_addr(transfer),
             reason="advertise_receiver_state",
         )
         LOGGER.debug(
@@ -498,6 +541,16 @@ class SpaceSyncReceiver:
                     and cached_sha == manifest.sha256
                 ):
                     return True
+            # Size matches but no cache hit. Prefer size+mtime as a fast
+            # proxy to avoid blocking the main receive thread with a full
+            # SHA-256 read. Fall back to full hash only when mtime is
+            # unavailable (e.g. tests, legacy senders).
+            source_mtime_raw = manifest.metadata.get(int(MetadataType.SOURCE_MTIME_NS))
+            if source_mtime_raw is not None and len(source_mtime_raw) == 8:
+                source_mtime_ns = int.from_bytes(source_mtime_raw, "big")
+                if stat_result.st_mtime_ns == source_mtime_ns:
+                    return True
+                return False
             digest = hashlib.sha256()
             with final_path.open("rb") as stream:
                 for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -524,6 +577,22 @@ class SpaceSyncReceiver:
         if any(part == ".." for part in filtered_parts):
             return None
         return self.config.output_dir / Path(*filtered_parts)
+
+    @staticmethod
+    def _reply_addr_for(
+        manifest: TransferManifest,
+        source_addr: tuple[str, int],
+    ) -> tuple[str, int]:
+        raw = manifest.metadata.get(int(MetadataType.REPLY_PORT))
+        if raw is not None and len(raw) == 2:
+            port = int.from_bytes(raw, "big")
+            if port > 0:
+                return (source_addr[0], port)
+        return source_addr
+
+    @staticmethod
+    def _effective_reply_addr(transfer: _TransferStateData) -> tuple[str, int]:
+        return transfer.reply_addr or transfer.source_addr
 
     def _accept_data(
         self,
@@ -555,6 +624,8 @@ class SpaceSyncReceiver:
                     stream.seek(chunk_start)
                     stream.write(payload)
             changed = transfer.tracker.add(chunk_index)
+            if changed and chunk_index < transfer.highest_chunk_seen:
+                transfer.backfill_chunks += 1
             transfer.last_activity_s = time.monotonic()
             if chunk_index > transfer.highest_chunk_seen:
                 transfer.highest_chunk_seen = chunk_index
@@ -579,7 +650,7 @@ class SpaceSyncReceiver:
                 self._mark_journal_dirty_locked()
                 self._publish_transfer_update_locked(transfer, force=False)
         if finalize_transfer is not None and finalize_missing_ranges is not None:
-            self._finalize_transfer(sock, finalize_transfer, finalize_missing_ranges)
+            self._queue_finalization(sock, finalize_transfer, finalize_missing_ranges)
 
 
     def _send_repair_request(
@@ -610,7 +681,7 @@ class SpaceSyncReceiver:
                     missing_ranges=limited_missing_ranges,
                 )
             ),
-            transfer.source_addr,
+            self._effective_reply_addr(transfer),
             reason="repair_status_incomplete",
         )
         transfer_id_hex = transfer.manifest.transfer_id.hex()
@@ -736,10 +807,17 @@ class SpaceSyncReceiver:
             and now - transfer.last_beacon_s < self.config.beacon_interval_s
         ):
             return
+        if transfer.last_beacon_rx_s > 0:
+            age = int((now - transfer.last_beacon_rx_s) * 1000)
+            peer_age = min(age, BEACON_PEER_AGE_NEVER - 1)
+        else:
+            peer_age = BEACON_PEER_AGE_NEVER
         sent = self._sendto_best_effort(
             sock,
-            encode_beacon(BeaconRole.RECEIVER, transfer.manifest.transfer_id),
-            transfer.source_addr,
+            encode_beacon(
+                BeaconRole.RECEIVER, transfer.manifest.transfer_id, peer_age,
+            ),
+            self._effective_reply_addr(transfer),
             reason="receiver_beacon",
         )
         if sent:
@@ -895,9 +973,17 @@ class SpaceSyncReceiver:
             inactivity_s,
             summarize_ranges(missing_ranges),
         )
-        self._finalize_transfer(sock, transfer, missing_ranges)
+        self._queue_finalization(sock, transfer, missing_ranges)
 
-    def _finalize_transfer(
+    def _run_finalize_worker(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                sock, transfer, missing_ranges = self._finalize_queue.get(timeout=0.5)
+            except queue_mod.Empty:
+                continue
+            self._finalize_transfer_impl(sock, transfer, missing_ranges)
+
+    def _queue_finalization(
         self,
         sock: socket.socket,
         transfer: _TransferStateData,
@@ -908,10 +994,22 @@ class SpaceSyncReceiver:
                 return
             transfer.finalized = True
             self._close_transfer_mmap(transfer)
+        if self._finalize_thread is not None and self._finalize_thread.is_alive():
+            self._finalize_queue.put((sock, transfer, missing_ranges))
+        else:
+            self._finalize_transfer_impl(sock, transfer, missing_ranges)
+
+    def _finalize_transfer_impl(
+        self,
+        sock: socket.socket,
+        transfer: _TransferStateData,
+        missing_ranges: list[tuple[int, int]],
+    ) -> None:
+        with self._lock:
             manifest = transfer.manifest
             transfer_id = manifest.transfer_id
             transfer_id_hex = transfer_id.hex()
-            source_addr = transfer.source_addr
+            source_addr = self._effective_reply_addr(transfer)
             part_path = transfer.part_path
             final_path = transfer.final_path
             expected_sha256 = manifest.sha256
@@ -1184,6 +1282,8 @@ class SpaceSyncReceiver:
                 "stream_cursor_chunk": max(transfer.last_chunk_seen, transfer.highest_chunk_seen),
                 "last_beacon_tx_s": transfer.last_beacon_s,
                 "last_beacon_rx_s": transfer.last_beacon_rx_s,
+                "last_sender_peer_age_ms": transfer.last_sender_peer_age_ms,
+                "backfill_chunks": transfer.backfill_chunks,
                 "ts_s": now,
             }
         )
@@ -1260,6 +1360,8 @@ class SpaceSyncReceiver:
                     "source_addr": [transfer.source_addr[0], transfer.source_addr[1]],
                     "last_beacon_tx_s": transfer.last_beacon_s,
                     "last_beacon_rx_s": transfer.last_beacon_rx_s,
+                    "last_sender_peer_age_ms": transfer.last_sender_peer_age_ms,
+                    "backfill_chunks": transfer.backfill_chunks,
                 }
             )
         journal_path = self._journal_path()
@@ -1443,6 +1545,20 @@ class SpaceSyncReceiver:
             return float(value)
         return default
 
+    def _run_send_worker(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                payload, destination = self._send_queue.get(timeout=0.1)
+            except queue_mod.Empty:
+                continue
+            tx = self._tx_sock
+            if tx is None:
+                continue
+            try:
+                tx.sendto(payload, destination)
+            except OSError:
+                pass
+
     def _sendto_best_effort(
         self,
         sock: socket.socket,
@@ -1451,6 +1567,18 @@ class SpaceSyncReceiver:
         *,
         reason: str,
     ) -> bool:
+        if self._send_thread is not None and self._send_thread.is_alive():
+            try:
+                self._send_queue.put_nowait((payload, destination))
+            except queue_mod.Full:
+                LOGGER.debug(
+                    "send_queue_full reason=%s dest=%s:%d",
+                    reason,
+                    destination[0],
+                    destination[1],
+                )
+                return False
+            return True
         try:
             sock.sendto(payload, destination)
         except OSError as exc:

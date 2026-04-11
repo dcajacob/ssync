@@ -130,6 +130,7 @@ def test_receiver_emits_monitor_ipc_events(tmp_path: Path) -> None:
                 enable_feedback=True,
                 feedback_wait_s=0.2,
                 max_repair_rounds=1,
+                beacon_interval_s=0.01,
             )
         )
         sender.send_file(source_path, "127.0.0.1", receiver.bind_port)

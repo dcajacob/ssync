@@ -27,10 +27,10 @@ _DETAIL_MAP_HEIGHT = 18
 _COMPLETED_SCAN_ACTIVE_INTERVAL_S = 5.0
 _COMPLETED_SCAN_IDLE_INTERVAL_S = 15.0
 _INPUT_POLL_INTERVAL_S = 0.03
-_MODE_FEEDBACK_STICKY_S = 10.0
+_MODE_FEEDBACK_STICKY_S = 30.0
+_BEACON_LINK_STATE_FEEDBACK_THRESHOLD_MS = 5000
 _MODE_MIN_SWITCH_DWELL_S = 2.0
 _BEACON_FLASH_WINDOW_S = 0.6
-_MODE_BEACON_FEEDBACK_WINDOW_S = 10.0
 _IPC_MAX_EVENTS_PER_REFRESH = 512
 
 
@@ -47,6 +47,8 @@ class TransferSnapshot:
     stream_cursor_chunk: int
     last_beacon_tx_s: float = 0.0
     last_beacon_rx_s: float = 0.0
+    last_sender_peer_age_ms: int = 0xFFFFFFFF
+    backfill_chunks: int = 0
 
     @property
     def progress_ratio(self) -> float:
@@ -71,15 +73,19 @@ def _estimate_transfer_mode(snapshot: TransferSnapshot) -> tuple[str, str]:
 
 def _estimate_overall_mode(
     snapshots: list[TransferSnapshot],
-    *,
-    now_s: float | None = None,
 ) -> tuple[str, str]:
     if not snapshots:
         return ("IDLE", "grey58")
-    current_s = time.monotonic() if now_s is None else now_s
+    now_s = time.monotonic()
+    for snapshot in snapshots:
+        if snapshot.last_beacon_rx_s <= 0:
+            continue
+        if (now_s - snapshot.last_beacon_rx_s) > _BEACON_FLASH_WINDOW_S * 5:
+            continue
+        if snapshot.last_sender_peer_age_ms < _BEACON_LINK_STATE_FEEDBACK_THRESHOLD_MS:
+            return ("FEEDBACK", "magenta")
     if any(
-        snapshot.last_beacon_tx_s > 0
-        and (current_s - snapshot.last_beacon_tx_s) <= _MODE_BEACON_FEEDBACK_WINDOW_S
+        _estimate_transfer_mode(snapshot)[0] == "FEEDBACK"
         for snapshot in snapshots
     ):
         return ("FEEDBACK", "magenta")
@@ -194,6 +200,10 @@ def _read_transfer_snapshots(output_dir: Path) -> list[TransferSnapshot]:
                 ),
                 last_beacon_tx_s=_safe_float(transfer.get("last_beacon_tx_s", 0.0)),
                 last_beacon_rx_s=_safe_float(transfer.get("last_beacon_rx_s", 0.0)),
+                last_sender_peer_age_ms=_safe_int(
+                    transfer.get("last_sender_peer_age_ms", 0xFFFFFFFF)
+                ),
+                backfill_chunks=_safe_int(transfer.get("backfill_chunks", 0)),
             )
         )
     snapshots.sort(key=lambda item: (item.file_name, item.transfer_id_hex))
@@ -266,6 +276,10 @@ def _merge_monitor_ipc_events(
                 stream_cursor_chunk=_safe_int(event.get("stream_cursor_chunk", 0)),
                 last_beacon_tx_s=_safe_float(event.get("last_beacon_tx_s", 0.0)),
                 last_beacon_rx_s=_safe_float(event.get("last_beacon_rx_s", 0.0)),
+                last_sender_peer_age_ms=_safe_int(
+                    event.get("last_sender_peer_age_ms", 0xFFFFFFFF)
+                ),
+                backfill_chunks=_safe_int(event.get("backfill_chunks", 0)),
             )
             by_id[transfer_id_hex] = current
             continue
@@ -283,6 +297,12 @@ def _merge_monitor_ipc_events(
         )
         current.last_beacon_rx_s = _safe_float(
             event.get("last_beacon_rx_s", current.last_beacon_rx_s)
+        )
+        current.last_sender_peer_age_ms = _safe_int(
+            event.get("last_sender_peer_age_ms", current.last_sender_peer_age_ms)
+        )
+        current.backfill_chunks = _safe_int(
+            event.get("backfill_chunks", current.backfill_chunks)
         )
     merged = list(by_id.values())
     merged.sort(key=lambda item: (item.file_name, item.transfer_id_hex))
@@ -512,6 +532,7 @@ def _render_monitor(
     selected_index: int,
     completed_count: int,
     completed_size: int,
+    cumulative_repairs: int = 0,
     overall_mode: tuple[str, str] | None = None,
 ) -> Group:
     if overall_mode is None:
@@ -525,6 +546,11 @@ def _render_monitor(
     summary.append(str(completed_count), style="cyan")
     summary.append("  completed_bytes=", style="bold")
     summary.append(_format_bytes(completed_size), style="cyan")
+    active_backfill = sum(s.backfill_chunks for s in snapshots)
+    total_backfill = cumulative_repairs + active_backfill
+    if total_backfill > 0:
+        summary.append("  repairs=", style="bold")
+        summary.append(str(total_backfill), style="red")
     summary.append("  mode=", style="bold")
     summary.append(overall_mode_label, style=overall_mode_style)
     now_s = time.monotonic()
@@ -705,6 +731,8 @@ def run_monitor_tui(
     selected_index = 0
     snapshots: list[TransferSnapshot] = []
     previous_active_ids: set[str] = set()
+    last_backfill_by_id: dict[str, int] = {}
+    cumulative_repairs: int = 0
     displayed_mode: tuple[str, str] = ("IDLE", "grey58")
     displayed_mode_since_s = time.monotonic()
     last_feedback_seen_s = float("-inf")
@@ -768,6 +796,9 @@ def run_monitor_tui(
                         for stale_id in stale_ids:
                             transfer_history.pop(stale_id, None)
                             throughput_bps.pop(stale_id, None)
+                            cumulative_repairs += last_backfill_by_id.pop(stale_id, 0)
+                        for snapshot in snapshots:
+                            last_backfill_by_id[snapshot.transfer_id_hex] = snapshot.backfill_chunks
                         selected_index = _autoselect_new_transfer_index(
                             snapshots,
                             selected_index=selected_index,
@@ -817,6 +848,7 @@ def run_monitor_tui(
                             selected_index=selected_index,
                             completed_count=completed_count,
                             completed_size=completed_size,
+                            cumulative_repairs=cumulative_repairs,
                             overall_mode=displayed_mode,
                         ),
                         refresh=True,

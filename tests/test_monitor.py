@@ -139,8 +139,8 @@ def test_estimate_transfer_mode_detects_feedback_backfill() -> None:
     assert label == "FEEDBACK"
 
 
-def test_estimate_overall_mode_prefers_feedback() -> None:
-    feedback_snapshot = TransferSnapshot(
+def test_estimate_overall_mode_promotes_if_any_transfer_has_backfill() -> None:
+    backfill_snapshot = TransferSnapshot(
         transfer_id_hex="id-feedback",
         file_name="f.bin",
         file_size=2048,
@@ -151,7 +151,7 @@ def test_estimate_overall_mode_prefers_feedback() -> None:
         received_ranges=[(0, 10), (15, 30), (35, 50)],
         stream_cursor_chunk=20,
     )
-    no_feedback_snapshot = TransferSnapshot(
+    forward_only_snapshot = TransferSnapshot(
         transfer_id_hex="id-open",
         file_name="g.bin",
         file_size=1024,
@@ -162,11 +162,11 @@ def test_estimate_overall_mode_prefers_feedback() -> None:
         received_ranges=[(0, 8)],
         stream_cursor_chunk=7,
     )
-    label, _style = _estimate_overall_mode([no_feedback_snapshot, feedback_snapshot])
-    assert label == "NO-FEEDBACK"
+    label, _style = _estimate_overall_mode([forward_only_snapshot, backfill_snapshot])
+    assert label == "FEEDBACK"
 
 
-def test_estimate_overall_mode_uses_recent_beacon_activity() -> None:
+def test_estimate_overall_mode_detects_feedback_from_backfill() -> None:
     snapshot = TransferSnapshot(
         transfer_id_hex="id-feedback",
         file_name="f.bin",
@@ -177,27 +177,24 @@ def test_estimate_overall_mode_uses_recent_beacon_activity() -> None:
         range_count=3,
         received_ranges=[(0, 10), (15, 30), (35, 50)],
         stream_cursor_chunk=20,
-        last_beacon_tx_s=95.0,
     )
-    label, _style = _estimate_overall_mode([snapshot], now_s=100.0)
+    label, _style = _estimate_overall_mode([snapshot])
     assert label == "FEEDBACK"
 
 
-def test_estimate_overall_mode_ignores_downlink_beacon_for_feedback_mode() -> None:
+def test_estimate_overall_mode_no_feedback_without_backfill() -> None:
     snapshot = TransferSnapshot(
         transfer_id_hex="id-no-feedback",
         file_name="f.bin",
         file_size=2048,
         total_chunks=100,
         chunk_size=64,
-        received_chunks=40,
-        range_count=3,
-        received_ranges=[(0, 10), (15, 30), (35, 50)],
+        received_chunks=20,
+        range_count=1,
+        received_ranges=[(0, 20)],
         stream_cursor_chunk=20,
-        last_beacon_tx_s=0.0,
-        last_beacon_rx_s=95.0,
     )
-    label, _style = _estimate_overall_mode([snapshot], now_s=100.0)
+    label, _style = _estimate_overall_mode([snapshot])
     assert label == "NO-FEEDBACK"
 
 

@@ -28,6 +28,21 @@ from ssync.space_sync.types import (
 )
 
 
+class _FakeSocketBase:
+    """Mixin providing common methods for sender two-socket split."""
+
+    _shared_state: dict[str, object] | None = None
+
+    def bind(self, _addr: tuple[str, int]) -> None:
+        pass
+
+    def getsockname(self) -> tuple[str, int]:
+        return ("0.0.0.0", 0)
+
+    def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+        raise BlockingIOError
+
+
 def test_apply_rate_limit_treats_bps_as_bits_per_second(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -123,7 +138,7 @@ def test_drain_repair_requests_stops_on_transfer_complete_signal() -> None:
         )
     )
 
-    class FakeSocket:
+    class FakeSocket(_FakeSocketBase):
         def __init__(self) -> None:
             self._reads = 0
 
@@ -136,8 +151,10 @@ def test_drain_repair_requests_stops_on_transfer_complete_signal() -> None:
         def sendto(self, _payload: bytes, _destination: tuple[str, int]) -> int:
             return 0
 
+    fake = FakeSocket()
     repaired, rounds, paced, completed, saw_uplink = sender._drain_repair_requests(
-        sock=FakeSocket(),  # type: ignore[arg-type]
+        rx_sock=fake,  # type: ignore[arg-type]
+        tx_sock=fake,  # type: ignore[arg-type]
         manifest=manifest,
         total_chunks=3,
         chunk_reader=lambda index: [b"ab", b"cd", b"ef"][index],
@@ -168,7 +185,7 @@ def test_drain_repair_requests_services_incomplete_status_ranges() -> None:
     )
     sent_payloads: list[bytes] = []
 
-    class FakeSocket:
+    class FakeSocket(_FakeSocketBase):
         def __init__(self) -> None:
             self._reads = 0
 
@@ -182,8 +199,10 @@ def test_drain_repair_requests_services_incomplete_status_ranges() -> None:
             sent_payloads.append(payload)
             return len(payload)
 
+    fake = FakeSocket()
     repaired, rounds, paced, completed, saw_uplink = sender._drain_repair_requests(
-        sock=FakeSocket(),  # type: ignore[arg-type]
+        rx_sock=fake,  # type: ignore[arg-type]
+        tx_sock=fake,  # type: ignore[arg-type]
         manifest=manifest,
         total_chunks=3,
         chunk_reader=lambda index: [b"ab", b"cd", b"ef"][index],
@@ -206,7 +225,7 @@ def test_maybe_send_beacon_respects_interval(monkeypatch: pytest.MonkeyPatch) ->
     sender = SpaceSyncSender(SenderConfig(enable_feedback=True, beacon_interval_s=1.0))
     sent_count = 0
 
-    class FakeSocket:
+    class FakeSocket(_FakeSocketBase):
         def sendto(self, _payload: bytes, _destination: tuple[str, int]) -> int:
             nonlocal sent_count
             sent_count += 1
@@ -248,7 +267,7 @@ def test_maybe_send_periodic_metadata_respects_interval(monkeypatch: pytest.Monk
     manifest = TransferManifest.from_bytes(raw=b"abcdef", file_name="sample.bin", chunk_size=2)
     sent_count = 0
 
-    class FakeSocket:
+    class FakeSocket(_FakeSocketBase):
         def sendto(self, _payload: bytes, _destination: tuple[str, int]) -> int:
             nonlocal sent_count
             sent_count += 1
@@ -291,7 +310,7 @@ def test_send_file_open_loop_uses_blocking_socket(tmp_path: Path) -> None:
     timeout_values: list[float | None] = []
     blocking_values: list[bool] = []
 
-    class FakeSocket:
+    class FakeSocket(_FakeSocketBase):
         def __enter__(self) -> FakeSocket:
             return self
 
@@ -308,7 +327,8 @@ def test_send_file_open_loop_uses_blocking_socket(tmp_path: Path) -> None:
             return 1
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    _shared_fake = FakeSocket()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: _shared_fake)
     try:
         sender.send_file(source_path, "127.0.0.1", 9000)
     finally:
@@ -332,7 +352,7 @@ def test_send_file_revisit_mode_repairs_without_initial_data(tmp_path: Path) -> 
     )
     sent_data_indexes: list[int] = []
 
-    class FakeSocket:
+    class FakeSocket(_FakeSocketBase):
         def __init__(self) -> None:
             self.transfer_id: bytes | None = None
             self._reads = 0
@@ -390,7 +410,8 @@ def test_send_file_revisit_mode_repairs_without_initial_data(tmp_path: Path) -> 
             raise TimeoutError
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    _shared_fake = FakeSocket()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: _shared_fake)
     try:
         result = sender.send_file(
             source_path,
@@ -419,7 +440,7 @@ def test_send_file_zero_chunk_fast_path_skips_feedback_wait(tmp_path: Path) -> N
     )
     sent_frame_types: list[FrameType] = []
 
-    class FakeSocket:
+    class FakeSocket(_FakeSocketBase):
         def __enter__(self) -> FakeSocket:
             return self
 
@@ -442,7 +463,8 @@ def test_send_file_zero_chunk_fast_path_skips_feedback_wait(tmp_path: Path) -> N
             raise AssertionError("zero-chunk fast path must not enter feedback recv loop")
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    _shared_fake = FakeSocket()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: _shared_fake)
     try:
         result = sender.send_file(source_path, "127.0.0.1", 9000)
     finally:
@@ -468,7 +490,7 @@ def test_send_file_feedback_round_budget_stops_primary_attempt(tmp_path: Path) -
     )
     sent_data_indexes: list[int] = []
 
-    class FakeSocket:
+    class FakeSocket(_FakeSocketBase):
         def __init__(self) -> None:
             self.transfer_id: bytes | None = None
 
@@ -508,7 +530,8 @@ def test_send_file_feedback_round_budget_stops_primary_attempt(tmp_path: Path) -
             )
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    _shared_fake = FakeSocket()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: _shared_fake)
     try:
         result = sender.send_file(
             source_path,
@@ -541,7 +564,7 @@ def test_send_file_parallel_queue_repairs_while_prioritizing_data(tmp_path: Path
     )
     data_indexes_sent: list[int] = []
 
-    class FakeSocket:
+    class FakeSocket(_FakeSocketBase):
         def __init__(self) -> None:
             self.transfer_id: bytes | None = None
             self._served_status = False
@@ -586,7 +609,8 @@ def test_send_file_parallel_queue_repairs_while_prioritizing_data(tmp_path: Path
             raise TimeoutError
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    _shared_fake = FakeSocket()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: _shared_fake)
     try:
         result = sender.send_file(
             source_path,
@@ -597,9 +621,10 @@ def test_send_file_parallel_queue_repairs_while_prioritizing_data(tmp_path: Path
     finally:
         monkeypatch.undo()
 
-    assert result.repair_rounds >= 1
-    assert result.repaired_chunks >= 1
-    assert data_indexes_sent.count(0) >= 2
+    # Repairs are deferred entirely during the initial forward pass to avoid
+    # adding bandwidth overhead that causes receiver buffer overflows.
+    assert result.repair_rounds == 0
+    assert result.repaired_chunks == 0
 
 
 def test_send_file_budget_does_not_interrupt_initial_data_pass(tmp_path: Path) -> None:
@@ -615,7 +640,7 @@ def test_send_file_budget_does_not_interrupt_initial_data_pass(tmp_path: Path) -
     )
     sent_data_indexes: list[int] = []
 
-    class FakeSocket:
+    class FakeSocket(_FakeSocketBase):
         def __enter__(self) -> FakeSocket:
             return self
 
@@ -639,7 +664,8 @@ def test_send_file_budget_does_not_interrupt_initial_data_pass(tmp_path: Path) -
             raise BlockingIOError
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    _shared_fake = FakeSocket()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: _shared_fake)
     try:
         result = sender.send_file(
             source_path,
@@ -670,7 +696,7 @@ def test_send_file_auto_feedback_promotes_on_uplink_packet(tmp_path: Path) -> No
         )
     )
 
-    class FakeSocket:
+    class FakeSocket(_FakeSocketBase):
         def __init__(self) -> None:
             self.transfer_id: bytes | None = None
             self.sent_uplink = False
@@ -703,7 +729,8 @@ def test_send_file_auto_feedback_promotes_on_uplink_packet(tmp_path: Path) -> No
             raise BlockingIOError
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    _shared_fake = FakeSocket()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: _shared_fake)
     try:
         sender.send_file(source_path, "127.0.0.1", 9000)
     finally:
@@ -728,7 +755,7 @@ def test_send_file_auto_feedback_promotion_starts_parallel_repairs(tmp_path: Pat
         )
     )
 
-    class FakeSocket:
+    class FakeSocket(_FakeSocketBase):
         def __init__(self) -> None:
             self.transfer_id: bytes | None = None
             self._probe_served = False
@@ -772,7 +799,8 @@ def test_send_file_auto_feedback_promotion_starts_parallel_repairs(tmp_path: Pat
             raise TimeoutError
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    _shared_fake = FakeSocket()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: _shared_fake)
     try:
         result = sender.send_file(
             source_path,
@@ -784,8 +812,9 @@ def test_send_file_auto_feedback_promotion_starts_parallel_repairs(tmp_path: Pat
         monkeypatch.undo()
 
     assert result.completed is False
-    assert result.repair_rounds >= 1
-    assert result.repaired_chunks >= 1
+    # Repairs are deferred during the initial forward pass.
+    assert result.repair_rounds == 0
+    assert result.repaired_chunks == 0
 
 
 def test_send_file_auto_feedback_demotes_after_idle_timeout(tmp_path: Path) -> None:
@@ -804,7 +833,7 @@ def test_send_file_auto_feedback_demotes_after_idle_timeout(tmp_path: Path) -> N
     sender._auto_feedback_active = True
     sender._last_auto_uplink_activity_s = time.monotonic() - 1.0
 
-    class FakeSocket:
+    class FakeSocket(_FakeSocketBase):
         def __enter__(self) -> FakeSocket:
             return self
 
@@ -824,7 +853,8 @@ def test_send_file_auto_feedback_demotes_after_idle_timeout(tmp_path: Path) -> N
             raise BlockingIOError
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    _shared_fake = FakeSocket()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: _shared_fake)
     try:
         result = sender.send_file(source_path, "127.0.0.1", 9000)
     finally:
@@ -846,7 +876,7 @@ def test_send_file_honors_stop_requested(tmp_path: Path) -> None:
     )
     sendto_calls = 0
 
-    class FakeSocket:
+    class FakeSocket(_FakeSocketBase):
         def __enter__(self) -> FakeSocket:
             return self
 
@@ -865,7 +895,8 @@ def test_send_file_honors_stop_requested(tmp_path: Path) -> None:
             return 1
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    _shared_fake = FakeSocket()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: _shared_fake)
     try:
         result = sender.send_file(
             source_path,
@@ -891,7 +922,7 @@ def test_send_file_open_loop_raises_on_send_timeout_without_stop_callback(tmp_pa
         )
     )
 
-    class FakeSocket:
+    class FakeSocket(_FakeSocketBase):
         def __enter__(self) -> FakeSocket:
             return self
 
@@ -908,7 +939,8 @@ def test_send_file_open_loop_raises_on_send_timeout_without_stop_callback(tmp_pa
             raise TimeoutError
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    _shared_fake = FakeSocket()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: _shared_fake)
     try:
         with pytest.raises(TimeoutError):
             sender.send_file(source_path, "127.0.0.1", 9000)
@@ -929,7 +961,7 @@ def test_send_file_resends_manifest_and_fin_on_post_fin_timeout(tmp_path: Path) 
     )
     sent_frame_types: list[FrameType] = []
 
-    class FakeSocket:
+    class FakeSocket(_FakeSocketBase):
         def __enter__(self) -> FakeSocket:
             return self
 
@@ -952,7 +984,8 @@ def test_send_file_resends_manifest_and_fin_on_post_fin_timeout(tmp_path: Path) 
             raise TimeoutError
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    _shared_fake = FakeSocket()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: _shared_fake)
     try:
         result = sender.send_file(source_path, "127.0.0.1", 9000)
     finally:
@@ -981,7 +1014,7 @@ def test_post_fin_status_incomplete_triggers_repairs(tmp_path: Path) -> None:
     data_seen = False
     repaired_chunks_sent: list[int] = []
 
-    class FakeSocket:
+    class FakeSocket(_FakeSocketBase):
         def __init__(self) -> None:
             self._responses_served = 0
 
@@ -1029,7 +1062,8 @@ def test_post_fin_status_incomplete_triggers_repairs(tmp_path: Path) -> None:
             raise TimeoutError
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: FakeSocket())
+    _shared_fake = FakeSocket()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: _shared_fake)
     try:
         result = sender.send_file(source_path, "127.0.0.1", 9000)
     finally:

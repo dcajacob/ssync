@@ -28,7 +28,9 @@ DATA_FIXED_STRUCT = struct.Struct(f"!{TRANSFER_ID_SIZE}sIH")
 STATUS_FIXED_STRUCT = struct.Struct(f"!{TRANSFER_ID_SIZE}sBBH")
 TLV_HEADER_STRUCT = struct.Struct("!BH")
 FILE_INFO_RESPONSE_FIXED_STRUCT = struct.Struct(f"!BBQQ{SHA256_SIZE}sH")
-BEACON_STRUCT = struct.Struct(f"!B{TRANSFER_ID_SIZE}s")
+BEACON_STRUCT = struct.Struct(f"!B{TRANSFER_ID_SIZE}sI")
+_BEACON_STRUCT_LEGACY = struct.Struct(f"!B{TRANSFER_ID_SIZE}s")
+BEACON_PEER_AGE_NEVER: int = 0xFFFFFFFF
 KNOWN_FRAME_TYPE_VALUES = {item.value for item in FrameType}
 
 
@@ -281,17 +283,27 @@ def decode_status(payload: bytes) -> TransferStatus:
     )
 
 
-def encode_beacon(role: BeaconRole, transfer_id: bytes) -> bytes:
+def encode_beacon(
+    role: BeaconRole,
+    transfer_id: bytes,
+    peer_beacon_age_ms: int = BEACON_PEER_AGE_NEVER,
+) -> bytes:
     if len(transfer_id) != TRANSFER_ID_SIZE:
         raise ValueError("Beacon transfer_id size mismatch")
-    return encode_frame(FrameType.BEACON, BEACON_STRUCT.pack(int(role), transfer_id))
+    return encode_frame(
+        FrameType.BEACON,
+        BEACON_STRUCT.pack(int(role), transfer_id, peer_beacon_age_ms),
+    )
 
 
-def decode_beacon(payload: bytes) -> tuple[BeaconRole, bytes]:
-    if len(payload) != BEACON_STRUCT.size:
-        raise ValueError("Beacon payload size mismatch")
-    raw_role, transfer_id = BEACON_STRUCT.unpack(payload)
-    return BeaconRole(raw_role), transfer_id
+def decode_beacon(payload: bytes) -> tuple[BeaconRole, bytes, int]:
+    if len(payload) == BEACON_STRUCT.size:
+        raw_role, transfer_id, peer_age = BEACON_STRUCT.unpack(payload)
+        return BeaconRole(raw_role), transfer_id, peer_age
+    if len(payload) == _BEACON_STRUCT_LEGACY.size:
+        raw_role, transfer_id = _BEACON_STRUCT_LEGACY.unpack(payload)
+        return BeaconRole(raw_role), transfer_id, BEACON_PEER_AGE_NEVER
+    raise ValueError("Beacon payload size mismatch")
 
 
 def encode_file_info_response(file_info: RemoteFileInfo) -> bytes:

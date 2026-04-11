@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import BinaryIO
 
 from .frames import (
+    BEACON_PEER_AGE_NEVER,
+    decode_beacon,
     decode_frame,
     decode_status,
     encode_beacon,
@@ -88,8 +90,9 @@ class SpaceSyncSender:
         metadata = {
             int(MetadataType.SOURCE_MTIME_NS): int(file_stat.st_mtime_ns).to_bytes(8, "big"),
         }
+        tid = transfer_id if transfer_id is not None else uuid.uuid4().bytes
         manifest = TransferManifest(
-            transfer_id=transfer_id if transfer_id is not None else uuid.uuid4().bytes,
+            transfer_id=tid,
             file_name=remote_name or file_path.name,
             file_size=file_size,
             chunk_size=self.config.chunk_size,
@@ -192,27 +195,38 @@ class SpaceSyncSender:
 
         with (
             file_path.open("rb") as file_stream,
-            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock,
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as tx_sock,
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as rx_sock,
         ):
+            rx_sock.bind(("", 0))
+            rx_port = rx_sock.getsockname()[1]
+            manifest.metadata[int(MetadataType.REPLY_PORT)] = rx_port.to_bytes(2, "big")
+            last_peer_beacon_rx_s: float = 0.0
+
             chunk_reader_lock = threading.Lock()
 
             def chunk_reader(index: int) -> bytes:
-                # Parallel repair sends and primary forward sends can both read
-                # from the same file stream. Guard seek/read so offsets cannot
-                # interleave across threads and corrupt chunk payload selection.
                 with chunk_reader_lock:
                     return self._read_chunk(
                         file_stream=file_stream,
                         chunk_size=self.config.chunk_size,
                         chunk_index=index,
                     )
+
+            def _peer_beacon_age_ms() -> int:
+                if last_peer_beacon_rx_s <= 0:
+                    return BEACON_PEER_AGE_NEVER
+                age = time.monotonic() - last_peer_beacon_rx_s
+                return min(int(age * 1000), BEACON_PEER_AGE_NEVER - 1)
+
             if feedback_active:
-                sock.settimeout(self.config.feedback_wait_s)
-                sock.setblocking(False)
+                rx_sock.settimeout(self.config.feedback_wait_s)
+                rx_sock.setblocking(False)
             else:
-                sock.setblocking(True)
-                # Use finite timeout so Ctrl-C/stop checks can break blocked sends.
-                sock.settimeout(0.5)
+                rx_sock.setblocking(True)
+                rx_sock.settimeout(0.5)
+            tx_sock.setblocking(True)
+            tx_sock.settimeout(0.5)
 
             def _set_feedback_mode(active: bool, reason: str) -> None:
                 nonlocal feedback_active, feedback_deadline_s, prioritize_forward_data
@@ -221,8 +235,8 @@ class SpaceSyncSender:
                     return
                 feedback_active = active
                 if feedback_active:
-                    sock.settimeout(self.config.feedback_wait_s)
-                    sock.setblocking(False)
+                    rx_sock.settimeout(self.config.feedback_wait_s)
+                    rx_sock.setblocking(False)
                     last_uplink_activity_s = time.monotonic()
                     if effective_max_feedback_seconds > 0:
                         feedback_deadline_s = (
@@ -236,8 +250,8 @@ class SpaceSyncSender:
                         )
                     )
                 else:
-                    sock.setblocking(True)
-                    sock.settimeout(0.5)
+                    rx_sock.setblocking(True)
+                    rx_sock.settimeout(0.5)
                     feedback_deadline_s = None
                     prioritize_forward_data = False
                 LOGGER.info(
@@ -248,19 +262,27 @@ class SpaceSyncSender:
                 )
 
             def _probe_uplink_packets(max_packets: int = 8) -> bool:
-                # Probe opportunistically while running in open-loop socket mode.
-                if not hasattr(sock, "recvfrom"):
-                    return False
-                sock.setblocking(False)
+                nonlocal last_peer_beacon_rx_s
+                rx_sock.setblocking(False)
                 saw_uplink = False
                 for _ in range(max(1, max_packets)):
                     try:
-                        _response_raw, _response_addr = sock.recvfrom(65535)
+                        response_raw, _response_addr = rx_sock.recvfrom(65535)
                     except (BlockingIOError, TimeoutError):
                         break
                     saw_uplink = True
-                sock.setblocking(True)
-                sock.settimeout(0.5)
+                    try:
+                        parsed = decode_frame(response_raw)
+                    except ValueError:
+                        continue
+                    if parsed.frame_type == FrameType.BEACON:
+                        try:
+                            _role, _tid, _age = decode_beacon(parsed.payload)
+                        except ValueError:
+                            continue
+                        last_peer_beacon_rx_s = time.monotonic()
+                rx_sock.setblocking(True)
+                rx_sock.settimeout(0.5)
                 return saw_uplink
 
             parallel_runtime: _ParallelRepairRuntime | None = None
@@ -278,11 +300,11 @@ class SpaceSyncSender:
                 )
 
                 def _recv_pump() -> None:
-                    nonlocal last_uplink_activity_s
+                    nonlocal last_uplink_activity_s, last_peer_beacon_rx_s
                     assert parallel_runtime is not None
                     while not parallel_runtime.stop_event.is_set():
                         try:
-                            response_raw, _response_addr = sock.recvfrom(65535)
+                            response_raw, _response_addr = rx_sock.recvfrom(65535)
                         except (BlockingIOError, TimeoutError):
                             time.sleep(self.config.repair_worker_poll_interval_s)
                             continue
@@ -295,6 +317,14 @@ class SpaceSyncSender:
                         with parallel_runtime.state_lock:
                             parallel_runtime.saw_uplink = True
                         last_uplink_activity_s = time.monotonic()
+                        if parsed.frame_type == FrameType.BEACON:
+                            try:
+                                _role, _tid, _age = decode_beacon(parsed.payload)
+                            except ValueError:
+                                pass
+                            else:
+                                last_peer_beacon_rx_s = time.monotonic()
+                            continue
                         if parsed.frame_type != FrameType.STATUS:
                             continue
                         status = decode_status(parsed.payload)
@@ -349,32 +379,18 @@ class SpaceSyncSender:
                             and not initial_data_phase_complete
                             and prioritize_forward_data
                         ):
-                            # During the first-pass forward stream, keep only the
-                            # freshest repair request to avoid replaying stale
-                            # missing snapshots and overwhelming the downlink.
-                            while True:
-                                try:
-                                    request = parallel_runtime.queue.get_nowait()
-                                except queue.Empty:
-                                    break
+                            # During the first-pass forward stream, defer all
+                            # repairs to avoid adding bandwidth on top of the
+                            # rate-limited forward data and causing receiver
+                            # buffer overflows.
+                            time.sleep(self.config.repair_worker_poll_interval_s)
+                            continue
                         limited_ranges = limit_ranges_to_chunk_budget(
                             request.missing_ranges,
-                            max(
-                                1,
-                                min(
-                                    self.config.repair_worker_max_chunks_per_burst,
-                                    self.config.initial_pass_repair_max_chunks_per_burst
-                                    if (
-                                        send_initial_data
-                                        and not initial_data_phase_complete
-                                        and prioritize_forward_data
-                                    )
-                                    else self.config.repair_worker_max_chunks_per_burst,
-                                ),
-                            ),
+                            max(1, self.config.repair_worker_max_chunks_per_burst),
                         )
                         repaired_now, _, paced_data_bytes = self._send_requested_repairs(
-                            sock=sock,
+                            sock=tx_sock,
                             manifest=manifest,
                             total_chunks=total_chunks,
                             chunk_reader=chunk_reader,
@@ -389,12 +405,6 @@ class SpaceSyncSender:
                                 parallel_runtime.repair_rounds += 1
                             parallel_runtime.last_signature = request.signature
                             parallel_runtime.last_signature_s = request.enqueued_s
-                        if (
-                            send_initial_data
-                            and not initial_data_phase_complete
-                            and prioritize_forward_data
-                        ):
-                            time.sleep(max(0.0, self.config.repair_worker_poll_interval_s))
 
                 parallel_threads.extend(
                     [
@@ -442,17 +452,18 @@ class SpaceSyncSender:
                 if self._should_stop(stop_requested):
                     return self._aborted_result(manifest.transfer_id.hex(), total_chunks)
                 if not self._sendto_with_interrupt(
-                    sock=sock,
+                    sock=tx_sock,
                     payload=encode_metadata(manifest),
                     destination=destination,
                     stop_requested=stop_requested,
                 ):
                     return self._aborted_result(manifest.transfer_id.hex(), total_chunks)
                 last_beacon_s = self._maybe_send_beacon(
-                    sock=sock,
+                    sock=tx_sock,
                     destination=destination,
                     transfer_id=manifest.transfer_id,
                     last_beacon_s=last_beacon_s,
+                    peer_beacon_age_ms=_peer_beacon_age_ms(),
                 )
                 if self.config.inter_packet_delay_s > 0:
                     time.sleep(self.config.inter_packet_delay_s)
@@ -496,10 +507,11 @@ class SpaceSyncSender:
                         if not chunk_payload:
                             continue
                         last_beacon_s = self._maybe_send_beacon(
-                            sock=sock,
+                            sock=tx_sock,
                             destination=destination,
                             transfer_id=manifest.transfer_id,
                             last_beacon_s=last_beacon_s,
+                            peer_beacon_age_ms=_peer_beacon_age_ms(),
                         )
                         if feedback_active and not prioritize_forward_data:
                             if parallel_runtime is None:
@@ -510,7 +522,8 @@ class SpaceSyncSender:
                                     completed_now,
                                     saw_uplink_now,
                                 ) = self._drain_repair_requests(
-                                    sock=sock,
+                                    rx_sock=rx_sock,
+                                    tx_sock=tx_sock,
                                     manifest=manifest,
                                     total_chunks=total_chunks,
                                     chunk_reader=chunk_reader,
@@ -579,7 +592,7 @@ class SpaceSyncSender:
                             dropped += 1
                             continue
                         if not self._sendto_with_interrupt(
-                            sock=sock,
+                            sock=tx_sock,
                             payload=encode_data_chunk(
                                 manifest.transfer_id, chunk_index, chunk_payload
                             ),
@@ -597,7 +610,7 @@ class SpaceSyncSender:
                             last_metadata_s,
                             chunks_since_metadata,
                         ) = self._maybe_send_periodic_metadata(
-                            sock=sock,
+                            sock=tx_sock,
                             destination=destination,
                             manifest=manifest,
                             last_metadata_s=last_metadata_s,
@@ -624,10 +637,11 @@ class SpaceSyncSender:
                 and not _feedback_budget_exhausted()
             ):
                 last_beacon_s = self._maybe_send_beacon(
-                    sock=sock,
+                    sock=tx_sock,
                     destination=destination,
                     transfer_id=manifest.transfer_id,
                     last_beacon_s=last_beacon_s,
+                    peer_beacon_age_ms=_peer_beacon_age_ms(),
                 )
                 (
                     repaired_now,
@@ -636,7 +650,8 @@ class SpaceSyncSender:
                     completed_now,
                     saw_uplink_now,
                 ) = self._drain_repair_requests(
-                    sock=sock,
+                    rx_sock=rx_sock,
+                    tx_sock=tx_sock,
                     manifest=manifest,
                     total_chunks=total_chunks,
                     chunk_reader=chunk_reader,
@@ -714,8 +729,8 @@ class SpaceSyncSender:
                     repair_rounds=repair_rounds,
                     completed=True,
                 )
-            sock.setblocking(True)
-            sock.settimeout(self.config.feedback_wait_s)
+            rx_sock.setblocking(True)
+            rx_sock.settimeout(self.config.feedback_wait_s)
             while effective_max_repair_rounds <= 0 or (
                 post_fin_repair_rounds < effective_max_repair_rounds
             ):
@@ -746,10 +761,8 @@ class SpaceSyncSender:
                         idle_timeouts,
                         self.config.max_feedback_idle_timeouts,
                     )
-                    # Under lossy links, metadata can be dropped. Re-send METADATA so
-                    # receiver can (re)associate transfer state and request missing data.
                     if self._sendto_with_interrupt(
-                        sock=sock,
+                        sock=tx_sock,
                         payload=encode_metadata(manifest),
                         destination=destination,
                         stop_requested=stop_requested,
@@ -768,13 +781,14 @@ class SpaceSyncSender:
                         )
                         break
                 last_beacon_s = self._maybe_send_beacon(
-                    sock=sock,
+                    sock=tx_sock,
                     destination=destination,
                     transfer_id=manifest.transfer_id,
                     last_beacon_s=last_beacon_s,
+                    peer_beacon_age_ms=_peer_beacon_age_ms(),
                 )
                 try:
-                    response_raw, _response_addr = sock.recvfrom(65535)
+                    response_raw, _response_addr = rx_sock.recvfrom(65535)
                 except (BlockingIOError, TimeoutError):
                     continue
                 try:
@@ -784,6 +798,14 @@ class SpaceSyncSender:
                 if parsed.frame_type is None:
                     continue
                 last_uplink_activity_s = time.monotonic()
+                if parsed.frame_type == FrameType.BEACON:
+                    try:
+                        _role, _tid, _age = decode_beacon(parsed.payload)
+                    except ValueError:
+                        pass
+                    else:
+                        last_peer_beacon_rx_s = time.monotonic()
+                    continue
                 if parsed.frame_type == FrameType.STATUS:
                     status = decode_status(parsed.payload)
                     if status.kind != StatusKind.TRANSFER:
@@ -819,7 +841,7 @@ class SpaceSyncSender:
                         suppressed_duplicate_repairs += 1
                         continue
                     repaired_now, _, paced_data_bytes = self._send_requested_repairs(
-                        sock=sock,
+                        sock=tx_sock,
                         manifest=manifest,
                         total_chunks=total_chunks,
                         chunk_reader=chunk_reader,
@@ -915,6 +937,7 @@ class SpaceSyncSender:
         destination: tuple[str, int],
         transfer_id: bytes,
         last_beacon_s: float,
+        peer_beacon_age_ms: int = BEACON_PEER_AGE_NEVER,
     ) -> float:
         if self.config.beacon_interval_s <= 0:
             return last_beacon_s
@@ -922,7 +945,10 @@ class SpaceSyncSender:
         if last_beacon_s > 0 and now - last_beacon_s < self.config.beacon_interval_s:
             return last_beacon_s
         try:
-            sock.sendto(encode_beacon(BeaconRole.SENDER, transfer_id), destination)
+            sock.sendto(
+                encode_beacon(BeaconRole.SENDER, transfer_id, peer_beacon_age_ms),
+                destination,
+            )
         except BlockingIOError:
             return last_beacon_s
         return now
@@ -1057,7 +1083,8 @@ class SpaceSyncSender:
     def _drain_repair_requests(
         self,
         *,
-        sock: socket.socket,
+        rx_sock: socket.socket,
+        tx_sock: socket.socket,
         manifest: TransferManifest,
         total_chunks: int,
         chunk_reader: Callable[[int], bytes],
@@ -1077,7 +1104,7 @@ class SpaceSyncSender:
             if max_chunks > 0 and repaired_chunks >= max_chunks:
                 break
             try:
-                response_raw, _response_addr = sock.recvfrom(65535)
+                response_raw, _response_addr = rx_sock.recvfrom(65535)
             except (BlockingIOError, TimeoutError):
                 break
             saw_uplink = True
@@ -1108,7 +1135,7 @@ class SpaceSyncSender:
                     )
                 )
                 repaired_now, _, paced_data_bytes = self._send_requested_repairs(
-                    sock=sock,
+                    sock=tx_sock,
                     manifest=manifest,
                     total_chunks=total_chunks,
                     chunk_reader=chunk_reader,

@@ -144,10 +144,11 @@ def test_status_file_info_response_round_trip() -> None:
 
 
 def test_beacon_round_trip() -> None:
-    raw = encode_beacon(BeaconRole.SENDER, b"\xEE" * 16)
+    raw = encode_beacon(BeaconRole.SENDER, b"\xEE" * 16, peer_beacon_age_ms=1234)
     parsed = decode_frame(raw)
     assert parsed.frame_type == FrameType.BEACON
-    role, transfer_id = decode_beacon(parsed.payload)
+    role, transfer_id, peer_age = decode_beacon(parsed.payload)
     assert role == BeaconRole.SENDER
     assert transfer_id == b"\xEE" * 16
+    assert peer_age == 1234
 
