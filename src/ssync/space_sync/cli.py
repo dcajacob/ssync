@@ -19,7 +19,7 @@ from pathlib import Path, PurePosixPath
 from .monitor import run_monitor_tui
 from .receiver import SpaceSyncReceiver
 from .sender import SpaceSyncSender
-from .types import ReceiverConfig, RemoteFileInfo, SenderConfig
+from .types import DEFAULT_CHUNK_SIZE, ReceiverConfig, RemoteFileInfo, SenderConfig
 
 _REVISIT_WORKER_POLL_INTERVAL_S = 0.05
 
@@ -208,7 +208,7 @@ def _build_parser() -> argparse.ArgumentParser:
     send.add_argument("files", nargs="+")
     send.add_argument("--dest-host", default="127.0.0.1")
     send.add_argument("--dest-port", type=int, default=9000)
-    send.add_argument("--chunk-size", type=int, default=1024)
+    send.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
     send.add_argument("--manifest-repeats", type=int, default=3)
     send.add_argument(
         "--metadata-repeats",
@@ -607,7 +607,7 @@ def _add_sync_args(parser: argparse.ArgumentParser) -> None:
         help="Use checksum (with --skip-unchanged) for unchanged checks",
     )
     parser.add_argument("--dest-port", type=int, default=9000)
-    parser.add_argument("--chunk-size", type=int, default=1024)
+    parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--manifest-repeats", type=int, default=3)
     parser.add_argument(
         "--metadata-repeats",
