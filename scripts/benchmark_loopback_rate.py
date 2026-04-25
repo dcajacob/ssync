@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ssync.space_sync.receiver import SpaceSyncReceiver
 from ssync.space_sync.sender import SpaceSyncSender
-from ssync.space_sync.types import ReceiverConfig, SendResult, SenderConfig
+from ssync.space_sync.types import DEFAULT_CHUNK_SIZE, ReceiverConfig, SendResult, SenderConfig
 
 
 @dataclass(slots=True)
@@ -93,9 +93,9 @@ def _parse_args() -> argparse.Namespace:
         default=64,
         help="Benchmark payload size in MiB",
     )
-    parser.add_argument("--chunk-size", type=int, default=1024)
+    parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--manifest-repeats", type=int, default=3)
-    parser.add_argument("--inter-packet-delay-s", type=float, default=0.0002)
+    parser.add_argument("--inter-packet-delay-s", type=float, default=0.0)
     parser.add_argument(
         "--feedback",
         action="store_true",

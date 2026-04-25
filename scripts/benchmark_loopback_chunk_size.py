@@ -80,7 +80,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-data-rate-bps",
         type=int,
-        default=20_000_000,
+        default=0,
         help="Sender max data rate used for all chunk-size trials",
     )
     parser.add_argument("--manifest-repeats", type=int, default=3)

@@ -68,8 +68,14 @@ The top-level `ssync SRC DEST` workflow enables auto feedback discovery by defau
 it starts open-loop, promotes to feedback when uplink packets/beacons are observed,
 and can fall back to open-loop if uplink goes idle. Use `--feedback` or
 `--no-feedback` to force either mode.
-- Default auto-feedback demotion window is `60s` of uplink inactivity
-  (`--auto-feedback-idle-timeout-s`).
+- Default auto-feedback demotion window is `60s` of uplink inactivity (built into the
+  sender; not a separate CLI flag).
+
+`--help` shows the common workflow and transport options. Many repair/metadata/debug
+knobs are still accepted on the command line for compatibility but are hidden from
+help; put them in `./.ssync.toml`, `~/.ssync.toml`, or `~/.config/ssync/config.toml`
+under the matching command section when you want tuning without long invocations
+(see allowed keys in `src/ssync/space_sync/config_file.py`).
 
 Rsync-style convenience options:
 
@@ -90,16 +96,17 @@ By default, sync does not pre-query the destination; it streams files immediatel
 Use `--skip-unchanged` (optionally with `--checksum`) when you want pre-transfer
 unchanged detection.
 
-Open-loop behavior (`--no-feedback`) is round-based and continuous by default:
-once the file set is finished, `ssync` starts another round. It keeps a persistent
-send-state file (`.ssync-open-loop-state.json`) with retransmission counts and
-orders each round so files with the lowest retransmission count are sent first.
+Open-loop behavior (`--no-feedback`) is round-based. By default `--open-loop-max-rounds`
+is `10`: after each pass over the file set, `ssync` starts another round until that
+cap is reached. Use `--open-loop-max-rounds 0` to run rounds continuously. It keeps
+a persistent send-state file (`.ssync-open-loop-state.json`) with retransmission counts
+and orders each round so files with the lowest retransmission count are sent first.
 When feedback becomes active, a revisit worker services queued incomplete
 transfers on a `50ms` poll interval and prioritizes the current transfer first.
 
 ```bash
-# run open-loop continuously
-uv run ssync -r --no-feedback ./payloads 127.0.0.1:missions/pass-001/
+# run open-loop continuously (unlimited rounds)
+uv run ssync -r --no-feedback --open-loop-max-rounds 0 ./payloads 127.0.0.1:missions/pass-001/
 
 # run exactly two open-loop rounds
 uv run ssync -r --no-feedback --open-loop-max-rounds 2 ./payloads 127.0.0.1:missions/pass-001/

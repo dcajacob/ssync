@@ -13,15 +13,62 @@ import signal
 import sys
 import threading
 import time
+from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
+from typing import Any
 
+from .config_file import detect_cli_command, load_cli_config_defaults
 from .monitor import run_monitor_tui
 from .receiver import SpaceSyncReceiver
 from .sender import SpaceSyncSender
 from .types import DEFAULT_CHUNK_SIZE, ReceiverConfig, RemoteFileInfo, SenderConfig
 
 _REVISIT_WORKER_POLL_INTERVAL_S = 0.05
+_DEFAULT_OPEN_LOOP_MAX_ROUNDS = 10
+
+
+class _OverrideAppendAction(argparse.Action):
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str | list[str] | None,
+        option_string: str | None = None,
+    ) -> None:
+        marker = f"_{self.dest}_explicit"
+        if not getattr(namespace, marker, False):
+            setattr(namespace, self.dest, [])
+            setattr(namespace, marker, True)
+        items = getattr(namespace, self.dest)
+        if isinstance(values, list):
+            items.extend(values)
+        else:
+            items.append(values)
+
+
+def _make_default_getter(
+    config_defaults: dict[str, Any] | None,
+) -> Callable[[str, Any], Any]:
+    data = config_defaults if config_defaults is not None else {}
+
+    def g(name: str, builtin: Any) -> Any:
+        if name in data:
+            return data[name]
+        return builtin
+
+    return g
+
+
+def _add_cli_argument(
+    parser: argparse.ArgumentParser,
+    *name_or_flags: str,
+    hidden: bool = False,
+    **kwargs: Any,
+) -> None:
+    if hidden:
+        kwargs.setdefault("help", argparse.SUPPRESS)
+    parser.add_argument(*name_or_flags, **kwargs)
 
 
 def _default_log_level() -> str:
@@ -32,10 +79,10 @@ def _default_monitor_ipc_socket_for_dir(base_dir: Path) -> Path:
     return base_dir / ".ssync-monitor.sock"
 
 
-def _add_log_level_arg(parser: argparse.ArgumentParser) -> None:
+def _add_log_level_arg(parser: argparse.ArgumentParser, g: Callable[[str, Any], Any]) -> None:
     parser.add_argument(
         "--log-level",
-        default=_default_log_level(),
+        default=g("log_level", _default_log_level()),
         choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"],
         help="Runtime logging level (or set SSYNC_LOG_LEVEL)",
     )
@@ -48,173 +95,205 @@ def _configure_logging(level_name: str) -> None:
     )
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _build_parser(config_defaults: dict[str, Any] | None = None) -> argparse.ArgumentParser:
+    g = _make_default_getter(config_defaults)
     parser = argparse.ArgumentParser(description="Space Sync UDP file transport prototype")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     recv = subparsers.add_parser("receive", help="Run a Space Sync receiver")
-    recv.add_argument("--bind-host", default="127.0.0.1")
-    recv.add_argument("--bind-port", type=int, default=9000)
-    recv.add_argument("--output-dir", type=Path, default=Path("./received"))
-    recv.add_argument(
+    recv.add_argument("--bind-host", default=g("bind_host", "127.0.0.1"))
+    recv.add_argument("--bind-port", type=int, default=g("bind_port", 9000))
+    recv.add_argument("--output-dir", type=Path, default=g("output_dir", Path("./received")))
+    _add_cli_argument(
+        recv,
         "--monitor-ipc-socket",
         type=Path,
-        default=None,
-        help=(
-            "Unix datagram socket for live monitor IPC "
-            "(default: <output-dir>/.ssync-monitor.sock)"
-        ),
+        default=g("monitor_ipc_socket", None),
+        hidden=True,
     )
-    recv.add_argument("--feedback", action="store_true", help="Enable repair feedback")
     recv.add_argument(
+        "--feedback",
+        action="store_true",
+        default=g("feedback", False),
+        help="Enable repair feedback",
+    )
+    _add_cli_argument(
+        recv,
         "--keep-part-files-on-complete",
         action="store_true",
-        help="Keep .part files after successful completion (debugging)",
+        default=g("keep_part_files_on_complete", False),
+        hidden=True,
     )
-    recv.add_argument(
+    _add_cli_argument(
+        recv,
         "--status-repeat",
         type=int,
-        default=3,
-        help="How many times status is repeated when feedback is enabled",
+        default=g("status_repeat", 3),
+        hidden=True,
     )
-    recv.add_argument(
+    _add_cli_argument(
+        recv,
         "--periodic-repair-request-s",
         type=float,
-        default=0.5,
-        help="Periodic repair request interval while transfer is in progress",
+        default=g("periodic_repair_request_s", 0.5),
+        hidden=True,
     )
-    recv.add_argument(
+    _add_cli_argument(
+        recv,
         "--periodic-repair-min-seen-chunks",
         type=int,
-        default=32,
-        help="Minimum received chunk frontier before periodic repair requests",
+        default=g("periodic_repair_min_seen_chunks", 32),
+        hidden=True,
     )
-    recv.add_argument(
+    _add_cli_argument(
+        recv,
         "--max-repair-chunks-per-request",
         type=int,
-        default=256,
-        help="Cap chunks requested in each repair request (0 means unlimited)",
+        default=g("max_repair_chunks_per_request", 256),
+        hidden=True,
     )
-    recv.add_argument(
+    _add_cli_argument(
+        recv,
         "--adaptive-leading-hole-boost",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Dynamically boost repair request chunk budget for large leading holes",
+        default=g("adaptive_leading_hole_boost", True),
+        hidden=True,
     )
-    recv.add_argument(
+    _add_cli_argument(
+        recv,
         "--leading-hole-start-threshold-chunks",
         type=int,
-        default=512,
-        help="Max starting chunk index for considering a leading-hole boost",
+        default=g("leading_hole_start_threshold_chunks", 512),
+        hidden=True,
     )
-    recv.add_argument(
+    _add_cli_argument(
+        recv,
         "--leading-hole-min-span-chunks",
         type=int,
-        default=2048,
-        help="Minimum first-missing-range span to trigger leading-hole boost",
+        default=g("leading_hole_min_span_chunks", 2048),
+        hidden=True,
     )
-    recv.add_argument(
+    _add_cli_argument(
+        recv,
         "--leading-hole-boost-multiplier",
         type=int,
-        default=4,
-        help="Multiplier applied to max repair chunk budget during leading-hole boost",
+        default=g("leading_hole_boost_multiplier", 4),
+        hidden=True,
     )
-    recv.add_argument(
+    _add_cli_argument(
+        recv,
         "--leading-hole-max-repair-chunks-per-request",
         type=int,
-        default=2048,
-        help="Hard cap for boosted per-request repair chunk budget (0 means unlimited)",
+        default=g("leading_hole_max_repair_chunks_per_request", 2048),
+        hidden=True,
     )
-    recv.add_argument(
+    _add_cli_argument(
+        recv,
         "--repair-request-cooldown-s",
         type=float,
-        default=0.2,
-        help="Minimum delay before re-requesting unchanged missing ranges after REPAIR_DONE",
+        default=g("repair_request_cooldown_s", 0.2),
+        hidden=True,
     )
-    recv.add_argument(
+    _add_cli_argument(
+        recv,
         "--repair-request-inflight-timeout-s",
         type=float,
-        default=1.5,
-        help="Timeout before resending a repair request still considered in-flight",
+        default=g("repair_request_inflight_timeout_s", 1.5),
+        hidden=True,
     )
-    recv.add_argument(
+    _add_cli_argument(
+        recv,
         "--transfer-inactivity-timeout-s",
         type=float,
-        default=10.0,
-        help="Finalize transfer as incomplete after FIN + inactivity timeout",
+        default=g("transfer_inactivity_timeout_s", 10.0),
+        hidden=True,
     )
-    recv.add_argument(
+    _add_cli_argument(
+        recv,
         "--socket-rcvbuf-bytes",
         type=int,
-        default=8 * 1024 * 1024,
-        help="OS socket receive buffer size in bytes",
+        default=g("socket_rcvbuf_bytes", 8 * 1024 * 1024),
+        hidden=True,
     )
-    recv.add_argument(
+    _add_cli_argument(
+        recv,
         "--journal-flush-interval-s",
         type=float,
-        default=0.5,
-        help="Receiver journal flush interval in seconds (0 flushes every update)",
+        default=g("journal_flush_interval_s", 0.5),
+        hidden=True,
     )
-    recv.add_argument(
+    _add_cli_argument(
+        recv,
         "--beacon-interval-s",
         type=float,
-        default=1.0,
-        help="Receiver beacon interval in seconds (0 disables beacons)",
+        default=g("beacon_interval_s", 1.0),
+        hidden=True,
     )
     recv.add_argument(
         "--forward-stream-quiet-s",
         type=float,
-        default=0.5,
+        default=g("forward_stream_quiet_s", 0.5),
         help="Seconds of DATA silence before allowing state advertisements during forward streaming",
     )
-    recv.add_argument(
+    _add_cli_argument(
+        recv,
         "--pre-metadata-max-pending-bytes",
         type=int,
-        default=8 * 1024 * 1024,
-        help="Max global bytes buffered for unknown-transfer DATA",
+        default=g("pre_metadata_max_pending_bytes", 8 * 1024 * 1024),
+        hidden=True,
     )
-    recv.add_argument(
+    _add_cli_argument(
+        recv,
         "--pre-metadata-max-pending-bytes-per-transfer",
         type=int,
-        default=512 * 1024,
-        help="Max bytes buffered per unknown transfer ID",
+        default=g("pre_metadata_max_pending_bytes_per_transfer", 512 * 1024),
+        hidden=True,
     )
-    recv.add_argument(
+    _add_cli_argument(
+        recv,
         "--pre-metadata-max-pending-transfers",
         type=int,
-        default=128,
-        help="Max unknown transfer IDs tracked in pre-metadata buffer",
+        default=g("pre_metadata_max_pending_transfers", 128),
+        hidden=True,
     )
-    recv.add_argument(
+    _add_cli_argument(
+        recv,
         "--pre-metadata-ttl-s",
         type=float,
-        default=30.0,
-        help="TTL for buffered unknown-transfer DATA before eviction",
+        default=g("pre_metadata_ttl_s", 30.0),
+        hidden=True,
     )
-    _add_log_level_arg(recv)
+    _add_log_level_arg(recv, g)
 
     server = subparsers.add_parser(
         "server",
         help="Run a destination server for rsync-like ssync sync operations",
     )
-    _add_server_args(server)
+    _add_server_args(server, g)
     ssyncd = subparsers.add_parser(
         "ssyncd",
         help="Alias for the Space Sync destination server daemon",
     )
-    _add_server_args(ssyncd)
+    _add_server_args(ssyncd, g)
 
     send = subparsers.add_parser("send", help="Send file(s) over Space Sync")
     send.add_argument("files", nargs="+")
-    send.add_argument("--dest-host", default="127.0.0.1")
-    send.add_argument("--dest-port", type=int, default=9000)
-    send.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
-    send.add_argument("--manifest-repeats", type=int, default=3)
-    send.add_argument(
+    send.add_argument("--dest-host", default=g("dest_host", "127.0.0.1"))
+    send.add_argument("--dest-port", type=int, default=g("dest_port", 9000))
+    send.add_argument("--chunk-size", type=int, default=g("chunk_size", DEFAULT_CHUNK_SIZE))
+    _add_cli_argument(
+        send,
+        "--manifest-repeats",
+        type=int,
+        default=g("manifest_repeats", 3),
+        hidden=True,
+    )
+    _add_cli_argument(
+        send,
         "--metadata-repeats",
         type=int,
         dest="manifest_repeats",
-        help="Alias for --manifest-repeats",
+        hidden=True,
     )
     send_feedback = send.add_mutually_exclusive_group()
     send_feedback.add_argument(
@@ -232,128 +311,161 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="feedback",
         help="Force feedback/repair flow off",
     )
-    send.add_argument("--feedback-wait-s", type=float, default=2.0)
-    send.add_argument(
+    _add_cli_argument(
+        send,
+        "--feedback-wait-s",
+        type=float,
+        default=g("feedback_wait_s", 2.0),
+        hidden=True,
+    )
+    _add_cli_argument(
+        send,
         "--max-repair-rounds",
         type=int,
-        default=32,
-        help="Post-FIN repair rounds (0 means unlimited until timeout/complete)",
+        default=g("max_repair_rounds", 32),
+        hidden=True,
     )
-    send.add_argument("--max-feedback-idle-timeouts", type=int, default=2)
-    send.add_argument(
+    _add_cli_argument(
+        send,
+        "--max-feedback-idle-timeouts",
+        type=int,
+        default=g("max_feedback_idle_timeouts", 2),
+        hidden=True,
+    )
+    _add_cli_argument(
+        send,
         "--drop-every-nth-data",
         type=int,
-        default=0,
-        help="Test helper: drop every nth data frame",
+        default=g("drop_every_nth_data", 0),
+        hidden=True,
     )
     send.add_argument(
+        "--inter-packet-delay-s",
+        type=float,
+        default=g("inter_packet_delay_s", 0.0),
+        help="Delay between UDP sends in seconds (0 disables pacing)",
+    )
+    _add_cli_argument(
+        send,
         "--drop-rate",
         type=float,
-        default=0.0,
-        help="Test helper: random drop probability (0.0-1.0)",
+        default=g("drop_rate", 0.0),
+        hidden=True,
     )
-    send.add_argument("--inter-packet-delay-s", type=float, default=0.0002)
     send.add_argument(
         "--max-data-rate-bps",
         type=int,
-        default=0,
+        default=g("max_data_rate_bps", 0),
         help="Throttle payload transmit rate in bits/sec (0 means unlimited)",
     )
-    send.add_argument(
+    _add_cli_argument(
+        send,
         "--midstream-repair-max-rounds-per-poll",
         type=int,
-        default=1,
-        help="Maximum repair requests handled per midstream polling pass (0 unlimited)",
+        default=g("midstream_repair_max_rounds_per_poll", 1),
+        hidden=True,
     )
-    send.add_argument(
+    _add_cli_argument(
+        send,
         "--midstream-repair-max-chunks-per-poll",
         type=int,
-        default=512,
-        help="Maximum repair chunks sent per midstream polling pass (0 unlimited)",
+        default=g("midstream_repair_max_chunks_per_poll", 512),
+        hidden=True,
     )
-    send.add_argument(
+    _add_cli_argument(
+        send,
         "--repair-duplicate-suppression-s",
         type=float,
-        default=0.2,
-        help="Suppress servicing identical repair requests within this interval",
+        default=g("repair_duplicate_suppression_s", 0.2),
+        hidden=True,
     )
-    send.add_argument(
+    _add_cli_argument(
+        send,
         "--repair-queue-max-pending-requests",
         type=int,
-        default=1024,
-        help="Maximum queued repair STATUS requests before dropping new ones",
+        default=g("repair_queue_max_pending_requests", 1024),
+        hidden=True,
     )
-    send.add_argument(
+    _add_cli_argument(
+        send,
         "--repair-worker-max-chunks-per-burst",
         type=int,
-        default=256,
-        help="Maximum repair chunks sent for each queued repair request burst",
+        default=g("repair_worker_max_chunks_per_burst", 256),
+        hidden=True,
     )
-    send.add_argument(
+    _add_cli_argument(
+        send,
         "--initial-pass-repair-max-chunks-per-burst",
         type=int,
-        default=16,
-        help=(
-            "Maximum queued-repair chunks per burst during the initial forward "
-            "data pass"
-        ),
+        default=g("initial_pass_repair_max_chunks_per_burst", 16),
+        hidden=True,
     )
-    send.add_argument(
+    _add_cli_argument(
+        send,
         "--repair-worker-poll-interval-s",
         type=float,
-        default=0.01,
-        help="Repair worker queue poll interval in seconds",
+        default=g("repair_worker_poll_interval_s", 0.01),
+        hidden=True,
     )
-    send.add_argument(
+    _add_cli_argument(
+        send,
         "--beacon-interval-s",
         type=float,
-        default=1.0,
-        help="Sender beacon interval in seconds (0 disables beacons)",
+        default=g("beacon_interval_s", 1.0),
+        hidden=True,
     )
-    send.add_argument(
+    _add_cli_argument(
+        send,
         "--periodic-metadata-interval-s",
         type=float,
-        default=10.0,
-        help="Send METADATA periodically during transfer (seconds, default 10, 0 disables)",
+        default=g("periodic_metadata_interval_s", 10.0),
+        hidden=True,
     )
-    send.add_argument(
+    _add_cli_argument(
+        send,
         "--periodic-metadata-every-n-chunks",
         type=int,
-        default=0,
-        help="Send METADATA every N data chunks during transfer (0 disables)",
+        default=g("periodic_metadata_every_n_chunks", 0),
+        hidden=True,
     )
-    send.add_argument(
+    _add_cli_argument(
+        send,
         "--revisit-incomplete-passes",
         type=int,
-        default=2,
-        help="Maximum revisit attempts for each incomplete transfer (feedback mode)",
+        default=g("revisit_incomplete_passes", 2),
+        hidden=True,
     )
-    send.add_argument(
+    _add_cli_argument(
+        send,
         "--revisit-max-rounds-per-pass",
         type=int,
-        default=8,
-        help="Max repair rounds handled during each revisit attempt (0 unlimited)",
+        default=g("revisit_max_rounds_per_pass", 8),
+        hidden=True,
     )
-    send.add_argument(
+    _add_cli_argument(
+        send,
         "--primary-feedback-max-rounds",
         type=int,
-        default=0,
-        help=(
-            "Cap feedback repair rounds per primary file attempt in sync-style flows "
-            "(0 disables)"
-        ),
+        default=g("primary_feedback_max_rounds", 0),
+        hidden=True,
     )
-    send.add_argument(
+    _add_cli_argument(
+        send,
         "--primary-feedback-max-seconds",
         type=float,
-        default=0.0,
-        help=(
-            "Cap wall-clock feedback servicing time per primary file attempt in "
-            "sync-style flows (0 disables)"
-        ),
+        default=g("primary_feedback_max_seconds", 0.0),
+        hidden=True,
     )
-    send.add_argument("--json", action="store_true", dest="json_output")
-    _add_log_level_arg(send)
+    send.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        default=g("json_output", False),
+        help="Emit machine-readable JSON events to stdout",
+    )
+    _add_log_level_arg(send, g)
+    if config_defaults is not None and "feedback" in config_defaults:
+        send.set_defaults(feedback=config_defaults["feedback"])
 
     monitor = subparsers.add_parser(
         "monitor",
@@ -362,60 +474,61 @@ def _build_parser() -> argparse.ArgumentParser:
     monitor.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("./received"),
+        default=g("output_dir", Path("./received")),
         help="Receiver output directory containing .ssync-journal.json",
     )
     monitor.add_argument(
         "--refresh-interval-s",
         type=float,
-        default=0.5,
+        default=g("refresh_interval_s", 0.5),
         help="TUI refresh interval in seconds",
     )
-    monitor.add_argument(
+    _add_cli_argument(
+        monitor,
         "--monitor-ipc-socket",
         type=Path,
-        default=None,
-        help=(
-            "Unix datagram socket for live monitor IPC "
-            "(default: <output-dir>/.ssync-monitor.sock)"
-        ),
+        default=g("monitor_ipc_socket", None),
+        hidden=True,
     )
-    _add_log_level_arg(monitor)
+    _add_log_level_arg(monitor, g)
     return parser
 
 
-def _build_rsync_parser() -> argparse.ArgumentParser:
+def _build_rsync_parser(config_defaults: dict[str, Any] | None = None) -> argparse.ArgumentParser:
+    g = _make_default_getter(config_defaults)
     parser = argparse.ArgumentParser(description="Space Sync rsync-like file synchronization")
-    _add_sync_args(parser)
-    _add_log_level_arg(parser)
+    _add_sync_args(parser, g, config_defaults)
+    _add_log_level_arg(parser, g)
     return parser
 
 
-def _build_ssyncd_parser() -> argparse.ArgumentParser:
+def _build_ssyncd_parser(config_defaults: dict[str, Any] | None = None) -> argparse.ArgumentParser:
+    g = _make_default_getter(config_defaults)
     parser = argparse.ArgumentParser(description="Space Sync destination server daemon")
-    _add_server_args(parser)
+    _add_server_args(parser, g)
     return parser
 
 
-def _add_server_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--bind-host", default="0.0.0.0")
-    parser.add_argument("--bind-port", type=int, default=9000)
+def _add_server_args(parser: argparse.ArgumentParser, g: Callable[[str, Any], Any]) -> None:
+    parser.add_argument("--bind-host", default=g("bind_host", "0.0.0.0"))
+    parser.add_argument("--bind-port", type=int, default=g("bind_port", 9000))
     parser.add_argument(
         "--root-dir",
         type=Path,
-        default=Path("./received"),
+        default=g("root_dir", Path("./received")),
         help="Root directory where incoming files are written",
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--monitor-ipc-socket",
         type=Path,
-        default=None,
-        help="Unix datagram socket for live monitor IPC (default: <root-dir>/.ssync-monitor.sock)",
+        default=g("monitor_ipc_socket", None),
+        hidden=True,
     )
     parser.add_argument(
         "--feedback",
         action="store_true",
-        default=True,
+        default=g("feedback", True),
         help="Enable repair feedback (default: enabled)",
     )
     parser.add_argument(
@@ -424,135 +537,160 @@ def _add_server_args(parser: argparse.ArgumentParser) -> None:
         dest="feedback",
         help="Disable feedback for open-loop only operation",
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--keep-part-files-on-complete",
         action="store_true",
-        help="Keep .part files after successful completion (debugging)",
+        default=g("keep_part_files_on_complete", False),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--status-repeat",
         type=int,
-        default=3,
-        help="How many times status is repeated when feedback is enabled",
+        default=g("status_repeat", 3),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--periodic-repair-request-s",
         type=float,
-        default=0.5,
-        help="Periodic repair request interval while transfer is in progress",
+        default=g("periodic_repair_request_s", 0.5),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--periodic-repair-min-seen-chunks",
         type=int,
-        default=32,
-        help="Minimum received chunk frontier before periodic repair requests",
+        default=g("periodic_repair_min_seen_chunks", 32),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--max-repair-chunks-per-request",
         type=int,
-        default=256,
-        help="Cap chunks requested in each repair request (0 means unlimited)",
+        default=g("max_repair_chunks_per_request", 256),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--adaptive-leading-hole-boost",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Dynamically boost repair request chunk budget for large leading holes",
+        default=g("adaptive_leading_hole_boost", True),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--leading-hole-start-threshold-chunks",
         type=int,
-        default=512,
-        help="Max starting chunk index for considering a leading-hole boost",
+        default=g("leading_hole_start_threshold_chunks", 512),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--leading-hole-min-span-chunks",
         type=int,
-        default=2048,
-        help="Minimum first-missing-range span to trigger leading-hole boost",
+        default=g("leading_hole_min_span_chunks", 2048),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--leading-hole-boost-multiplier",
         type=int,
-        default=4,
-        help="Multiplier applied to max repair chunk budget during leading-hole boost",
+        default=g("leading_hole_boost_multiplier", 4),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--leading-hole-max-repair-chunks-per-request",
         type=int,
-        default=2048,
-        help="Hard cap for boosted per-request repair chunk budget (0 means unlimited)",
+        default=g("leading_hole_max_repair_chunks_per_request", 2048),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--repair-request-cooldown-s",
         type=float,
-        default=0.2,
-        help="Minimum delay before re-requesting unchanged missing ranges after REPAIR_DONE",
+        default=g("repair_request_cooldown_s", 0.2),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--repair-request-inflight-timeout-s",
         type=float,
-        default=1.5,
-        help="Timeout before resending a repair request still considered in-flight",
+        default=g("repair_request_inflight_timeout_s", 1.5),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--transfer-inactivity-timeout-s",
         type=float,
-        default=10.0,
-        help="Finalize transfer as incomplete after FIN + inactivity timeout",
+        default=g("transfer_inactivity_timeout_s", 10.0),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--socket-rcvbuf-bytes",
         type=int,
-        default=8 * 1024 * 1024,
-        help="OS socket receive buffer size in bytes",
+        default=g("socket_rcvbuf_bytes", 8 * 1024 * 1024),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--journal-flush-interval-s",
         type=float,
-        default=0.5,
-        help="Receiver journal flush interval in seconds (0 flushes every update)",
+        default=g("journal_flush_interval_s", 0.5),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--beacon-interval-s",
         type=float,
-        default=1.0,
-        help="Receiver beacon interval in seconds (0 disables beacons)",
+        default=g("beacon_interval_s", 1.0),
+        hidden=True,
     )
     parser.add_argument(
         "--forward-stream-quiet-s",
         type=float,
-        default=0.5,
+        default=g("forward_stream_quiet_s", 0.5),
         help="Seconds of DATA silence before allowing state advertisements during forward streaming",
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--pre-metadata-max-pending-bytes",
         type=int,
-        default=8 * 1024 * 1024,
-        help="Max global bytes buffered for unknown-transfer DATA",
+        default=g("pre_metadata_max_pending_bytes", 8 * 1024 * 1024),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--pre-metadata-max-pending-bytes-per-transfer",
         type=int,
-        default=512 * 1024,
-        help="Max bytes buffered per unknown transfer ID",
+        default=g("pre_metadata_max_pending_bytes_per_transfer", 512 * 1024),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--pre-metadata-max-pending-transfers",
         type=int,
-        default=128,
-        help="Max unknown transfer IDs tracked in pre-metadata buffer",
+        default=g("pre_metadata_max_pending_transfers", 128),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--pre-metadata-ttl-s",
         type=float,
-        default=30.0,
-        help="TTL for buffered unknown-transfer DATA before eviction",
+        default=g("pre_metadata_ttl_s", 30.0),
+        hidden=True,
     )
-    _add_log_level_arg(parser)
+    _add_log_level_arg(parser, g)
 
 
-def _add_sync_args(parser: argparse.ArgumentParser) -> None:
+def _add_sync_args(
+    parser: argparse.ArgumentParser,
+    g: Callable[[str, Any], Any],
+    config_defaults: dict[str, Any] | None,
+) -> None:
     parser.add_argument(
         "paths",
         nargs="+",
@@ -561,8 +699,8 @@ def _add_sync_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "-D",
         "--destination",
-        action="append",
-        default=[],
+        action=_OverrideAppendAction,
+        default=g("destinations", []),
         dest="destinations",
         help="Additional destination in host:path form (repeatable)",
     )
@@ -570,50 +708,69 @@ def _add_sync_args(parser: argparse.ArgumentParser) -> None:
         "-r",
         "--recursive",
         action="store_true",
+        default=g("recursive", False),
         help="Recurse into source directories",
     )
     parser.add_argument(
         "-n",
         "--dry-run",
         action="store_true",
+        default=g("dry_run", False),
         help="Show actions without sending data",
     )
-    parser.add_argument("-v", "--verbose", action="count", default=0, help="Increase verbosity")
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=g("verbose", 0),
+        help="Increase verbosity",
+    )
     parser.add_argument(
         "--include",
-        action="append",
-        default=[],
+        action=_OverrideAppendAction,
+        default=g("include", []),
         help="Include only paths matching glob",
     )
     parser.add_argument(
         "--exclude",
-        action="append",
-        default=[],
+        action=_OverrideAppendAction,
+        default=g("exclude", []),
         help="Exclude paths matching glob",
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--delete",
         action="store_true",
-        help="Reserved for future delete semantics",
+        default=g("delete", False),
+        hidden=True,
     )
     parser.add_argument(
         "--skip-unchanged",
         action="store_true",
+        default=g("skip_unchanged", False),
         help="Query destination metadata and skip unchanged files",
     )
     parser.add_argument(
         "--checksum",
         action="store_true",
+        default=g("checksum", False),
         help="Use checksum (with --skip-unchanged) for unchanged checks",
     )
-    parser.add_argument("--dest-port", type=int, default=9000)
-    parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
-    parser.add_argument("--manifest-repeats", type=int, default=3)
-    parser.add_argument(
+    parser.add_argument("--dest-port", type=int, default=g("dest_port", 9000))
+    parser.add_argument("--chunk-size", type=int, default=g("chunk_size", DEFAULT_CHUNK_SIZE))
+    _add_cli_argument(
+        parser,
+        "--manifest-repeats",
+        type=int,
+        default=g("manifest_repeats", 3),
+        hidden=True,
+    )
+    _add_cli_argument(
+        parser,
         "--metadata-repeats",
         type=int,
         dest="manifest_repeats",
-        help="Alias for --manifest-repeats",
+        hidden=True,
     )
     feedback_group = parser.add_mutually_exclusive_group()
     feedback_group.add_argument(
@@ -631,139 +788,175 @@ def _add_sync_args(parser: argparse.ArgumentParser) -> None:
         dest="feedback",
         help="Force feedback/repair flow off",
     )
-    parser.add_argument("--feedback-wait-s", type=float, default=2.0)
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
+        "--feedback-wait-s",
+        type=float,
+        default=g("feedback_wait_s", 2.0),
+        hidden=True,
+    )
+    _add_cli_argument(
+        parser,
         "--max-repair-rounds",
         type=int,
-        default=32,
-        help="Post-FIN repair rounds (0 means unlimited until timeout/complete)",
+        default=g("max_repair_rounds", 32),
+        hidden=True,
     )
-    parser.add_argument("--max-feedback-idle-timeouts", type=int, default=2)
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
+        "--max-feedback-idle-timeouts",
+        type=int,
+        default=g("max_feedback_idle_timeouts", 2),
+        hidden=True,
+    )
+    _add_cli_argument(
+        parser,
         "--drop-every-nth-data",
         type=int,
-        default=0,
-        help="Test helper: drop every nth data frame",
+        default=g("drop_every_nth_data", 0),
+        hidden=True,
     )
     parser.add_argument(
+        "--inter-packet-delay-s",
+        type=float,
+        default=g("inter_packet_delay_s", 0.0),
+        help="Delay between UDP sends in seconds (0 disables pacing)",
+    )
+    _add_cli_argument(
+        parser,
         "--drop-rate",
         type=float,
-        default=0.0,
-        help="Test helper: random drop probability (0.0-1.0)",
+        default=g("drop_rate", 0.0),
+        hidden=True,
     )
-    parser.add_argument("--inter-packet-delay-s", type=float, default=0.0002)
     parser.add_argument(
         "--max-data-rate-bps",
         type=int,
-        default=0,
+        default=g("max_data_rate_bps", 0),
         help="Throttle payload transmit rate in bits/sec (0 means unlimited)",
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--midstream-repair-max-rounds-per-poll",
         type=int,
-        default=1,
-        help="Maximum repair requests handled per midstream polling pass (0 unlimited)",
+        default=g("midstream_repair_max_rounds_per_poll", 1),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--midstream-repair-max-chunks-per-poll",
         type=int,
-        default=512,
-        help="Maximum repair chunks sent per midstream polling pass (0 unlimited)",
+        default=g("midstream_repair_max_chunks_per_poll", 512),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--repair-duplicate-suppression-s",
         type=float,
-        default=0.2,
-        help="Suppress servicing identical repair requests within this interval",
+        default=g("repair_duplicate_suppression_s", 0.2),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--repair-queue-max-pending-requests",
         type=int,
-        default=1024,
-        help="Maximum queued repair STATUS requests before dropping new ones",
+        default=g("repair_queue_max_pending_requests", 1024),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--repair-worker-max-chunks-per-burst",
         type=int,
-        default=256,
-        help="Maximum repair chunks sent for each queued repair request burst",
+        default=g("repair_worker_max_chunks_per_burst", 256),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--initial-pass-repair-max-chunks-per-burst",
         type=int,
-        default=16,
-        help=(
-            "Maximum queued-repair chunks per burst during the initial forward "
-            "data pass"
-        ),
+        default=g("initial_pass_repair_max_chunks_per_burst", 16),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--repair-worker-poll-interval-s",
         type=float,
-        default=0.01,
-        help="Repair worker queue poll interval in seconds",
+        default=g("repair_worker_poll_interval_s", 0.01),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--beacon-interval-s",
         type=float,
-        default=1.0,
-        help="Sender beacon interval in seconds (0 disables beacons)",
+        default=g("beacon_interval_s", 1.0),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--periodic-metadata-interval-s",
         type=float,
-        default=10.0,
-        help="Send METADATA periodically during transfer (seconds, default 10, 0 disables)",
+        default=g("periodic_metadata_interval_s", 10.0),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--periodic-metadata-every-n-chunks",
         type=int,
-        default=0,
-        help="Send METADATA every N data chunks during transfer (0 disables)",
+        default=g("periodic_metadata_every_n_chunks", 0),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--revisit-incomplete-passes",
         type=int,
-        default=2,
-        help="Maximum revisit attempts for each incomplete transfer (feedback mode)",
+        default=g("revisit_incomplete_passes", 2),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--revisit-max-rounds-per-pass",
         type=int,
-        default=8,
-        help="Max repair rounds handled during each revisit attempt (0 unlimited)",
+        default=g("revisit_max_rounds_per_pass", 8),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--primary-feedback-max-rounds",
         type=int,
-        default=64,
-        help=(
-            "Cap feedback repair rounds per primary file attempt so revisits run "
-            "regularly (0 disables)"
-        ),
+        default=g("primary_feedback_max_rounds", 64),
+        hidden=True,
     )
-    parser.add_argument(
+    _add_cli_argument(
+        parser,
         "--primary-feedback-max-seconds",
         type=float,
-        default=8.0,
-        help=(
-            "Cap wall-clock feedback servicing time per primary file attempt so "
-            "revisits run regularly (0 disables)"
-        ),
+        default=g("primary_feedback_max_seconds", 8.0),
+        hidden=True,
     )
     parser.add_argument(
         "--state-file",
         type=Path,
-        default=Path(".ssync-open-loop-state.json"),
+        default=g("state_file", Path(".ssync-open-loop-state.json")),
         help="Persistent send-state file used for open-loop retransmission ordering",
     )
     parser.add_argument(
         "--open-loop-max-rounds",
         type=int,
-        default=0,
-        help="Open-loop rounds to run (0 means run continuously)",
+        default=g("open_loop_max_rounds", _DEFAULT_OPEN_LOOP_MAX_ROUNDS),
+        help=(
+            "Open-loop rounds to run when feedback is unavailable "
+            f"(default: {_DEFAULT_OPEN_LOOP_MAX_ROUNDS}, 0 means run continuously)"
+        ),
     )
-    parser.add_argument("--json", action="store_true", dest="json_output")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        default=g("json_output", False),
+        help="Emit machine-readable JSON events to stdout",
+    )
+    if config_defaults is not None and "feedback" in config_defaults:
+        parser.set_defaults(feedback=config_defaults["feedback"])
 
 
 def _run_receiver_common(
@@ -1898,11 +2091,19 @@ def main(argv: list[str] | None = None) -> int:
         print("sync error: 'ssync sync' is deprecated; use 'ssync <sources> <destination>'")
         return 2
     subcommands = {"receive", "server", "ssyncd", "send", "monitor"}
+    cmd = detect_cli_command(argv)
+    config_defaults: dict[str, Any] | None = None
+    if cmd is not None:
+        try:
+            config_defaults = load_cli_config_defaults(cmd)
+        except ValueError as exc:
+            print(f"config error: {exc}", file=sys.stderr)
+            return 2
     if argv and argv[0] in subcommands:
-        parser = _build_parser()
+        parser = _build_parser(config_defaults)
         args = parser.parse_args(argv)
     else:
-        parser = _build_rsync_parser()
+        parser = _build_rsync_parser(config_defaults)
         args = parser.parse_args(argv)
         args.command = "sync"
     _configure_logging(args.log_level)
@@ -1922,7 +2123,12 @@ def main(argv: list[str] | None = None) -> int:
 
 def ssyncd_main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
-    parser = _build_ssyncd_parser()
+    try:
+        config_defaults = load_cli_config_defaults("ssyncd")
+    except ValueError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 2
+    parser = _build_ssyncd_parser(config_defaults)
     args = parser.parse_args(argv)
     _configure_logging(args.log_level)
     return _run_server(args)

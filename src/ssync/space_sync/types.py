@@ -60,7 +60,7 @@ Range = tuple[int, int]
 class SenderConfig:
     chunk_size: int = DEFAULT_CHUNK_SIZE
     manifest_repeats: int = DEFAULT_MANIFEST_REPEATS
-    inter_packet_delay_s: float = 0.0002
+    inter_packet_delay_s: float = 0.0
     enable_feedback: bool = False
     auto_feedback_discovery: bool = True
     auto_feedback_idle_timeout_s: float = 60.0
