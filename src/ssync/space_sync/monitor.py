@@ -32,6 +32,10 @@ _BEACON_LINK_STATE_FEEDBACK_THRESHOLD_MS = 5000
 _MODE_MIN_SWITCH_DWELL_S = 2.0
 _BEACON_FLASH_WINDOW_S = 0.6
 _IPC_MAX_EVENTS_PER_REFRESH = 512
+_MAX_VISIBLE_TRANSFERS = 5
+_FILE_COLUMN_WIDTH = 40
+_FILE_SCROLL_GAP = 6
+_FILE_SCROLL_STEP_S = 0.2
 
 
 @dataclass(slots=True)
@@ -524,6 +528,36 @@ def _autoselect_new_transfer_index(
     return clamped_selected
 
 
+def _visible_transfer_window(
+    total_transfers: int,
+    *,
+    selected_index: int,
+    max_visible: int = _MAX_VISIBLE_TRANSFERS,
+) -> tuple[int, int]:
+    if total_transfers <= 0 or max_visible <= 0:
+        return (0, 0)
+    visible = min(total_transfers, max_visible)
+    clamped_selected = max(0, min(selected_index, total_transfers - 1))
+    start = max(0, min(clamped_selected - visible + 1, total_transfers - visible))
+    return (start, start + visible)
+
+
+def _format_transfer_file_name(
+    file_name: str,
+    *,
+    highlighted: bool,
+    now_s: float,
+    width: int = _FILE_COLUMN_WIDTH,
+) -> Text:
+    value = file_name or "<unknown>"
+    if width <= 0 or len(value) <= width or not highlighted:
+        return Text(value, no_wrap=True)
+    scroll_text = value + (" " * _FILE_SCROLL_GAP)
+    offset = int(now_s / _FILE_SCROLL_STEP_S) % len(scroll_text)
+    visible = (scroll_text + scroll_text)[offset : offset + width]
+    return Text(visible, no_wrap=True)
+
+
 def _render_monitor(
     *,
     output_dir: Path,
@@ -579,24 +613,35 @@ def _render_monitor(
     beacon_summary.append("●", style="bold cyan" if beacon_tx_active else "grey35")
 
     table = Table(expand=True)
-    table.add_column("File", overflow="fold")
+    table.add_column("File", width=_FILE_COLUMN_WIDTH, no_wrap=True, overflow="crop")
     table.add_column("ID", width=10, no_wrap=True)
     table.add_column("Progress", width=22)
     table.add_column("Chunks", justify="right", no_wrap=True)
     table.add_column("Rate", justify="right", no_wrap=True)
     table.add_column("Ranges", justify="right", no_wrap=True)
 
-    for index, snapshot in enumerate(snapshots):
+    visible_start, visible_end = _visible_transfer_window(
+        len(snapshots),
+        selected_index=selected_index,
+    )
+
+    for index in range(visible_start, visible_end):
+        snapshot = snapshots[index]
         percent = snapshot.progress_ratio * 100.0
         rate_bps = throughput_bps.get(snapshot.transfer_id_hex, 0.0)
+        is_selected = index == selected_index
         table.add_row(
-            snapshot.file_name or "<unknown>",
+            _format_transfer_file_name(
+                snapshot.file_name or "<unknown>",
+                highlighted=is_selected,
+                now_s=now_s,
+            ),
             snapshot.transfer_id_hex[:8],
             _progress_bar(20, snapshot.progress_ratio),
             f"{snapshot.received_chunks}/{snapshot.total_chunks} ({percent:5.1f}%)",
             _format_bps(rate_bps),
             str(snapshot.range_count),
-            style="bold black on cyan" if index == selected_index else "",
+            style="bold black on cyan" if is_selected else "",
         )
 
     if not snapshots:
@@ -618,7 +663,13 @@ def _render_monitor(
         table,
         border_style="cyan",
         padding=(0, 1),
-        title="Active Transfers (Up/Down or j/k to select)",
+        title=(
+            "Active Transfers "
+            f"({visible_start + 1}-{visible_end}/{len(snapshots)}) "
+            "(Up/Down or j/k to select)"
+            if snapshots
+            else "Active Transfers (Up/Down or j/k to select)"
+        ),
     )
 
     selected = snapshots[selected_index] if snapshots else None

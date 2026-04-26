@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from rich.console import Console
+
 from ssync.space_sync.monitor import (
+    _FILE_COLUMN_WIDTH,
     TransferSnapshot,
     _autoselect_active_transfer_index,
     _autoselect_new_transfer_index,
@@ -11,9 +14,12 @@ from ssync.space_sync.monitor import (
     _build_hole_map_2d,
     _estimate_overall_mode,
     _estimate_transfer_mode,
+    _format_transfer_file_name,
     _merge_monitor_ipc_events,
     _read_transfer_snapshots,
+    _render_monitor,
     _stabilize_overall_mode,
+    _visible_transfer_window,
 )
 
 
@@ -412,18 +418,6 @@ def test_reset_baseline_prevents_pre_reset_repairs_from_resurrecting() -> None:
     assert last_backfill_by_id == {"aaa": 5, "bbb": 3}
     assert backfill_baseline_by_id == {"aaa": 5, "bbb": 3}
 
-    transfer_a_post = TransferSnapshot(
-        transfer_id_hex="aaa",
-        file_name="a.bin",
-        file_size=1024,
-        total_chunks=16,
-        chunk_size=64,
-        received_chunks=16,
-        range_count=1,
-        received_ranges=[(0, 16)],
-        stream_cursor_chunk=15,
-        backfill_chunks=7,
-    )
     last_backfill_by_id["aaa"] = 7
 
     stale_ids = {"aaa"}
@@ -446,18 +440,6 @@ def test_reset_baseline_prevents_pre_reset_repairs_from_resurrecting() -> None:
 def test_reset_preserves_last_backfill_for_immediate_retirement() -> None:
     """If a transfer disappears right after reset, its post-reset repairs
     should still be tracked correctly (raw - baseline = 0, not negative)."""
-    snapshot = TransferSnapshot(
-        transfer_id_hex="x",
-        file_name="x.bin",
-        file_size=512,
-        total_chunks=8,
-        chunk_size=64,
-        received_chunks=8,
-        range_count=1,
-        received_ranges=[(0, 8)],
-        stream_cursor_chunk=7,
-        backfill_chunks=10,
-    )
     backfill_baseline_by_id = {"x": 10}
     last_backfill_by_id = dict(backfill_baseline_by_id)
     cumulative_repairs = 0
@@ -467,6 +449,82 @@ def test_reset_preserves_last_backfill_for_immediate_retirement() -> None:
     cumulative_repairs += max(0, raw - baseline)
 
     assert cumulative_repairs == 0
+
+
+def test_visible_transfer_window_follows_selection() -> None:
+    assert _visible_transfer_window(0, selected_index=0) == (0, 0)
+    assert _visible_transfer_window(3, selected_index=1) == (0, 3)
+    assert _visible_transfer_window(8, selected_index=0) == (0, 5)
+    assert _visible_transfer_window(8, selected_index=4) == (0, 5)
+    assert _visible_transfer_window(8, selected_index=5) == (1, 6)
+    assert _visible_transfer_window(8, selected_index=7) == (3, 8)
+
+
+def test_render_monitor_limits_active_transfer_rows_to_five() -> None:
+    snapshots = [
+        TransferSnapshot(
+            transfer_id_hex=f"id{i:02d}",
+            file_name=f"file-{i}.bin",
+            file_size=1024,
+            total_chunks=16,
+            chunk_size=64,
+            received_chunks=min(i + 1, 16),
+            range_count=1,
+            received_ranges=[(0, min(i + 1, 16))],
+            stream_cursor_chunk=min(i, 15),
+        )
+        for i in range(7)
+    ]
+    console = Console(record=True, width=140)
+    console.print(
+        _render_monitor(
+            output_dir=Path("/tmp/rx"),
+            snapshots=snapshots,
+            throughput_bps={},
+            selected_index=6,
+            completed_count=0,
+            completed_size=0,
+        )
+    )
+    rendered = console.export_text()
+
+    assert "file-0.bin" not in rendered
+    assert "file-1.bin" not in rendered
+    assert "file-2.bin" in rendered
+    assert "file-3.bin" in rendered
+    assert "file-4.bin" in rendered
+    assert "file-5.bin" in rendered
+    assert "file-6.bin" in rendered
+    assert "(3-7/7)" in rendered
+
+
+def test_format_transfer_file_name_scrolls_only_when_highlighted() -> None:
+    long_name = "abcdefghijklmnopqrstuvwxyz0123456789-extra-long.bin"
+
+    plain = _format_transfer_file_name(
+        long_name,
+        highlighted=False,
+        now_s=0.0,
+    )
+    assert plain.plain == long_name
+
+    scrolled_a = _format_transfer_file_name(
+        long_name,
+        highlighted=True,
+        now_s=0.0,
+    )
+    scrolled_b = _format_transfer_file_name(
+        long_name,
+        highlighted=True,
+        now_s=1.0,
+    )
+
+    assert len(scrolled_a.plain) == _FILE_COLUMN_WIDTH
+    assert len(scrolled_b.plain) == _FILE_COLUMN_WIDTH
+    assert scrolled_a.plain != scrolled_b.plain
+    assert "\n" not in scrolled_a.plain
+    assert "\n" not in scrolled_b.plain
+
 
 
 def test_merge_monitor_ipc_terminal_event_removes_snapshot() -> None:
