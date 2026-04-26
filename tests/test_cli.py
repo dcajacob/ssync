@@ -10,7 +10,6 @@ import pytest
 
 from ssync.space_sync import cli as cli_module
 from ssync.space_sync.cli import (
-    _CLEAR_CONFIRM_TOKEN,
     _build_parser,
     _build_rsync_parser,
     _build_ssyncd_parser,
@@ -300,15 +299,6 @@ def test_parser_supports_monitor_subcommand() -> None:
     assert args.log_level == "WARNING"
 
 
-def test_parser_supports_clear_subcommand() -> None:
-    parser = _build_parser()
-    args = parser.parse_args(["clear", "--output-dir", "./received"])
-    assert args.command == "clear"
-    assert args.output_dir == Path("./received")
-    assert args.confirm is None
-    assert args.log_level == "WARNING"
-
-
 def test_parser_supports_forward_stream_quiet_s_flag() -> None:
     parser = _build_parser()
     recv_default = parser.parse_args(["receive"])
@@ -387,21 +377,6 @@ def test_main_routes_ssyncd_to_server(
     assert cli_module.main(["ssyncd", "--bind-port", "9012"]) == 0
 
 
-def test_main_routes_clear_subcommand(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    def _fake_run_clear(args: Namespace) -> int:
-        assert args.output_dir == Path("./received")
-        assert args.confirm == _CLEAR_CONFIRM_TOKEN
-        return 0
-
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    (tmp_path / "home").mkdir()
-    monkeypatch.setattr(cli_module, "_run_clear", _fake_run_clear)
-    assert cli_module.main(["clear", "--output-dir", "./received", "--confirm", "CLEAR"]) == 0
-
-
 def test_checksum_requires_skip_unchanged(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -439,33 +414,6 @@ def test_clear_output_dir_removes_contents_but_keeps_directory(tmp_path: Path) -
     assert removed_files == 1
     assert removed_dirs == 1
     assert output_dir.exists()
-    assert list(output_dir.iterdir()) == []
-
-
-def test_run_clear_requires_confirmation(
-    capsys: pytest.CaptureFixture[str], tmp_path: Path
-) -> None:
-    output_dir = tmp_path / "received"
-    output_dir.mkdir()
-    exit_code = cli_module._run_clear(SimpleNamespace(output_dir=output_dir, confirm=None))
-    captured = capsys.readouterr()
-    assert exit_code == 2
-    assert "clear aborted" in captured.out
-    assert _CLEAR_CONFIRM_TOKEN in captured.out
-
-
-def test_run_clear_clears_directory_with_confirmation(
-    capsys: pytest.CaptureFixture[str], tmp_path: Path
-) -> None:
-    output_dir = tmp_path / "received"
-    output_dir.mkdir()
-    (output_dir / "file.bin").write_text("data")
-    exit_code = cli_module._run_clear(
-        SimpleNamespace(output_dir=output_dir, confirm=_CLEAR_CONFIRM_TOKEN)
-    )
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    assert "cleared" in captured.out
     assert list(output_dir.iterdir()) == []
 
 

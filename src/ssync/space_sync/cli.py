@@ -20,14 +20,12 @@ from typing import Any
 
 from .config_file import detect_cli_command, load_cli_config_defaults
 from .monitor import run_monitor_tui
-from .output_dir import clear_output_dir
 from .receiver import SpaceSyncReceiver
 from .sender import SpaceSyncSender
 from .types import DEFAULT_CHUNK_SIZE, ReceiverConfig, RemoteFileInfo, SenderConfig
 
 _REVISIT_WORKER_POLL_INTERVAL_S = 0.05
 _DEFAULT_OPEN_LOOP_MAX_ROUNDS = 10
-_CLEAR_CONFIRM_TOKEN = "CLEAR"
 
 
 class _OverrideAppendAction(argparse.Action):
@@ -493,23 +491,6 @@ def _build_parser(config_defaults: dict[str, Any] | None = None) -> argparse.Arg
         hidden=True,
     )
     _add_log_level_arg(monitor, g)
-
-    clear = subparsers.add_parser(
-        "clear",
-        help="Wipe all contents from a receiver output directory",
-    )
-    clear.add_argument(
-        "--output-dir",
-        type=Path,
-        default=g("output_dir", Path("./received")),
-        help="Receiver output directory to empty",
-    )
-    clear.add_argument(
-        "--confirm",
-        default=None,
-        help=f"Verification token required to proceed ({_CLEAR_CONFIRM_TOKEN})",
-    )
-    _add_log_level_arg(clear, g)
     return parser
 
 
@@ -2104,32 +2085,12 @@ def _run_monitor(args: argparse.Namespace) -> int:
         return 0
 
 
-def _run_clear(args: argparse.Namespace) -> int:
-    if args.confirm != _CLEAR_CONFIRM_TOKEN:
-        print(
-            "clear aborted: pass --confirm "
-            f"{_CLEAR_CONFIRM_TOKEN} to wipe {args.output_dir}"
-        )
-        return 2
-    try:
-        removed_files, removed_dirs = clear_output_dir(args.output_dir)
-    except ValueError as exc:
-        print(f"clear error: {exc}")
-        return 2
-    print(
-        f"cleared {args.output_dir} "
-        f"(removed {removed_files} file(s), {removed_dirs} director"
-        f"{'y' if removed_dirs == 1 else 'ies'})"
-    )
-    return 0
-
-
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     if argv and argv[0] == "sync":
         print("sync error: 'ssync sync' is deprecated; use 'ssync <sources> <destination>'")
         return 2
-    subcommands = {"receive", "server", "ssyncd", "send", "monitor", "clear"}
+    subcommands = {"receive", "server", "ssyncd", "send", "monitor"}
     cmd = detect_cli_command(argv)
     config_defaults: dict[str, Any] | None = None
     if cmd is not None:
@@ -2156,8 +2117,6 @@ def main(argv: list[str] | None = None) -> int:
         return _run_sync(args)
     if args.command == "monitor":
         return _run_monitor(args)
-    if args.command == "clear":
-        return _run_clear(args)
     parser.print_help()
     return 1
 

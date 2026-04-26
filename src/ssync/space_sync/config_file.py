@@ -12,7 +12,7 @@ _LOG_LEVEL_CHOICES: Final[frozenset[str]] = frozenset(
 
 # TOML section names (top-level tables).
 _ALLOWED_SECTIONS: Final[frozenset[str]] = frozenset(
-    {"global", "receive", "send", "sync", "server", "monitor", "clear"}
+    {"global", "receive", "send", "sync", "server", "monitor"}
 )
 
 _GLOBAL_KEYS: Final[frozenset[str]] = frozenset({"log_level"})
@@ -85,12 +85,6 @@ _MONITOR_KEYS: Final[frozenset[str]] = frozenset(
         "output_dir",
         "refresh_interval_s",
         "monitor_ipc_socket",
-    }
-)
-
-_CLEAR_KEYS: Final[frozenset[str]] = frozenset(
-    {
-        "output_dir",
     }
 )
 
@@ -182,7 +176,7 @@ def detect_cli_command(argv: list[str]) -> str | None:
         return None
     if argv[0] == "sync":
         return None
-    subcommands = {"receive", "server", "ssyncd", "send", "monitor", "clear"}
+    subcommands = {"receive", "server", "ssyncd", "send", "monitor"}
     if argv[0] in subcommands:
         return argv[0]
     return "sync"
@@ -201,8 +195,6 @@ def _allowed_keys_for_command(command: str) -> frozenset[str]:
         return _GLOBAL_KEYS | _SEND_KEYS
     if command == "monitor":
         return _GLOBAL_KEYS | _MONITOR_KEYS
-    if command == "clear":
-        return _GLOBAL_KEYS | _CLEAR_KEYS
     if command in {"server", "ssyncd"}:
         return _GLOBAL_KEYS | _SERVER_KEYS
     if command == "sync":
