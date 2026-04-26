@@ -20,7 +20,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .output_dir import clear_output_dir
+from .output_dir import clear_output_dir, write_clear_request
 
 _TermiosAttrs = list[int | list[bytes | int]]
 _RATE_WINDOW_S = 3.0
@@ -933,6 +933,7 @@ def run_monitor_tui(
                         if now_s <= clear_armed_until_s:
                             try:
                                 removed_files, removed_dirs = clear_output_dir(output_dir)
+                                write_clear_request(output_dir)
                             except ValueError as exc:
                                 status_message = (f"Clear failed: {exc}", "bold red")
                             else:

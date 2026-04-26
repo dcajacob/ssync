@@ -77,6 +77,7 @@ class SenderConfig:
     beacon_interval_s: float = 1.0
     periodic_metadata_interval_s: float = 10.0
     periodic_metadata_every_n_chunks: int = 0
+    tail_redundancy_chunks: int = 4
     revisit_incomplete_passes: int = 2
     revisit_max_rounds_per_pass: int = 8
     primary_feedback_max_rounds: int = 0
