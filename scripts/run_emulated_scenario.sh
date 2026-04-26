@@ -4,6 +4,15 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
+# sudo resets PATH; uv is often installed under the invoking user's home.
+if [[ -n "${SUDO_USER:-}" ]]; then
+  _invoker_home="$(getent passwd "${SUDO_USER}" | cut -d: -f6)"
+  PATH="${_invoker_home}/.local/bin:${_invoker_home}/.cargo/bin:${PATH}"
+  unset _invoker_home
+fi
+PATH="/usr/local/bin:${PATH}"
+export PATH
+
 PROFILE="${PROFILE:-leo_nominal}"
 FEEDBACK="${FEEDBACK:-1}"
 PORT="${PORT:-9000}"
@@ -12,6 +21,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/artifacts/emulation-${SCENARIO_NAME}-$(dat
 SOURCE_FILE="${OUTPUT_DIR}/source.bin"
 RECEIVED_DIR="${OUTPUT_DIR}/received"
 SENDER_JSON="${OUTPUT_DIR}/sender.json"
+RECEIVER_LOG="${OUTPUT_DIR}/receiver.log"
 TC_BEFORE_TX="${OUTPUT_DIR}/tc-before-tx.txt"
 TC_BEFORE_RX="${OUTPUT_DIR}/tc-before-rx.txt"
 TC_AFTER_TX="${OUTPUT_DIR}/tc-after-tx.txt"
@@ -65,7 +75,10 @@ fi
 require_cmd ip
 require_cmd tc
 require_cmd tcpdump
-require_cmd uv
+if ! command -v uv >/dev/null 2>&1; then
+  echo "missing required command: uv; install uv or from your normal shell run: sudo env \"PATH=\$PATH\" bash ./scripts/run_emulated_scenario.sh ..." >&2
+  exit 2
+fi
 
 mkdir -p "${OUTPUT_DIR}" "${RECEIVED_DIR}"
 
@@ -90,16 +103,20 @@ if [[ "${FEEDBACK}" == "1" ]]; then
     --bind-host "${RX_HOST}" \
     --bind-port "${PORT}" \
     --root-dir "${RECEIVED_DIR}" \
-    --feedback >/dev/null 2>&1 &
+    --feedback >"${RECEIVER_LOG}" 2>&1 &
 else
   ip netns exec "${NS_RX}" uv run ssyncd \
     --bind-host "${RX_HOST}" \
     --bind-port "${PORT}" \
     --root-dir "${RECEIVED_DIR}" \
-    --no-feedback >/dev/null 2>&1 &
+    --no-feedback >"${RECEIVER_LOG}" 2>&1 &
 fi
 RECEIVER_PID="$!"
 sleep 0.5
+if ! kill -0 "${RECEIVER_PID}" 2>/dev/null; then
+  echo "receiver failed to start; see ${RECEIVER_LOG}" >&2
+  exit 1
+fi
 
 if [[ "${FEEDBACK}" == "1" ]]; then
   ip netns exec "${NS_TX}" uv run ssync "${SOURCE_FILE}" "${RX_HOST}:scenario/input.bin" \
@@ -133,6 +150,7 @@ RECEIVER_PID=""
 echo "Scenario complete."
 echo "  output_dir: ${OUTPUT_DIR}"
 echo "  sender_json: ${SENDER_JSON}"
+echo "  receiver_log: ${RECEIVER_LOG}"
 echo "  pcap_tx: ${PCAP_TX}"
 echo "  pcap_rx: ${PCAP_RX}"
 echo "  tc_before_tx: ${TC_BEFORE_TX}"

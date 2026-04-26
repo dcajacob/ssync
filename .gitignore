@@ -13,5 +13,4 @@ received/
 *.log
 tcpdump.log
 demo.bin
-docs/protocol-sequence-diagrams.md
 .vscode/

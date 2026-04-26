@@ -21,6 +21,7 @@ from ssync.space_sync.sender import SpaceSyncSender
 from ssync.space_sync.types import (
     BeaconRole,
     FrameType,
+    MetadataType,
     RemoteFileInfo,
     SenderConfig,
     StatusKind,
@@ -124,6 +125,44 @@ def test_query_remote_file_times_out_on_non_matching_responses() -> None:
     stop_event.set()
     worker.join(timeout=1.0)
     assert elapsed < 1.0
+
+
+def test_query_remote_file_ignores_malformed_frames_then_succeeds() -> None:
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.bind(("127.0.0.1", 0))
+    host, port = server.getsockname()
+
+    def _respond() -> None:
+        try:
+            request_raw, addr = server.recvfrom(65535)
+            manifest = decode_manifest(decode_frame(request_raw).payload)
+            query_token = manifest.metadata[int(MetadataType.FILE_INFO_QUERY_TOKEN)]
+            server.sendto(b"not-a-valid-frame", addr)
+            valid = encode_status(
+                TransferStatus(
+                    transfer_id=b"\x00" * 16,
+                    kind=StatusKind.FILE_INFO_RESPONSE,
+                    state=TransferState.INCOMPLETE,
+                    missing_ranges=[],
+                    file_info=RemoteFileInfo(path="expected-name.bin", exists=False),
+                    query_token=query_token,
+                )
+            )
+            server.sendto(valid, addr)
+        finally:
+            server.close()
+
+    worker = threading.Thread(target=_respond, daemon=True)
+    worker.start()
+    sender = SpaceSyncSender(SenderConfig(enable_feedback=True, feedback_wait_s=0.2))
+    response = sender.query_remote_file(
+        destination_host=str(host),
+        destination_port=int(port),
+        remote_name="expected-name.bin",
+        include_checksum=False,
+    )
+    worker.join(timeout=1.0)
+    assert response.path == "expected-name.bin"
 
 
 def test_drain_repair_requests_stops_on_transfer_complete_signal() -> None:

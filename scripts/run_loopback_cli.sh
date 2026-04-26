@@ -37,8 +37,8 @@ PY
 start_receiver() {
   local port="$1"
   local out_dir="$2"
-  local feedback_flag="${3:-}"
-  uv run ssync receive --bind-host 127.0.0.1 --bind-port "${port}" --output-dir "${out_dir}" ${feedback_flag} >/dev/null 2>&1 &
+  local feedback_flag="${3:---no-feedback}"
+  uv run ssyncd --bind-host 127.0.0.1 --bind-port "${port}" --root-dir "${out_dir}" "${feedback_flag}" >/dev/null 2>&1 &
   RECEIVER_PID="$!"
   # Allow receiver thread/socket to come up.
   sleep 0.20
@@ -87,14 +87,13 @@ echo "================================="
 # Scenario 1: open-loop
 open_port="$(free_port)"
 mkdir -p "${OPEN_RX_DIR}"
-start_receiver "${open_port}" "${OPEN_RX_DIR}"
+start_receiver "${open_port}" "${OPEN_RX_DIR}" "--no-feedback"
 
 open_passed=0
 open_details="receiver did not produce output file"
 for attempt in $(seq 1 "${OPEN_LOOP_ATTEMPTS}"); do
   rm -f "${OPEN_RX_DIR}/$(basename "${SRC_OPEN}")"
-  uv run ssync send "${SRC_OPEN}" \
-    --dest-host 127.0.0.1 \
+  uv run ssync "${SRC_OPEN}" "127.0.0.1:$(basename "${SRC_OPEN}")" \
     --dest-port "${open_port}" \
     --chunk-size "${CHUNK_SIZE}" \
     --manifest-repeats 5 \
@@ -126,8 +125,7 @@ start_receiver "${repair_port}" "${REPAIR_RX_DIR}" "--feedback"
 feedback_passed=0
 feedback_details="receiver did not produce output file"
 send_output="$(
-  uv run ssync send "${SRC_REPAIR}" \
-    --dest-host 127.0.0.1 \
+  uv run ssync "${SRC_REPAIR}" "127.0.0.1:$(basename "${SRC_REPAIR}")" \
     --dest-port "${repair_port}" \
     --chunk-size "${CHUNK_SIZE}" \
     --manifest-repeats 5 \

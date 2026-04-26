@@ -34,7 +34,7 @@ sudo tcpdump -i lo -nn -s 0 -U -w ./ssync-loopback.pcap "udp port 9000 and host 
 Terminal C: run sender:
 
 ```bash
-uv run ssync send ./example.bin --dest-host 127.0.0.1 --dest-port 9000 --feedback --drop-every-nth-data 5
+uv run ssync ./example.bin 127.0.0.1:example.bin --dest-port 9000 --feedback --drop-every-nth-data 5
 ```
 
 Stop capture with `Ctrl-C` in Terminal B.

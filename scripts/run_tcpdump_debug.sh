@@ -57,8 +57,7 @@ TCPDUMP_PID="$!"
 sleep 0.25
 
 echo "Running sender with induced loss to trigger feedback/repair"
-uv run ssync send "${SOURCE_FILE}" \
-  --dest-host 127.0.0.1 \
+uv run ssync "${SOURCE_FILE}" "127.0.0.1:source.bin" \
   --dest-port "${PORT}" \
   --feedback \
   --drop-every-nth-data 5 \
