@@ -9,7 +9,6 @@ from types import SimpleNamespace
 import pytest
 
 from ssync.space_sync import cli as cli_module
-from ssync.space_sync import config_file as config_file_module
 from ssync.space_sync.cli import (
     _build_parser,
     _build_rsync_parser,
@@ -97,10 +96,18 @@ def test_collect_sync_items_directory(tmp_path: Path) -> None:
     }
 
 
-def test_sync_supports_json_flag() -> None:
+def test_send_and_sync_support_json_flag() -> None:
+    parser = _build_parser()
     rsync_parser = _build_rsync_parser()
-    sync_args = rsync_parser.parse_args(["src", "127.0.0.1:dst", "--json"])
+    send_args = parser.parse_args(["send", "data.bin", "--json", "--beacon-interval-s", "2.5"])
+    sync_args = rsync_parser.parse_args(
+        ["src", "127.0.0.1:dst", "--json", "--beacon-interval-s", "0"]
+    )
+    assert send_args.json_output is True
     assert sync_args.json_output is True
+    assert send_args.files == ["data.bin"]
+    assert send_args.beacon_interval_s == pytest.approx(2.5)
+    assert sync_args.beacon_interval_s == pytest.approx(0.0)
 
 
 def _subparsers_action(parser: argparse.ArgumentParser) -> argparse._SubParsersAction:
@@ -113,13 +120,20 @@ def _subparsers_action(parser: argparse.ArgumentParser) -> argparse._SubParsersA
 def test_cli_help_shows_common_options_and_hides_advanced() -> None:
     parser = _build_parser()
     subparsers = _subparsers_action(parser)
-    assert "send" not in subparsers.choices
-    assert "receive" not in subparsers.choices
-    server_help = subparsers.choices["server"].format_help()
-    assert "--bind-port" in server_help
-    assert "--root-dir" in server_help
-    assert "--status-repeat" not in server_help
-    assert "--pre-metadata-ttl-s" not in server_help
+    send_help = subparsers.choices["send"].format_help()
+    assert "--chunk-size" in send_help
+    assert "--max-data-rate-bps" in send_help
+    assert "--inter-packet-delay-s" in send_help
+    assert "--feedback" in send_help
+    assert "--json" in send_help
+    assert "--max-repair-rounds" not in send_help
+    assert "--beacon-interval-s" not in send_help
+
+    recv_help = subparsers.choices["receive"].format_help()
+    assert "--bind-port" in recv_help
+    assert "--output-dir" in recv_help
+    assert "--status-repeat" not in recv_help
+    assert "--pre-metadata-ttl-s" not in recv_help
 
     sync_help = _build_rsync_parser().format_help()
     assert "--open-loop-max-rounds" in sync_help
@@ -127,52 +141,57 @@ def test_cli_help_shows_common_options_and_hides_advanced() -> None:
     assert "--state-file" in sync_help
     assert "--manifest-repeats" not in sync_help
     assert "--max-repair-rounds" not in sync_help
-    assert "--delete" not in sync_help
 
 
-def test_hidden_advanced_flags_still_parse_sync_and_server() -> None:
+def test_hidden_advanced_flags_still_parse_send_and_sync() -> None:
     parser = _build_parser()
-    server_ns = parser.parse_args(
+    send_ns = parser.parse_args(
         [
-            "server",
-            "--status-repeat",
-            "5",
-            "--pre-metadata-ttl-s",
-            "12.5",
+            "send",
+            "data.bin",
+            "--max-repair-rounds",
+            "0",
+            "--metadata-repeats",
+            "4",
         ]
     )
-    assert server_ns.status_repeat == 5
-    assert server_ns.pre_metadata_ttl_s == pytest.approx(12.5)
+    assert send_ns.max_repair_rounds == 0
+    assert send_ns.manifest_repeats == 4
 
     rsync_parser = _build_rsync_parser()
     sync_ns = rsync_parser.parse_args(
         [
             "src",
             "127.0.0.1:dst",
+            "--delete",
             "--feedback-wait-s",
             "1.5",
             "--repair-worker-poll-interval-s",
             "0.02",
         ]
     )
+    assert sync_ns.delete is True
     assert sync_ns.feedback_wait_s == pytest.approx(1.5)
     assert sync_ns.repair_worker_poll_interval_s == pytest.approx(0.02)
 
 
-def test_removed_send_receive_subcommands_error(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    assert cli_module.main(["send", "data.bin"]) == 2
-    assert "removed" in capsys.readouterr().out
-    assert cli_module.main(["receive", "--bind-port", "9000"]) == 2
-    assert "removed" in capsys.readouterr().out
-
-
 def test_parser_supports_metadata_alias_flags() -> None:
     parser = _build_parser()
-    server_args = parser.parse_args(
+    send_args = parser.parse_args(
         [
-            "server",
+            "send",
+            "data.bin",
+            "--metadata-repeats",
+            "5",
+            "--periodic-metadata-interval-s",
+            "1.5",
+            "--periodic-metadata-every-n-chunks",
+            "100",
+        ]
+    )
+    receive_args = parser.parse_args(
+        [
+            "receive",
             "--pre-metadata-max-pending-bytes",
             "123456",
             "--pre-metadata-max-pending-bytes-per-transfer",
@@ -183,33 +202,20 @@ def test_parser_supports_metadata_alias_flags() -> None:
             "12.5",
         ]
     )
-    rsync_parser = _build_rsync_parser()
-    sync_ns = rsync_parser.parse_args(
-        [
-            "src",
-            "127.0.0.1:dst",
-            "--metadata-repeats",
-            "5",
-            "--periodic-metadata-interval-s",
-            "1.5",
-            "--periodic-metadata-every-n-chunks",
-            "100",
-        ]
-    )
-    assert sync_ns.manifest_repeats == 5
-    assert sync_ns.periodic_metadata_interval_s == pytest.approx(1.5)
-    assert sync_ns.periodic_metadata_every_n_chunks == 100
-    assert server_args.pre_metadata_max_pending_bytes == 123456
-    assert server_args.pre_metadata_max_pending_bytes_per_transfer == 2048
-    assert server_args.pre_metadata_max_pending_transfers == 16
-    assert server_args.pre_metadata_ttl_s == pytest.approx(12.5)
+    assert send_args.manifest_repeats == 5
+    assert send_args.periodic_metadata_interval_s == pytest.approx(1.5)
+    assert send_args.periodic_metadata_every_n_chunks == 100
+    assert receive_args.pre_metadata_max_pending_bytes == 123456
+    assert receive_args.pre_metadata_max_pending_bytes_per_transfer == 2048
+    assert receive_args.pre_metadata_max_pending_transfers == 16
+    assert receive_args.pre_metadata_ttl_s == pytest.approx(12.5)
 
 
 def test_parser_supports_adaptive_leading_hole_repair_flags() -> None:
     parser = _build_parser()
-    server_args = parser.parse_args(
+    receive_args = parser.parse_args(
         [
-            "server",
+            "receive",
             "--adaptive-leading-hole-boost",
             "--leading-hole-start-threshold-chunks",
             "128",
@@ -221,18 +227,30 @@ def test_parser_supports_adaptive_leading_hole_repair_flags() -> None:
             "8192",
         ]
     )
-    assert server_args.adaptive_leading_hole_boost is True
-    assert server_args.leading_hole_start_threshold_chunks == 128
-    assert server_args.leading_hole_min_span_chunks == 4096
-    assert server_args.leading_hole_boost_multiplier == 6
-    assert server_args.leading_hole_max_repair_chunks_per_request == 8192
+    assert receive_args.adaptive_leading_hole_boost is True
+    assert receive_args.leading_hole_start_threshold_chunks == 128
+    assert receive_args.leading_hole_min_span_chunks == 4096
+    assert receive_args.leading_hole_boost_multiplier == 6
+    assert receive_args.leading_hole_max_repair_chunks_per_request == 8192
 
 
 def test_periodic_metadata_default_is_enabled() -> None:
+    parser = _build_parser()
     rsync_parser = _build_rsync_parser()
+    send_args = parser.parse_args(["send", "data.bin"])
     sync_args = rsync_parser.parse_args(["src", "127.0.0.1:dst"])
+    assert send_args.feedback is None
     assert sync_args.feedback is None
+    assert send_args.periodic_metadata_interval_s == pytest.approx(10.0)
     assert sync_args.periodic_metadata_interval_s == pytest.approx(10.0)
+    assert send_args.revisit_incomplete_passes == 2
+    assert send_args.revisit_max_rounds_per_pass == 8
+    assert send_args.primary_feedback_max_rounds == 0
+    assert send_args.primary_feedback_max_seconds == pytest.approx(0.0)
+    assert send_args.repair_queue_max_pending_requests == 1024
+    assert send_args.repair_worker_max_chunks_per_burst == 256
+    assert send_args.initial_pass_repair_max_chunks_per_burst == 16
+    assert send_args.repair_worker_poll_interval_s == pytest.approx(0.01)
     assert sync_args.revisit_incomplete_passes == 2
     assert sync_args.revisit_max_rounds_per_pass == 8
     assert sync_args.primary_feedback_max_rounds == 64
@@ -245,10 +263,17 @@ def test_periodic_metadata_default_is_enabled() -> None:
 
 
 def test_parser_feedback_flags_support_auto_and_overrides() -> None:
+    parser = _build_parser()
     rsync_parser = _build_rsync_parser()
+    send_auto = parser.parse_args(["send", "data.bin"])
+    send_on = parser.parse_args(["send", "data.bin", "--feedback"])
+    send_off = parser.parse_args(["send", "data.bin", "--no-feedback"])
     sync_auto = rsync_parser.parse_args(["src", "127.0.0.1:dst"])
     sync_on = rsync_parser.parse_args(["src", "127.0.0.1:dst", "--feedback"])
     sync_off = rsync_parser.parse_args(["src", "127.0.0.1:dst", "--no-feedback"])
+    assert send_auto.feedback is None
+    assert send_on.feedback is True
+    assert send_off.feedback is False
     assert sync_auto.feedback is None
     assert sync_on.feedback is True
     assert sync_off.feedback is False
@@ -275,6 +300,10 @@ def test_parser_supports_monitor_subcommand() -> None:
 
 def test_parser_supports_forward_stream_quiet_s_flag() -> None:
     parser = _build_parser()
+    recv_default = parser.parse_args(["receive"])
+    assert recv_default.forward_stream_quiet_s == pytest.approx(0.5)
+    recv_custom = parser.parse_args(["receive", "--forward-stream-quiet-s", "1.25"])
+    assert recv_custom.forward_stream_quiet_s == pytest.approx(1.25)
     ssyncd_default = parser.parse_args(["ssyncd"])
     assert ssyncd_default.forward_stream_quiet_s == pytest.approx(0.5)
     ssyncd_custom = parser.parse_args(["ssyncd", "--forward-stream-quiet-s", "0.1"])
@@ -305,36 +334,6 @@ def test_top_level_rsync_parser_supports_options() -> None:
     assert args.skip_unchanged is True
     assert args.include == ["*.txt"]
     assert args.paths == ["src", "127.0.0.1:dst"]
-
-
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["src", "127.0.0.1:dst", "--chunk-size", "0"],
-        ["src", "127.0.0.1:dst", "--dest-port", "0"],
-        ["src", "127.0.0.1:dst", "--drop-rate", "1.5"],
-        ["src", "127.0.0.1:dst", "--feedback-wait-s", "-1"],
-        ["src", "127.0.0.1:dst", "--feedback-wait-s", "nan"],
-        ["src", "127.0.0.1:dst", "--inter-packet-delay-s", "inf"],
-    ],
-)
-def test_sync_parser_rejects_invalid_numeric_values(argv: list[str]) -> None:
-    parser = _build_rsync_parser()
-    with pytest.raises(SystemExit):
-        parser.parse_args(argv)
-
-
-@pytest.mark.parametrize("value", ["nan", "inf"])
-def test_ssyncd_parser_rejects_non_finite_forward_stream_quiet_s(value: str) -> None:
-    parser = _build_ssyncd_parser()
-    with pytest.raises(SystemExit):
-        parser.parse_args(["--forward-stream-quiet-s", value])
-
-
-def test_sync_parser_verbose_from_config_increments_with_cli_flag() -> None:
-    parser = _build_rsync_parser({"verbose": 2})
-    args = parser.parse_args(["-v", "src", "127.0.0.1:dst"])
-    assert args.verbose == 3
 
 
 def test_main_routes_top_level_to_sync(
@@ -375,20 +374,6 @@ def test_main_routes_ssyncd_to_server(
     (tmp_path / "home").mkdir()
     monkeypatch.setattr(cli_module, "_run_server", _fake_run_server)
     assert cli_module.main(["ssyncd", "--bind-port", "9012"]) == 0
-
-
-def test_ssyncd_main_routes_to_server(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    def _fake_run_server(args: Namespace) -> int:
-        assert args.bind_port == 9013
-        return 0
-
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    (tmp_path / "home").mkdir()
-    monkeypatch.setattr(cli_module, "_run_server", _fake_run_server)
-    assert cli_module.ssyncd_main(["--bind-port", "9013"]) == 0
 
 
 def test_checksum_requires_skip_unchanged(
@@ -1139,19 +1124,116 @@ def test_run_sync_expands_source_wildcards(
     assert "would_send=2" in captured.out
 
 
-def test_config_local_sync_chunk_size_applies_to_parser(
+def test_run_sender_expands_quoted_wildcard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "a.deb").write_bytes(b"a")
+    (tmp_path / "b.deb").write_bytes(b"b")
+    send_order: list[str] = []
+
+    class FakeSender:
+        def __init__(self, config: object) -> None:
+            self.config = config
+
+        def send_file(
+            self,
+            file_path: Path,
+            destination_host: str,
+            destination_port: int,
+            remote_name: str | None = None,
+            stop_requested: object | None = None,
+            **_kwargs: object,
+        ) -> SimpleNamespace:
+            send_order.append(file_path.name)
+            return SimpleNamespace(
+                transfer_id_hex=file_path.name,
+                total_chunks=1,
+                repaired_chunks=0,
+                repair_rounds=0,
+                completed=True,
+            )
+
+    monkeypatch.setattr(cli_module, "SpaceSyncSender", FakeSender)
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "send",
+            str(tmp_path / "*.deb"),
+            "--dest-host",
+            "127.0.0.1",
+            "--dest-port",
+            "9000",
+        ]
+    )
+    exit_code = cli_module._run_sender(args)
+    assert exit_code == 0
+    assert send_order == ["a.deb", "b.deb"]
+
+
+def test_run_sender_accepts_multiple_expanded_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a = tmp_path / "a.deb"
+    b = tmp_path / "b.deb"
+    a.write_bytes(b"a")
+    b.write_bytes(b"b")
+    send_order: list[str] = []
+
+    class FakeSender:
+        def __init__(self, config: object) -> None:
+            self.config = config
+
+        def send_file(
+            self,
+            file_path: Path,
+            destination_host: str,
+            destination_port: int,
+            remote_name: str | None = None,
+            stop_requested: object | None = None,
+            **_kwargs: object,
+        ) -> SimpleNamespace:
+            send_order.append(file_path.name)
+            return SimpleNamespace(
+                transfer_id_hex=file_path.name,
+                total_chunks=1,
+                repaired_chunks=0,
+                repair_rounds=0,
+                completed=True,
+            )
+
+    monkeypatch.setattr(cli_module, "SpaceSyncSender", FakeSender)
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "send",
+            str(a),
+            str(b),
+            "--dest-host",
+            "127.0.0.1",
+            "--dest-port",
+            "9000",
+        ]
+    )
+    exit_code = cli_module._run_sender(args)
+    assert exit_code == 0
+    assert send_order == ["a.deb", "b.deb"]
+
+
+def test_config_local_send_chunk_size_applies_to_parser(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     (tmp_path / ".ssync.toml").write_text(
-        '[sync]\nchunk_size = 7777\n',
+        '[send]\nchunk_size = 7777\n',
         encoding="utf-8",
     )
-    cfg = load_cli_config_defaults("sync")
-    parser = _build_rsync_parser(cfg)
-    args = parser.parse_args(["src", "127.0.0.1:dst"])
+    cfg = load_cli_config_defaults("send")
+    parser = _build_parser(cfg)
+    args = parser.parse_args(["send", "data.bin"])
     assert args.chunk_size == 7777
 
 
@@ -1163,20 +1245,20 @@ def test_config_later_file_overrides_earlier(
     monkeypatch.setenv("HOME", str(home))
     (home / ".config" / "ssync").mkdir(parents=True)
     (home / ".config" / "ssync" / "config.toml").write_text(
-        "[sync]\nchunk_size = 100\n",
+        "[send]\nchunk_size = 100\n",
         encoding="utf-8",
     )
     (home / ".ssync.toml").write_text(
-        "[sync]\nchunk_size = 200\n",
+        "[send]\nchunk_size = 200\n",
         encoding="utf-8",
     )
     (tmp_path / ".ssync.toml").write_text(
-        "[sync]\nchunk_size = 300\n",
+        "[send]\nchunk_size = 300\n",
         encoding="utf-8",
     )
-    cfg = load_cli_config_defaults("sync")
-    parser = _build_rsync_parser(cfg)
-    args = parser.parse_args(["src", "127.0.0.1:dst"])
+    cfg = load_cli_config_defaults("send")
+    parser = _build_parser(cfg)
+    args = parser.parse_args(["send", "data.bin"])
     assert args.chunk_size == 300
 
 
@@ -1187,12 +1269,12 @@ def test_config_cli_overrides_toml(
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     (tmp_path / ".ssync.toml").write_text(
-        "[sync]\nchunk_size = 5000\n",
+        "[send]\nchunk_size = 5000\n",
         encoding="utf-8",
     )
-    cfg = load_cli_config_defaults("sync")
-    parser = _build_rsync_parser(cfg)
-    args = parser.parse_args(["src", "127.0.0.1:dst", "--chunk-size", "9999"])
+    cfg = load_cli_config_defaults("send")
+    parser = _build_parser(cfg)
+    args = parser.parse_args(["send", "data.bin", "--chunk-size", "9999"])
     assert args.chunk_size == 9999
 
 
@@ -1203,98 +1285,11 @@ def test_config_unknown_key_in_section_errors(
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     (tmp_path / ".ssync.toml").write_text(
-        "[sync]\nchunk_siz = 1\n",
+        "[send]\nchunk_siz = 1\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="Unknown config key"):
-        load_cli_config_defaults("sync")
-
-
-def test_config_sync_delete_key_is_rejected(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    (tmp_path / "home").mkdir()
-    (tmp_path / ".ssync.toml").write_text(
-        "[sync]\ndelete = true\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="Unknown config key"):
-        load_cli_config_defaults("sync")
-
-
-def test_config_server_bind_port_allows_zero(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    (tmp_path / "home").mkdir()
-    (tmp_path / ".ssync.toml").write_text(
-        "[server]\nbind_port = 0\n",
-        encoding="utf-8",
-    )
-    cfg = load_cli_config_defaults("server")
-    parser = _build_ssyncd_parser(cfg)
-    args = parser.parse_args([])
-    assert args.bind_port == 0
-
-
-def test_config_sync_verbose_boolean_is_supported(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    (tmp_path / "home").mkdir()
-    (tmp_path / ".ssync.toml").write_text(
-        "[sync]\nverbose = true\n",
-        encoding="utf-8",
-    )
-    cfg = load_cli_config_defaults("sync")
-    parser = _build_rsync_parser(cfg)
-    args = parser.parse_args(["src", "127.0.0.1:dst"])
-    assert args.verbose == 1
-
-
-@pytest.mark.parametrize(
-    "toml",
-    [
-        "[sync]\ndrop_rate = nan\n",
-        "[sync]\ndrop_rate = inf\n",
-    ],
-)
-def test_config_drop_rate_rejects_non_finite(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, toml: str
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    (tmp_path / "home").mkdir()
-    (tmp_path / ".ssync.toml").write_text(toml, encoding="utf-8")
-    with pytest.raises(ValueError, match="must be finite"):
-        load_cli_config_defaults("sync")
-
-
-def test_config_all_supported_keys_have_validator_classification() -> None:
-    all_keys = (
-        config_file_module._GLOBAL_KEYS
-        | config_file_module._MONITOR_KEYS
-        | config_file_module._SERVER_KEYS
-        | config_file_module._SYNC_KEYS
-    )
-    classified = (
-        config_file_module._GLOBAL_KEYS
-        | config_file_module._APPEND_LIST_KEYS
-        | config_file_module._PATH_KEYS
-        | config_file_module._STRING_KEYS
-        | config_file_module._BOOL_KEYS
-        | config_file_module._BIND_PORT_KEYS
-        | config_file_module._DEST_PORT_KEYS
-        | config_file_module._POSITIVE_INT_KEYS
-        | config_file_module._NONNEGATIVE_INT_KEYS
-        | config_file_module._NONNEGATIVE_FLOAT_KEYS
-        | frozenset({"drop_rate", "verbose"})
-    )
-    assert all_keys <= classified
+        load_cli_config_defaults("send")
 
 
 def test_config_unknown_section_errors(
@@ -1308,44 +1303,7 @@ def test_config_unknown_section_errors(
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="Unknown config section"):
-        load_cli_config_defaults("sync")
-
-
-@pytest.mark.parametrize(
-    ("toml", "match"),
-    [
-        ("[sync]\ndest_port = 70000\n", "must be <= 65535"),
-        ('[sync]\nchunk_size = "large"\n', "expected integer"),
-        ("[sync]\nchunk_size = 0\n", "must be >= 1"),
-        ("[sync]\nfeedback_wait_s = -1.0\n", "must be >= 0"),
-        ('[server]\nfeedback = "yes"\n', "expected boolean"),
-        ("[server]\nroot_dir = 123\n", "expected string"),
-    ],
-)
-def test_config_invalid_types_and_ranges_error(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    toml: str,
-    match: str,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    (tmp_path / "home").mkdir()
-    (tmp_path / ".ssync.toml").write_text(toml, encoding="utf-8")
-    command = "server" if "[server]" in toml else "sync"
-    with pytest.raises(ValueError, match=match):
-        load_cli_config_defaults(command)
-
-
-def test_config_non_utf8_file_errors(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    (tmp_path / "home").mkdir()
-    (tmp_path / ".ssync.toml").write_bytes(b"\xff")
-    with pytest.raises(ValueError, match="Invalid UTF-8"):
-        load_cli_config_defaults("sync")
+        load_cli_config_defaults("send")
 
 
 def test_config_sync_lists_from_toml(
@@ -1406,9 +1364,9 @@ def test_main_config_load_error_returns_2(
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     (tmp_path / ".ssync.toml").write_text(
-        "[sync]\nchunk_siz = 1\n",
+        "[send]\nchunk_siz = 1\n",
         encoding="utf-8",
     )
-    exit_code = cli_module.main(["src", "127.0.0.1:dst"])
+    exit_code = cli_module.main(["send", "data.bin"])
     assert exit_code == 2
     assert "config error" in capsys.readouterr().err

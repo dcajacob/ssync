@@ -25,23 +25,23 @@ Install editable package and test dependencies:
 uv sync --dev
 ```
 
-Run destination daemon (open-loop mode):
+Run receiver (no feedback):
 
 ```bash
-uv run ssyncd --bind-host 127.0.0.1 --bind-port 9000 --root-dir ./received --no-feedback
+uv run ssync receive --bind-host 127.0.0.1 --bind-port 9000 --output-dir ./received
 ```
 
 Send a file:
 
 ```bash
-uv run ssync ./example.bin 127.0.0.1:example.bin --dest-port 9000
+uv run ssync send ./example.bin --dest-host 127.0.0.1 --dest-port 9000
 ```
 
 Run feedback/repair mode:
 
 ```bash
-uv run ssyncd --bind-port 9000 --root-dir ./received --feedback
-uv run ssync ./example.bin 127.0.0.1:example.bin --dest-port 9000 --feedback
+uv run ssync receive --bind-port 9000 --output-dir ./received --feedback
+uv run ssync send ./example.bin --dest-port 9000 --feedback
 ```
 
 Rsync-like workflow (destination runs a server):
@@ -115,14 +115,14 @@ uv run ssync -r --no-feedback --open-loop-max-rounds 2 ./payloads 127.0.0.1:miss
 Machine-readable output for automation:
 
 ```bash
-uv run ssync ./example.bin 127.0.0.1:example.bin --dest-port 9000 --json
+uv run ssync send ./example.bin --dest-port 9000 --json
 uv run ssync -r ./payloads 127.0.0.1:missions/pass-001/ --dest-port 9000 --json
 ```
 
 Feedback mode timing controls:
 
 ```bash
-uv run ssync ./example.bin 127.0.0.1:example.bin --dest-port 9000 --feedback \
+uv run ssync send ./example.bin --dest-port 9000 --feedback \
   --feedback-wait-s 3.0 --max-feedback-idle-timeouts 10 --max-repair-rounds 32 \
   --repair-worker-max-chunks-per-burst 256 \
   --initial-pass-repair-max-chunks-per-burst 16
@@ -145,7 +145,7 @@ Sync-mode checksum prefetch:
 Periodic transfer metadata is enabled by default every 10 seconds:
 
 ```bash
-uv run ssync ./example.bin 127.0.0.1:example.bin --dest-port 9000 --feedback \
+uv run ssync send ./example.bin --dest-port 9000 --feedback \
   --periodic-metadata-interval-s 10.0 --periodic-metadata-every-n-chunks 1024
 ```
 
@@ -153,13 +153,13 @@ Availability beacons (default every second; `0` disables):
 
 ```bash
 uv run ssyncd --bind-port 9000 --beacon-interval-s 1.0
-uv run ssync ./example.bin 127.0.0.1:example.bin --dest-port 9000 --feedback --beacon-interval-s 1.0
+uv run ssync send ./example.bin --dest-port 9000 --feedback --beacon-interval-s 1.0
 ```
 
 Pre-metadata buffering controls on receiver/server:
 
 ```bash
-uv run ssyncd --bind-port 9000 --root-dir ./received --feedback \
+uv run ssync receive --bind-port 9000 --feedback \
   --pre-metadata-max-pending-bytes 8388608 \
   --pre-metadata-max-pending-bytes-per-transfer 524288 \
   --pre-metadata-max-pending-transfers 128 \
@@ -184,7 +184,7 @@ Receiver state advertisement:
 Simulate loss to exercise repair:
 
 ```bash
-uv run ssync ./example.bin 127.0.0.1:example.bin --dest-port 9000 --feedback --drop-every-nth-data 5
+uv run ssync send ./example.bin --dest-port 9000 --feedback --drop-every-nth-data 5
 ```
 
 Run a full local loopback validation script (open-loop + feedback/repair):
