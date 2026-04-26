@@ -225,6 +225,7 @@ _NONNEGATIVE_FLOAT_KEYS: Final[frozenset[str]] = frozenset(
     {
         "beacon_interval_s",
         "feedback_wait_s",
+        "forward_stream_quiet_s",
         "inter_packet_delay_s",
         "journal_flush_interval_s",
         "periodic_metadata_interval_s",
@@ -370,6 +371,11 @@ def _coerce_value(key: str, value: object, *, path: Path) -> object:
         return _coerce_int(key, value, path=path, minimum=0)
     if key in _NONNEGATIVE_FLOAT_KEYS:
         return _coerce_float(key, value, path=path, minimum=0.0)
+    if key == "drop_rate":
+        drop_rate = _coerce_float(key, value, path=path, minimum=0.0)
+        if drop_rate > 1.0:
+            raise ValueError(f"Invalid value for {key!r} in {path}: must be <= 1")
+        return drop_rate
     return value
 
 
