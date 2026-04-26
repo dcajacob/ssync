@@ -1,0 +1,142 @@
+# Default ssync configuration.
+#
+# ssync loads config from ~/.config/ssync/config.toml, ~/.ssync.toml, then
+# ./.ssync.toml. Later files override earlier files.
+
+[global]
+# Omitted by default so SSYNC_LOG_LEVEL can still control logging.
+# log_level = "WARNING"
+
+[send]
+dest_host = "127.0.0.1"
+dest_port = 9000
+chunk_size = 8900
+manifest_repeats = 3
+# Omitted by default to preserve automatic feedback discovery.
+# feedback = true
+feedback_wait_s = 5.0
+max_repair_rounds = 32
+max_feedback_idle_timeouts = 2
+drop_every_nth_data = 0
+drop_rate = 0.0
+inter_packet_delay_s = 0.0
+max_data_rate_bps = 0
+midstream_repair_max_rounds_per_poll = 1
+midstream_repair_max_chunks_per_poll = 512
+repair_duplicate_suppression_s = 0.2
+repair_queue_max_pending_requests = 1024
+repair_worker_max_chunks_per_burst = 256
+initial_pass_repair_max_chunks_per_burst = 16
+repair_worker_poll_interval_s = 0.01
+beacon_interval_s = 1.0
+periodic_metadata_interval_s = 10.0
+periodic_metadata_every_n_chunks = 0
+revisit_incomplete_passes = 2
+revisit_max_rounds_per_pass = 8
+primary_feedback_max_rounds = 0
+primary_feedback_max_seconds = 0.0
+json_output = false
+
+[receive]
+bind_host = "127.0.0.1"
+bind_port = 9000
+output_dir = "./received"
+# Omitted by default; when unset, ssync derives the socket path from output_dir.
+# monitor_ipc_socket = "./received/.ssync-monitor.sock"
+feedback = false
+keep_part_files_on_complete = false
+status_repeat = 3
+periodic_repair_request_s = 0.5
+periodic_repair_min_seen_chunks = 32
+max_repair_chunks_per_request = 256
+adaptive_leading_hole_boost = true
+leading_hole_start_threshold_chunks = 512
+leading_hole_min_span_chunks = 2048
+leading_hole_boost_multiplier = 4
+leading_hole_max_repair_chunks_per_request = 2048
+repair_request_cooldown_s = 0.2
+repair_request_inflight_timeout_s = 1.5
+transfer_inactivity_timeout_s = 10.0
+socket_rcvbuf_bytes = 8388608
+journal_flush_interval_s = 0.5
+beacon_interval_s = 1.0
+forward_stream_quiet_s = 0.5
+pre_metadata_max_pending_bytes = 8388608
+pre_metadata_max_pending_bytes_per_transfer = 524288
+pre_metadata_max_pending_transfers = 128
+pre_metadata_ttl_s = 30.0
+
+[sync]
+destinations = []
+recursive = false
+dry_run = false
+verbose = 0
+include = []
+exclude = []
+delete = false
+skip_unchanged = false
+checksum = false
+dest_port = 9000
+chunk_size = 8900
+manifest_repeats = 3
+# Omitted by default to preserve automatic feedback discovery.
+# feedback = true
+feedback_wait_s = 5.0
+max_repair_rounds = 32
+max_feedback_idle_timeouts = 2
+drop_every_nth_data = 0
+drop_rate = 0.0
+inter_packet_delay_s = 0.0
+max_data_rate_bps = 0
+midstream_repair_max_rounds_per_poll = 1
+midstream_repair_max_chunks_per_poll = 512
+repair_duplicate_suppression_s = 0.2
+repair_queue_max_pending_requests = 1024
+repair_worker_max_chunks_per_burst = 256
+initial_pass_repair_max_chunks_per_burst = 16
+repair_worker_poll_interval_s = 0.01
+beacon_interval_s = 1.0
+periodic_metadata_interval_s = 10.0
+periodic_metadata_every_n_chunks = 0
+revisit_incomplete_passes = 2
+revisit_max_rounds_per_pass = 8
+primary_feedback_max_rounds = 64
+primary_feedback_max_seconds = 8.0
+state_file = ".ssync-open-loop-state.json"
+open_loop_max_rounds = 10
+json_output = false
+
+[server]
+bind_host = "0.0.0.0"
+bind_port = 9000
+root_dir = "./received"
+# Omitted by default; when unset, ssync derives the socket path from root_dir.
+# monitor_ipc_socket = "./received/.ssync-monitor.sock"
+feedback = true
+keep_part_files_on_complete = false
+status_repeat = 3
+periodic_repair_request_s = 0.5
+periodic_repair_min_seen_chunks = 32
+max_repair_chunks_per_request = 256
+adaptive_leading_hole_boost = true
+leading_hole_start_threshold_chunks = 512
+leading_hole_min_span_chunks = 2048
+leading_hole_boost_multiplier = 4
+leading_hole_max_repair_chunks_per_request = 2048
+repair_request_cooldown_s = 0.2
+repair_request_inflight_timeout_s = 1.5
+transfer_inactivity_timeout_s = 10.0
+socket_rcvbuf_bytes = 8388608
+journal_flush_interval_s = 0.5
+beacon_interval_s = 1.0
+forward_stream_quiet_s = 0.5
+pre_metadata_max_pending_bytes = 8388608
+pre_metadata_max_pending_bytes_per_transfer = 524288
+pre_metadata_max_pending_transfers = 128
+pre_metadata_ttl_s = 30.0
+
+[monitor]
+output_dir = "./received"
+refresh_interval_s = 0.5
+# Omitted by default; when unset, ssync derives the socket path from output_dir.
+# monitor_ipc_socket = "./received/.ssync-monitor.sock"
