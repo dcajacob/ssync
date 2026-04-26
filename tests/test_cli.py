@@ -314,12 +314,27 @@ def test_top_level_rsync_parser_supports_options() -> None:
         ["src", "127.0.0.1:dst", "--dest-port", "0"],
         ["src", "127.0.0.1:dst", "--drop-rate", "1.5"],
         ["src", "127.0.0.1:dst", "--feedback-wait-s", "-1"],
+        ["src", "127.0.0.1:dst", "--feedback-wait-s", "nan"],
+        ["src", "127.0.0.1:dst", "--inter-packet-delay-s", "inf"],
     ],
 )
 def test_sync_parser_rejects_invalid_numeric_values(argv: list[str]) -> None:
     parser = _build_rsync_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(argv)
+
+
+@pytest.mark.parametrize("value", ["nan", "inf"])
+def test_ssyncd_parser_rejects_non_finite_forward_stream_quiet_s(value: str) -> None:
+    parser = _build_ssyncd_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--forward-stream-quiet-s", value])
+
+
+def test_sync_parser_verbose_from_config_increments_with_cli_flag() -> None:
+    parser = _build_rsync_parser({"verbose": 2})
+    args = parser.parse_args(["-v", "src", "127.0.0.1:dst"])
+    assert args.verbose == 3
 
 
 def test_main_routes_top_level_to_sync(

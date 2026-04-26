@@ -8,6 +8,7 @@ import glob
 import inspect
 import json
 import logging
+import math
 import os
 import signal
 import sys
@@ -45,6 +46,20 @@ class _OverrideAppendAction(argparse.Action):
             items.extend(values)
         else:
             items.append(values)
+
+
+class _CountFromDefaultAction(argparse.Action):
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str | collections.abc.Sequence[Any] | None,
+        option_string: str | None = None,
+    ) -> None:
+        current = getattr(namespace, self.dest, 0)
+        if current is None:
+            current = 0
+        setattr(namespace, self.dest, int(current) + 1)
 
 
 def _make_default_getter(
@@ -101,6 +116,8 @@ def _nonnegative_int_arg(value: str) -> int:
 
 def _nonnegative_float_arg(value: str) -> float:
     parsed = float(value)
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("must be finite")
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be >= 0")
     return parsed
@@ -410,7 +427,8 @@ def _add_sync_args(
     parser.add_argument(
         "-v",
         "--verbose",
-        action="count",
+        action=_CountFromDefaultAction,
+        nargs=0,
         default=g("verbose", 0),
         help="Increase verbosity",
     )
