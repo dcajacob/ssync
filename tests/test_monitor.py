@@ -6,6 +6,7 @@ from pathlib import Path
 from rich.console import Console
 
 from ssync.space_sync.monitor import (
+    _CLEAR_CONFIRM_KEY,
     _FILE_COLUMN_WIDTH,
     TransferSnapshot,
     _autoselect_active_transfer_index,
@@ -524,6 +525,24 @@ def test_format_transfer_file_name_scrolls_only_when_highlighted() -> None:
     assert scrolled_a.plain != scrolled_b.plain
     assert "\n" not in scrolled_a.plain
     assert "\n" not in scrolled_b.plain
+
+
+def test_render_monitor_shows_clear_help_and_status_message() -> None:
+    console = Console(record=True, width=140)
+    console.print(
+        _render_monitor(
+            output_dir=Path("/tmp/rx"),
+            snapshots=[],
+            throughput_bps={},
+            selected_index=0,
+            completed_count=0,
+            completed_size=0,
+            status_message=("Press x again to clear", "yellow"),
+        )
+    )
+    rendered = console.export_text()
+    assert f"{_CLEAR_CONFIRM_KEY}=clear received dir" in rendered
+    assert "Press x again to clear" in rendered
 
 
 

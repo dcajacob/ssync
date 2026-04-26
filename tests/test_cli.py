@@ -14,7 +14,6 @@ from ssync.space_sync.cli import (
     _build_parser,
     _build_rsync_parser,
     _build_ssyncd_parser,
-    _clear_output_dir,
     _collect_sync_items,
     _is_unchanged,
     _load_open_loop_state,
@@ -23,6 +22,7 @@ from ssync.space_sync.cli import (
     _save_open_loop_state,
 )
 from ssync.space_sync.config_file import load_cli_config_defaults
+from ssync.space_sync.output_dir import clear_output_dir
 from ssync.space_sync.types import RemoteFileInfo
 
 
@@ -435,7 +435,7 @@ def test_clear_output_dir_removes_contents_but_keeps_directory(tmp_path: Path) -
     nested_dir.mkdir(parents=True)
     (output_dir / "file.bin").write_text("data")
     (nested_dir / "part.bin").write_text("part")
-    removed_files, removed_dirs = _clear_output_dir(output_dir)
+    removed_files, removed_dirs = clear_output_dir(output_dir)
     assert removed_files == 1
     assert removed_dirs == 1
     assert output_dir.exists()

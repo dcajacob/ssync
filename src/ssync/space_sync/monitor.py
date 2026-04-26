@@ -20,6 +20,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from .output_dir import clear_output_dir
+
 _TermiosAttrs = list[int | list[bytes | int]]
 _RATE_WINDOW_S = 3.0
 _DETAIL_MAP_WIDTH = 96
@@ -37,6 +39,9 @@ _FILE_COLUMN_WIDTH = 40
 _FILE_SCROLL_GAP = 6
 _FILE_SCROLL_STEP_S = 0.2
 _SELECTED_ROW_STYLE = "bold white on dark_blue"
+_CLEAR_CONFIRM_KEY = "x"
+_CLEAR_CONFIRM_WINDOW_S = 3.0
+_STATUS_MESSAGE_TTL_S = 3.0
 
 
 @dataclass(slots=True)
@@ -570,6 +575,7 @@ def _render_monitor(
     cumulative_repairs: int = 0,
     backfill_baseline_by_id: dict[str, int] | None = None,
     overall_mode: tuple[str, str] | None = None,
+    status_message: tuple[str, str] | None = None,
 ) -> Group:
     if overall_mode is None:
         overall_mode_label, overall_mode_style = _estimate_overall_mode(snapshots)
@@ -648,15 +654,21 @@ def _render_monitor(
     if not snapshots:
         table.add_row("No active transfers", "-", "-", "-", "-", "-")
 
-    help_line = Text("q=quit  r=reset counters", style="grey62")
+    help_line = Text(
+        f"q=quit  r=reset counters  {_CLEAR_CONFIRM_KEY}=clear received dir",
+        style="grey62",
+    )
+    header_items: list[Text] = [
+        Text("Space Sync Receiver Monitor", style="bold"),
+        Text(f"output_dir={output_dir}", style="grey70"),
+        summary,
+        beacon_summary,
+    ]
+    if status_message is not None:
+        header_items.append(Text(status_message[0], style=status_message[1]))
+    header_items.append(help_line)
     header = Panel(
-        Group(
-            Text("Space Sync Receiver Monitor", style="bold"),
-            Text(f"output_dir={output_dir}", style="grey70"),
-            summary,
-            beacon_summary,
-            help_line,
-        ),
+        Group(*header_items),
         border_style="blue",
         padding=(0, 1),
     )
@@ -764,6 +776,8 @@ class _KeyReader:
             return "down"
         if decoded.lower() in {"r"}:
             return "reset"
+        if decoded.lower() in {_CLEAR_CONFIRM_KEY}:
+            return "clear"
         return None
 
 
@@ -805,6 +819,9 @@ def run_monitor_tui(
     last_feedback_seen_s = float("-inf")
     next_refresh_s = 0.0
     render_needed = True
+    clear_armed_until_s = 0.0
+    status_message: tuple[str, str] | None = None
+    status_message_until_s = 0.0
     ipc_sock = _open_monitor_ipc_socket(monitor_ipc_socket)
     with _KeyReader() as keys:
         try:
@@ -890,6 +907,9 @@ def run_monitor_tui(
                         )
                         next_refresh_s = now + refresh_interval_s
                         render_needed = True
+                    if status_message is not None and time.monotonic() >= status_message_until_s:
+                        status_message = None
+                        render_needed = True
                     poll_timeout_s = 0.0 if render_needed else min(
                         _INPUT_POLL_INTERVAL_S,
                         max(0.0, next_refresh_s - time.monotonic()),
@@ -904,6 +924,45 @@ def run_monitor_tui(
                             for s in snapshots
                         }
                         last_backfill_by_id = dict(backfill_baseline_by_id)
+                        clear_armed_until_s = 0.0
+                        status_message = ("Counters reset", "cyan")
+                        status_message_until_s = time.monotonic() + _STATUS_MESSAGE_TTL_S
+                        render_needed = True
+                    if key == "clear":
+                        now_s = time.monotonic()
+                        if now_s <= clear_armed_until_s:
+                            try:
+                                removed_files, removed_dirs = clear_output_dir(output_dir)
+                            except ValueError as exc:
+                                status_message = (f"Clear failed: {exc}", "bold red")
+                            else:
+                                transfer_history.clear()
+                                throughput_bps.clear()
+                                snapshots = []
+                                previous_active_ids = set()
+                                last_backfill_by_id = {}
+                                backfill_baseline_by_id = {}
+                                cumulative_repairs = 0
+                                completed_count = 0
+                                completed_size = 0
+                                last_completed_scan_s = 0.0
+                                selected_index = 0
+                                next_refresh_s = 0.0
+                                status_message = (
+                                    "Cleared received dir "
+                                    f"({removed_files} file(s), {removed_dirs} dir(s))",
+                                    "bold green",
+                                )
+                            clear_armed_until_s = 0.0
+                            status_message_until_s = time.monotonic() + _STATUS_MESSAGE_TTL_S
+                        else:
+                            clear_armed_until_s = now_s + _CLEAR_CONFIRM_WINDOW_S
+                            status_message = (
+                                f"Press {_CLEAR_CONFIRM_KEY} again within "
+                                f"{_CLEAR_CONFIRM_WINDOW_S:.0f}s to clear {output_dir}",
+                                "bold yellow",
+                            )
+                            status_message_until_s = clear_armed_until_s
                         render_needed = True
                     if key == "up":
                         selected_index -= 1
@@ -928,6 +987,7 @@ def run_monitor_tui(
                             cumulative_repairs=cumulative_repairs,
                             backfill_baseline_by_id=backfill_baseline_by_id,
                             overall_mode=displayed_mode,
+                            status_message=status_message,
                         ),
                         refresh=True,
                     )

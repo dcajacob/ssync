@@ -9,7 +9,6 @@ import inspect
 import json
 import logging
 import os
-import shutil
 import signal
 import sys
 import threading
@@ -21,6 +20,7 @@ from typing import Any
 
 from .config_file import detect_cli_command, load_cli_config_defaults
 from .monitor import run_monitor_tui
+from .output_dir import clear_output_dir
 from .receiver import SpaceSyncReceiver
 from .sender import SpaceSyncSender
 from .types import DEFAULT_CHUNK_SIZE, ReceiverConfig, RemoteFileInfo, SenderConfig
@@ -2104,26 +2104,6 @@ def _run_monitor(args: argparse.Namespace) -> int:
         return 0
 
 
-def _clear_output_dir(output_dir: Path) -> tuple[int, int]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    resolved = output_dir.resolve()
-    home_dir = Path.home().resolve()
-    if resolved == Path(resolved.anchor):
-        raise ValueError("refusing to clear filesystem root")
-    if resolved == home_dir:
-        raise ValueError("refusing to clear the home directory")
-    removed_files = 0
-    removed_dirs = 0
-    for child in output_dir.iterdir():
-        if child.is_dir() and not child.is_symlink():
-            shutil.rmtree(child)
-            removed_dirs += 1
-            continue
-        child.unlink()
-        removed_files += 1
-    return removed_files, removed_dirs
-
-
 def _run_clear(args: argparse.Namespace) -> int:
     if args.confirm != _CLEAR_CONFIRM_TOKEN:
         print(
@@ -2132,7 +2112,7 @@ def _run_clear(args: argparse.Namespace) -> int:
         )
         return 2
     try:
-        removed_files, removed_dirs = _clear_output_dir(args.output_dir)
+        removed_files, removed_dirs = clear_output_dir(args.output_dir)
     except ValueError as exc:
         print(f"clear error: {exc}")
         return 2
