@@ -559,6 +559,16 @@ class SpaceSyncReceiver:
                     and cached_sha == manifest.sha256
                 ):
                     return True
+            # Size matches but no cache hit. Prefer size+mtime as a fast
+            # proxy to avoid blocking the main receive thread with a full
+            # SHA-256 read. Fall back to full hash only when mtime is
+            # unavailable (e.g. tests, legacy senders).
+            source_mtime_raw = manifest.metadata.get(int(MetadataType.SOURCE_MTIME_NS))
+            if source_mtime_raw is not None and len(source_mtime_raw) == 8:
+                source_mtime_ns = int.from_bytes(source_mtime_raw, "big")
+                if stat_result.st_mtime_ns == source_mtime_ns:
+                    return True
+                return False
             digest = hashlib.sha256()
             with final_path.open("rb") as stream:
                 for chunk in iter(lambda: stream.read(1024 * 1024), b""):

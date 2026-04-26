@@ -24,7 +24,7 @@ from .frames import (
     encode_metadata,
 )
 from .manifest import TransferManifest
-from .ranges import limit_ranges_to_chunk_budget, summarize_ranges
+from .ranges import expand_ranges, limit_ranges_to_chunk_budget, summarize_ranges
 from .types import (
     BeaconRole,
     FrameType,
@@ -384,10 +384,6 @@ class SpaceSyncSender:
                             # repairs to avoid adding bandwidth on top of the
                             # rate-limited forward data and causing receiver
                             # buffer overflows.
-                            try:
-                                parallel_runtime.queue.put_nowait(request)
-                            except queue.Full:
-                                pass
                             time.sleep(self.config.repair_worker_poll_interval_s)
                             continue
                         limited_ranges = limit_ranges_to_chunk_budget(
@@ -1019,16 +1015,10 @@ class SpaceSyncSender:
                     raise TimeoutError("Timed out waiting for matching STATUS FILE_INFO_RESPONSE")
                 sock.settimeout(remaining)
                 response_raw, _ = sock.recvfrom(65535)
-                try:
-                    parsed = decode_frame(response_raw)
-                except ValueError:
-                    continue
+                parsed = decode_frame(response_raw)
                 if parsed.frame_type != FrameType.STATUS:
                     continue
-                try:
-                    status = decode_status(parsed.payload)
-                except ValueError:
-                    continue
+                status = decode_status(parsed.payload)
                 if status.kind != StatusKind.FILE_INFO_RESPONSE:
                     continue
                 if status.query_token != query_token:
@@ -1065,37 +1055,33 @@ class SpaceSyncSender:
         paced_start_s: float,
         paced_data_bytes: int,
     ) -> tuple[int, bool, int]:
-        repaired = 0
-        had_indexes = False
-        for start, end in missing_ranges:
-            bounded_start = max(0, start)
-            bounded_end = min(end, total_chunks)
-            if bounded_start >= bounded_end:
-                continue
-            had_indexes = True
-            for chunk_index in range(bounded_start, bounded_end):
-                chunk_payload = chunk_reader(chunk_index)
-                if not chunk_payload:
-                    continue
-                while True:
-                    try:
-                        sock.sendto(
-                            encode_data_chunk(manifest.transfer_id, chunk_index, chunk_payload),
-                            destination,
-                        )
-                        break
-                    except BlockingIOError:
-                        time.sleep(0.001)
-                paced_data_bytes = self._apply_rate_limit(
-                    paced_start_s=paced_start_s,
-                    paced_data_bytes=paced_data_bytes,
-                    just_sent_bytes=len(chunk_payload),
-                )
-                repaired += 1
-                if self.config.inter_packet_delay_s > 0:
-                    time.sleep(self.config.inter_packet_delay_s)
-        if not had_indexes:
+        indexes = expand_ranges(missing_ranges)
+        if not indexes:
             return 0, True, paced_data_bytes
+        repaired = 0
+        for chunk_index in indexes:
+            if chunk_index >= total_chunks:
+                continue
+            chunk_payload = chunk_reader(chunk_index)
+            if not chunk_payload:
+                continue
+            while True:
+                try:
+                    sock.sendto(
+                        encode_data_chunk(manifest.transfer_id, chunk_index, chunk_payload),
+                        destination,
+                    )
+                    break
+                except BlockingIOError:
+                    time.sleep(0.001)
+            paced_data_bytes = self._apply_rate_limit(
+                paced_start_s=paced_start_s,
+                paced_data_bytes=paced_data_bytes,
+                just_sent_bytes=len(chunk_payload),
+            )
+            repaired += 1
+            if self.config.inter_packet_delay_s > 0:
+                time.sleep(self.config.inter_packet_delay_s)
         return repaired, False, paced_data_bytes
 
     def _drain_repair_requests(
