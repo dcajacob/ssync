@@ -36,6 +36,7 @@ _MAX_VISIBLE_TRANSFERS = 5
 _FILE_COLUMN_WIDTH = 40
 _FILE_SCROLL_GAP = 6
 _FILE_SCROLL_STEP_S = 0.2
+_SELECTED_ROW_STYLE = "bold white on dark_blue"
 
 
 @dataclass(slots=True)
@@ -641,7 +642,7 @@ def _render_monitor(
             f"{snapshot.received_chunks}/{snapshot.total_chunks} ({percent:5.1f}%)",
             _format_bps(rate_bps),
             str(snapshot.range_count),
-            style="bold black on cyan" if is_selected else "",
+            style=_SELECTED_ROW_STYLE if is_selected else "",
         )
 
     if not snapshots:
