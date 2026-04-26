@@ -1013,6 +1013,8 @@ class SpaceSyncReceiver:
                 return
             transfer.finalized = True
             self._close_transfer_mmap(transfer)
+            self._mark_journal_dirty_locked()
+            self._flush_journal_locked(force=True)
         if self._finalize_thread is not None and self._finalize_thread.is_alive():
             self._finalize_queue.put((sock, transfer, missing_ranges))
         else:
@@ -1357,6 +1359,8 @@ class SpaceSyncReceiver:
     def _save_journal_locked(self) -> None:
         records: list[dict[str, object]] = []
         for transfer_id, transfer in self._transfers.items():
+            if transfer.finalized:
+                continue
             records.append(
                 {
                     "transfer_id_hex": transfer_id.hex(),

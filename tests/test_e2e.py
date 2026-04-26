@@ -945,6 +945,47 @@ def test_receiver_completed_transfers_has_single_entry_per_transfer(tmp_path: Pa
         receiver.stop()
 
 
+
+def test_receiver_hides_fully_received_no_feedback_transfer_from_active_journal(
+    tmp_path: Path,
+) -> None:
+    receiver_dir = tmp_path / "rx-hide-finalizing"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(output_dir=receiver_dir, enable_feedback=False),
+    )
+    receiver.start()
+    try:
+        source_path = tmp_path / "source-hide-finalizing.bin"
+        source_payload = b"hide-finalizing-" * 200_000
+        source_path.write_bytes(source_payload)
+        sender = SpaceSyncSender(
+            config=SenderConfig(
+                chunk_size=1024,
+                enable_feedback=False,
+            )
+        )
+        result = sender.send_file(source_path, "127.0.0.1", receiver.bind_port)
+        assert result.completed is True
+
+        journal_path = receiver_dir / ".ssync-journal.json"
+        assert _wait_for_file(journal_path, timeout_s=2.0)
+        assert _wait_for_predicate(
+            lambda: not any(
+                isinstance(item, dict)
+                and item.get("transfer_id_hex") == result.transfer_id_hex
+                for item in json.loads(journal_path.read_text(encoding="utf-8")).get(
+                    "transfers", []
+                )
+            ),
+            timeout_s=2.0,
+        )
+        assert _wait_for_file(receiver_dir / source_path.name, timeout_s=8.0)
+    finally:
+        receiver.stop()
+
+
 def test_feedback_revisit_completes_transfer_after_primary_incomplete(tmp_path: Path) -> None:
     receiver_dir = tmp_path / "rx-revisit"
     receiver = SpaceSyncReceiver(
