@@ -204,7 +204,7 @@ Sender behavior:
 
 After initial data transmission, sender waits for receiver feedback:
 
-- `feedback_wait_s` timer per receive wait (default 2.0s in reference implementation).
+- `feedback_wait_s` timer per receive wait (default 5.0s in reference implementation).
 - `max_feedback_idle_timeouts` consecutive wait expirations before termination (default 2).
 - `max_repair_rounds` maximum repair request loops (default 32).
 - `periodic_metadata_interval_s` cadence for re-sending metadata during transfer

@@ -97,7 +97,7 @@ def _parse_args() -> argparse.Namespace:
         dest="feedback",
         help="Disable receiver feedback and benchmark open-loop only",
     )
-    parser.add_argument("--feedback-wait-s", type=float, default=2.0)
+    parser.add_argument("--feedback-wait-s", type=float, default=5.0)
     parser.add_argument("--max-repair-rounds", type=int, default=0)
     parser.add_argument("--max-feedback-idle-timeouts", type=int, default=60)
     parser.add_argument("--midstream-repair-max-rounds-per-poll", type=int, default=1)

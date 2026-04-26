@@ -65,7 +65,7 @@ class SenderConfig:
     auto_feedback_discovery: bool = True
     auto_feedback_idle_timeout_s: float = 60.0
     auto_feedback_probe_interval_chunks: int = 64
-    feedback_wait_s: float = 2.0
+    feedback_wait_s: float = 5.0
     max_repair_rounds: int = 32
     max_feedback_idle_timeouts: int = 2
     drop_every_nth_data: int = 0

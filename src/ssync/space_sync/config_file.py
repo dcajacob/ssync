@@ -169,6 +169,77 @@ _APPEND_LIST_KEYS: Final[frozenset[str]] = frozenset(
     {"destinations", "include", "exclude"}
 )
 
+_STRING_KEYS: Final[frozenset[str]] = frozenset({"bind_host", "dest_host"})
+
+_BOOL_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "adaptive_leading_hole_boost",
+        "checksum",
+        "delete",
+        "dry_run",
+        "feedback",
+        "json_output",
+        "keep_part_files_on_complete",
+        "recursive",
+        "skip_unchanged",
+    }
+)
+
+_PORT_KEYS: Final[frozenset[str]] = frozenset({"bind_port", "dest_port"})
+
+_POSITIVE_INT_KEYS: Final[frozenset[str]] = frozenset({"chunk_size"})
+
+_NONNEGATIVE_INT_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "drop_every_nth_data",
+        "initial_pass_repair_max_chunks_per_burst",
+        "leading_hole_boost_multiplier",
+        "leading_hole_max_repair_chunks_per_request",
+        "leading_hole_min_span_chunks",
+        "leading_hole_start_threshold_chunks",
+        "manifest_repeats",
+        "max_feedback_idle_timeouts",
+        "max_repair_chunks_per_request",
+        "max_repair_rounds",
+        "max_data_rate_bps",
+        "midstream_repair_max_chunks_per_poll",
+        "midstream_repair_max_rounds_per_poll",
+        "open_loop_max_rounds",
+        "periodic_metadata_every_n_chunks",
+        "periodic_repair_min_seen_chunks",
+        "pre_metadata_max_pending_bytes",
+        "pre_metadata_max_pending_bytes_per_transfer",
+        "pre_metadata_max_pending_transfers",
+        "primary_feedback_max_rounds",
+        "repair_queue_max_pending_requests",
+        "repair_worker_max_chunks_per_burst",
+        "revisit_incomplete_passes",
+        "revisit_max_rounds_per_pass",
+        "socket_rcvbuf_bytes",
+        "status_repeat",
+        "verbose",
+    }
+)
+
+_NONNEGATIVE_FLOAT_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "beacon_interval_s",
+        "feedback_wait_s",
+        "inter_packet_delay_s",
+        "journal_flush_interval_s",
+        "periodic_metadata_interval_s",
+        "periodic_repair_request_s",
+        "pre_metadata_ttl_s",
+        "primary_feedback_max_seconds",
+        "refresh_interval_s",
+        "repair_duplicate_suppression_s",
+        "repair_request_cooldown_s",
+        "repair_request_inflight_timeout_s",
+        "repair_worker_poll_interval_s",
+        "transfer_inactivity_timeout_s",
+    }
+)
+
 
 def detect_cli_command(argv: list[str]) -> str | None:
     """Return the logical CLI command for config lookup, or None if argv is empty."""
@@ -229,18 +300,49 @@ def _normalize_append_list(value: object, *, key: str, path: Path) -> list[str]:
     )
 
 
+def _coerce_bool(key: str, value: object, *, path: Path) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise ValueError(
+        f"Invalid type for {key!r} in {path}: expected boolean, got {type(value).__name__}"
+    )
+
+
+def _coerce_int(key: str, value: object, *, path: Path, minimum: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(
+            f"Invalid type for {key!r} in {path}: expected integer, got {type(value).__name__}"
+        )
+    if value < minimum:
+        raise ValueError(f"Invalid value for {key!r} in {path}: must be >= {minimum}")
+    return value
+
+
+def _coerce_float(key: str, value: object, *, path: Path, minimum: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"Invalid type for {key!r} in {path}: expected number, got {type(value).__name__}"
+        )
+    coerced = float(value)
+    if coerced < minimum:
+        raise ValueError(f"Invalid value for {key!r} in {path}: must be >= {minimum:g}")
+    return coerced
+
+
 def _coerce_value(key: str, value: object, *, path: Path) -> object:
     if key in _APPEND_LIST_KEYS:
         return _normalize_append_list(value, key=key, path=path)
     if key in _PATH_KEYS:
         if value is None:
             raise ValueError(f"Invalid value for {key!r} in {path}: cannot be null")
-        if isinstance(value, bool):
-            raise ValueError(f"Invalid type for {key!r} in {path}: expected string, got bool")
-        if isinstance(value, (int, float)):
-            return Path(str(value))
         if isinstance(value, str):
             return Path(value)
+        raise ValueError(
+            f"Invalid type for {key!r} in {path}: expected string, got {type(value).__name__}"
+        )
+    if key in _STRING_KEYS:
+        if isinstance(value, str):
+            return value
         raise ValueError(
             f"Invalid type for {key!r} in {path}: expected string, got {type(value).__name__}"
         )
@@ -255,28 +357,19 @@ def _coerce_value(key: str, value: object, *, path: Path) -> object:
                 f"Invalid log_level {value!r} in {path}: must be one of {sorted(_LOG_LEVEL_CHOICES)}"
             )
         return upper
-    if key == "verbose":
-        if isinstance(value, bool):
-            return 1 if value else 0
-        if isinstance(value, int) and not isinstance(value, bool):
-            if value < 0:
-                raise ValueError(f"verbose must be >= 0 in {path}")
-            return value
-        raise ValueError(
-            f"Invalid type for verbose in {path}: expected integer or boolean, got {type(value).__name__}"
-        )
-    if key == "json_output":
-        if isinstance(value, bool):
-            return value
-        raise ValueError(
-            f"Invalid type for json_output in {path}: expected boolean, got {type(value).__name__}"
-        )
-    if key == "feedback":
-        if isinstance(value, bool):
-            return value
-        raise ValueError(
-            f"Invalid type for feedback in {path}: expected boolean, got {type(value).__name__}"
-        )
+    if key in _BOOL_KEYS:
+        return _coerce_bool(key, value, path=path)
+    if key in _PORT_KEYS:
+        port = _coerce_int(key, value, path=path, minimum=1)
+        if port > 65535:
+            raise ValueError(f"Invalid value for {key!r} in {path}: must be <= 65535")
+        return port
+    if key in _POSITIVE_INT_KEYS:
+        return _coerce_int(key, value, path=path, minimum=1)
+    if key in _NONNEGATIVE_INT_KEYS:
+        return _coerce_int(key, value, path=path, minimum=0)
+    if key in _NONNEGATIVE_FLOAT_KEYS:
+        return _coerce_float(key, value, path=path, minimum=0.0)
     return value
 
 
@@ -309,7 +402,11 @@ def load_cli_config_defaults(command: str) -> dict[str, Any]:
         except OSError as exc:
             raise ValueError(f"Could not read config file {path}: {exc}") from exc
         try:
-            doc = tomllib.loads(raw.decode("utf-8"))
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"Invalid UTF-8 in config file {path}: {exc}") from exc
+        try:
+            doc = tomllib.loads(text)
         except tomllib.TOMLDecodeError as exc:
             raise ValueError(f"Invalid TOML in config file {path}: {exc}") from exc
         if not isinstance(doc, dict):

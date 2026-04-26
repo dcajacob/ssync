@@ -1306,6 +1306,43 @@ def test_config_unknown_section_errors(
         load_cli_config_defaults("send")
 
 
+@pytest.mark.parametrize(
+    ("toml", "match"),
+    [
+        ("[send]\ndest_port = 70000\n", "must be <= 65535"),
+        ('[send]\nchunk_size = "large"\n', "expected integer"),
+        ("[send]\nchunk_size = 0\n", "must be >= 1"),
+        ("[send]\nfeedback_wait_s = -1.0\n", "must be >= 0"),
+        ('[receive]\nfeedback = "yes"\n', "expected boolean"),
+        ("[receive]\noutput_dir = 123\n", "expected string"),
+    ],
+)
+def test_config_invalid_types_and_ranges_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    toml: str,
+    match: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    (tmp_path / ".ssync.toml").write_text(toml, encoding="utf-8")
+    command = "receive" if "[receive]" in toml else "send"
+    with pytest.raises(ValueError, match=match):
+        load_cli_config_defaults(command)
+
+
+def test_config_non_utf8_file_errors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    (tmp_path / ".ssync.toml").write_bytes(b"\xff")
+    with pytest.raises(ValueError, match="Invalid UTF-8"):
+        load_cli_config_defaults("send")
+
+
 def test_config_sync_lists_from_toml(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

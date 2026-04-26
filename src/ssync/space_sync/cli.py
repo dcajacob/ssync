@@ -315,7 +315,7 @@ def _build_parser(config_defaults: dict[str, Any] | None = None) -> argparse.Arg
         send,
         "--feedback-wait-s",
         type=float,
-        default=g("feedback_wait_s", 2.0),
+        default=g("feedback_wait_s", 5.0),
         hidden=True,
     )
     _add_cli_argument(
@@ -792,7 +792,7 @@ def _add_sync_args(
         parser,
         "--feedback-wait-s",
         type=float,
-        default=g("feedback_wait_s", 2.0),
+        default=g("feedback_wait_s", 5.0),
         hidden=True,
     )
     _add_cli_argument(
