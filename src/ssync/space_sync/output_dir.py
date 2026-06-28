@@ -1,24 +1,43 @@
 from __future__ import annotations
 
 import shutil
+import logging
 from pathlib import Path
+
+
+logger = logging.getLogger(__name__)
 
 
 def clear_output_dir(output_dir: Path) -> tuple[int, int]:
     output_dir.mkdir(parents=True, exist_ok=True)
     resolved = output_dir.resolve()
     home_dir = Path.home().resolve()
+    
     if resolved == Path(resolved.anchor):
         raise ValueError("refusing to clear filesystem root")
     if resolved == home_dir:
         raise ValueError("refusing to clear the home directory")
+    
     removed_files = 0
     removed_dirs = 0
-    for child in output_dir.iterdir():
-        if child.is_dir() and not child.is_symlink():
-            shutil.rmtree(child)
-            removed_dirs += 1
-            continue
-        child.unlink()
-        removed_files += 1
+    
+    try:
+        for child in output_dir.iterdir():
+            try:
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child)
+                    removed_dirs += 1
+                    logger.debug(f"Removed directory: {child}")
+                else:
+                    child.unlink()
+                    removed_files += 1
+                    logger.debug(f"Removed file: {child}")
+            except Exception as e:
+                logger.warning(f"Failed to remove {child}: {e}")
+                raise
+    except Exception:
+        # Re-raise any exceptions that occurred during iteration
+        raise
+    
+    logger.info(f"Cleared output directory: {removed_files} files, {removed_dirs} directories removed")
     return removed_files, removed_dirs
