@@ -9,11 +9,13 @@ import pytest
 
 from ssync.space_sync import sender as sender_module
 from ssync.space_sync.frames import (
+    STATUS_FIXED_STRUCT,
     TransferStatus,
     decode_data_chunk,
     decode_frame,
     decode_manifest,
     encode_beacon,
+    encode_frame,
     encode_status,
 )
 from ssync.space_sync.manifest import TransferManifest
@@ -23,6 +25,7 @@ from ssync.space_sync.types import (
     FrameType,
     RemoteFileInfo,
     SenderConfig,
+    SendOutcome,
     StatusKind,
     TransferState,
 )
@@ -219,6 +222,60 @@ def test_drain_repair_requests_services_incomplete_status_ranges() -> None:
     assert completed is False
     assert saw_uplink is True
     assert sent_payloads
+
+
+def test_drain_repair_requests_ignores_malformed_status_frame() -> None:
+    sender = SpaceSyncSender(SenderConfig(enable_feedback=True))
+    manifest = TransferManifest.from_bytes(raw=b"abcdef", file_name="sample.bin", chunk_size=2)
+    malformed_status_frame = encode_frame(
+        FrameType.STATUS,
+        STATUS_FIXED_STRUCT.pack(
+            manifest.transfer_id,
+            99,
+            int(TransferState.INCOMPLETE),
+            0,
+        ),
+    )
+    complete_status_frame = encode_status(
+        TransferStatus(
+            transfer_id=manifest.transfer_id,
+            kind=StatusKind.TRANSFER,
+            state=TransferState.COMPLETE,
+            missing_ranges=[],
+        )
+    )
+
+    class FakeSocket(_FakeSocketBase):
+        def __init__(self) -> None:
+            self._responses = [malformed_status_frame, complete_status_frame]
+
+        def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+            if self._responses:
+                return self._responses.pop(0), ("127.0.0.1", 9000)
+            raise BlockingIOError
+
+        def sendto(self, _payload: bytes, _destination: tuple[str, int]) -> int:
+            return 0
+
+    fake = FakeSocket()
+    repaired, rounds, paced, completed, saw_uplink = sender._drain_repair_requests(
+        rx_sock=fake,  # type: ignore[arg-type]
+        tx_sock=fake,  # type: ignore[arg-type]
+        manifest=manifest,
+        total_chunks=3,
+        chunk_reader=lambda index: [b"ab", b"cd", b"ef"][index],
+        destination=("127.0.0.1", 9000),
+        paced_start_s=time.monotonic(),
+        paced_data_bytes=0,
+        max_rounds=1,
+        max_chunks=1,
+    )
+
+    assert repaired == 0
+    assert rounds == 0
+    assert paced == 0
+    assert completed is True
+    assert saw_uplink is True
 
 
 def test_maybe_send_beacon_respects_interval(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -425,6 +482,7 @@ def test_send_file_revisit_mode_repairs_without_initial_data(tmp_path: Path) -> 
         monkeypatch.undo()
 
     assert result.completed is True
+    assert result.outcome == SendOutcome.RECEIVER_COMPLETE
     assert sent_data_indexes == [0]
 
 
@@ -471,6 +529,7 @@ def test_send_file_zero_chunk_fast_path_skips_feedback_wait(tmp_path: Path) -> N
         monkeypatch.undo()
 
     assert result.completed is True
+    assert result.outcome == SendOutcome.OPEN_LOOP_SENT
     assert result.total_chunks == 0
     assert sent_frame_types.count(FrameType.METADATA) == 1
     assert FrameType.DATA not in sent_frame_types
@@ -545,6 +604,7 @@ def test_send_file_feedback_round_budget_stops_primary_attempt(tmp_path: Path) -
         monkeypatch.undo()
 
     assert result.completed is False
+    assert result.outcome == SendOutcome.INCOMPLETE
     assert result.repair_rounds == 1
     assert result.repaired_chunks == 1
     assert sent_data_indexes == [0]
@@ -621,10 +681,10 @@ def test_send_file_parallel_queue_repairs_while_prioritizing_data(tmp_path: Path
     finally:
         monkeypatch.undo()
 
-    # Repairs are deferred entirely during the initial forward pass to avoid
-    # adding bandwidth overhead that causes receiver buffer overflows.
-    assert result.repair_rounds == 0
-    assert result.repaired_chunks == 0
+    # Repairs are retained during the initial forward pass and serviced after
+    # the forward stream quiets.
+    assert result.repair_rounds == 1
+    assert result.repaired_chunks == 1
 
 
 def test_send_file_budget_does_not_interrupt_initial_data_pass(tmp_path: Path) -> None:
@@ -812,9 +872,10 @@ def test_send_file_auto_feedback_promotion_starts_parallel_repairs(tmp_path: Pat
         monkeypatch.undo()
 
     assert result.completed is False
-    # Repairs are deferred during the initial forward pass.
-    assert result.repair_rounds == 0
-    assert result.repaired_chunks == 0
+    # Repairs are deferred during the initial forward pass, then retained and
+    # serviced after the forward stream.
+    assert result.repair_rounds == 1
+    assert result.repaired_chunks == 1
 
 
 def test_send_file_auto_feedback_demotes_after_idle_timeout(tmp_path: Path) -> None:
@@ -908,6 +969,7 @@ def test_send_file_honors_stop_requested(tmp_path: Path) -> None:
         monkeypatch.undo()
 
     assert result.completed is False
+    assert result.outcome == SendOutcome.ABORTED
     assert sendto_calls >= 3
 
 

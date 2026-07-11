@@ -1,4 +1,11 @@
-from ssync.space_sync.ranges import ChunkTracker, decode_ranges, encode_ranges, merge_ranges
+from ssync.space_sync.ranges import (
+    ChunkTracker,
+    clamp_ranges_to_chunks,
+    decode_ranges,
+    encode_ranges,
+    iter_range_chunks,
+    merge_ranges,
+)
 
 
 def test_merge_ranges_combines_overlaps_and_adjacent() -> None:
@@ -45,4 +52,16 @@ def test_chunk_tracker_restore_from_received_ranges() -> None:
     assert tracker.received_ranges() == [(0, 4), (6, 8)]
     assert tracker.received_count() == 6
     assert tracker.missing_ranges() == [(4, 6)]
+
+
+def test_clamp_ranges_to_chunks_bounds_untrusted_spans() -> None:
+    ranges = [(-10, 3), (2, 2**32 - 1)]
+
+    assert clamp_ranges_to_chunks(ranges, total_chunks=5) == [(0, 5)]
+
+
+def test_iter_range_chunks_does_not_materialize_oversized_spans() -> None:
+    iterator = iter_range_chunks([(0, 2**32 - 1)], total_chunks=3)
+
+    assert list(iterator) == [0, 1, 2]
 

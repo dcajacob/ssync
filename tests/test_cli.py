@@ -20,6 +20,8 @@ from ssync.space_sync.cli import (
     _parse_destination,
     _save_open_loop_state,
 )
+from ssync.space_sync.cli_args import build_parser, build_rsync_parser
+from ssync.space_sync.cli_output import result_outcome_value
 from ssync.space_sync.config_file import load_cli_config_defaults
 from ssync.space_sync.output_dir import clear_output_dir
 from ssync.space_sync.types import RemoteFileInfo
@@ -111,6 +113,18 @@ def test_send_and_sync_support_json_flag() -> None:
     assert sync_args.beacon_interval_s == pytest.approx(0.0)
 
 
+def test_cli_boundary_modules_expose_parser_and_output_helpers() -> None:
+    parser = build_parser()
+    rsync_parser = build_rsync_parser()
+
+    assert parser.parse_args(["send", "data.bin"]).command == "send"
+    assert rsync_parser.parse_args(["src", "127.0.0.1:dst"]).paths == [
+        "src",
+        "127.0.0.1:dst",
+    ]
+    assert result_outcome_value(Namespace(completed=True)) == "receiver_complete"
+
+
 def _subparsers_action(parser: argparse.ArgumentParser) -> argparse._SubParsersAction:
     for action in parser._actions:
         if isinstance(action, argparse._SubParsersAction):
@@ -164,14 +178,12 @@ def test_hidden_advanced_flags_still_parse_send_and_sync() -> None:
         [
             "src",
             "127.0.0.1:dst",
-            "--delete",
             "--feedback-wait-s",
             "1.5",
             "--repair-worker-poll-interval-s",
             "0.02",
         ]
     )
-    assert sync_ns.delete is True
     assert sync_ns.feedback_wait_s == pytest.approx(1.5)
     assert sync_ns.repair_worker_poll_interval_s == pytest.approx(0.02)
 
@@ -212,6 +224,39 @@ def test_parser_supports_metadata_alias_flags() -> None:
     assert receive_args.pre_metadata_ttl_s == pytest.approx(12.5)
 
 
+def test_parser_supports_receiver_resource_limit_flags() -> None:
+    parser = _build_parser()
+    receive_args = parser.parse_args(
+        [
+            "receive",
+            "--max-file-size-bytes",
+            "1000",
+            "--max-active-transfers",
+            "2",
+            "--max-active-allocation-bytes",
+            "5000",
+        ]
+    )
+    ssyncd_args = parser.parse_args(
+        [
+            "ssyncd",
+            "--max-file-size-bytes",
+            "2000",
+            "--max-active-transfers",
+            "3",
+            "--max-active-allocation-bytes",
+            "6000",
+        ]
+    )
+
+    assert receive_args.max_file_size_bytes == 1000
+    assert receive_args.max_active_transfers == 2
+    assert receive_args.max_active_allocation_bytes == 5000
+    assert ssyncd_args.max_file_size_bytes == 2000
+    assert ssyncd_args.max_active_transfers == 3
+    assert ssyncd_args.max_active_allocation_bytes == 6000
+
+
 def test_parser_supports_adaptive_leading_hole_repair_flags() -> None:
     parser = _build_parser()
     receive_args = parser.parse_args(
@@ -244,13 +289,10 @@ def test_periodic_metadata_default_is_enabled() -> None:
     assert sync_args.feedback is None
     assert send_args.periodic_metadata_interval_s == pytest.approx(10.0)
     assert sync_args.periodic_metadata_interval_s == pytest.approx(10.0)
-    assert send_args.revisit_incomplete_passes == 2
-    assert send_args.revisit_max_rounds_per_pass == 8
-    assert send_args.primary_feedback_max_rounds == 0
-    assert send_args.primary_feedback_max_seconds == pytest.approx(0.0)
+    assert send_args.primary_feedback_max_rounds == 64
+    assert send_args.primary_feedback_max_seconds == pytest.approx(8.0)
     assert send_args.repair_queue_max_pending_requests == 1024
     assert send_args.repair_worker_max_chunks_per_burst == 256
-    assert send_args.initial_pass_repair_max_chunks_per_burst == 16
     assert send_args.repair_worker_poll_interval_s == pytest.approx(0.01)
     assert sync_args.revisit_incomplete_passes == 2
     assert sync_args.revisit_max_rounds_per_pass == 8
@@ -258,7 +300,6 @@ def test_periodic_metadata_default_is_enabled() -> None:
     assert sync_args.primary_feedback_max_seconds == pytest.approx(8.0)
     assert sync_args.repair_queue_max_pending_requests == 1024
     assert sync_args.repair_worker_max_chunks_per_burst == 256
-    assert sync_args.initial_pass_repair_max_chunks_per_burst == 16
     assert sync_args.repair_worker_poll_interval_s == pytest.approx(0.01)
     assert sync_args.open_loop_max_rounds == 10
 

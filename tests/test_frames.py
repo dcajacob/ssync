@@ -1,5 +1,6 @@
 from ssync.space_sync.frames import (
     HEADER_STRUCT,
+    STATUS_FIXED_STRUCT,
     TransferStatus,
     decode_beacon,
     decode_data_chunk,
@@ -14,6 +15,7 @@ from ssync.space_sync.frames import (
     encode_manifest,
     encode_metadata,
     encode_status,
+    try_decode_status,
 )
 from ssync.space_sync.manifest import TransferManifest
 from ssync.space_sync.types import BeaconRole, FrameType, RemoteFileInfo, StatusKind, TransferState
@@ -118,6 +120,22 @@ def test_status_transfer_round_trip() -> None:
     status_decoded = decode_status(decode_frame(status_raw).payload)
     assert status_decoded.transfer_id == b"\xBB" * 16
     assert status_decoded.missing_ranges == [(2, 5), (8, 9)]
+
+
+def test_try_decode_status_returns_none_for_malformed_status() -> None:
+    assert try_decode_status(b"short") is None
+
+
+def test_try_decode_status_returns_none_for_unknown_status_kind() -> None:
+    payload = STATUS_FIXED_STRUCT.pack(
+        b"\xDD" * 16,
+        99,
+        int(TransferState.INCOMPLETE),
+        0,
+    )
+
+    assert try_decode_status(payload) is None
+
 
 def test_status_file_info_response_round_trip() -> None:
     status_raw = encode_status(

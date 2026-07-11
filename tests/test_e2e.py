@@ -22,6 +22,7 @@ from ssync.space_sync.sender import SpaceSyncSender
 from ssync.space_sync.types import (
     BeaconRole,
     FrameType,
+    MetadataType,
     ReceiverConfig,
     SenderConfig,
     TransferState,
@@ -261,6 +262,197 @@ def test_receiver_short_circuits_existing_complete_file(tmp_path: Path) -> None:
     first = decode_frame(first_raw)
     assert first.frame_type == FrameType.STATUS
     assert manifest.transfer_id not in receiver._transfers
+
+
+def test_receiver_does_not_short_circuit_on_mtime_only_match(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-short-circuit-mtime"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(output_dir=receiver_dir, enable_feedback=True),
+    )
+    final_path = receiver_dir / "same-mtime.bin"
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    final_path.write_bytes(b"wrong-bytes")
+    stat_result = final_path.stat()
+    manifest = TransferManifest.from_bytes(
+        raw=b"right-bytes",
+        file_name="same-mtime.bin",
+        chunk_size=4,
+        metadata={
+            int(MetadataType.SOURCE_MTIME_NS): int(stat_result.st_mtime_ns).to_bytes(
+                8,
+                "big",
+            ),
+        },
+    )
+
+    assert final_path.stat().st_size == manifest.file_size
+    assert receiver._is_matching_completed_file(final_path, manifest) is False
+
+
+def test_receiver_restores_reply_addr_from_journal_metadata(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-restore-reply"
+    receiver_dir.mkdir()
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(output_dir=receiver_dir, enable_feedback=True),
+    )
+    manifest = TransferManifest.from_bytes(
+        raw=b"restore-reply",
+        file_name="reply.bin",
+        chunk_size=4,
+        metadata={int(MetadataType.REPLY_PORT): (42424).to_bytes(2, "big")},
+    )
+    part_path = receiver_dir / f".{manifest.transfer_id.hex()}.part"
+    part_path.write_bytes(b"\x00" * manifest.file_size)
+    raw = {
+        "transfer_id_hex": manifest.transfer_id.hex(),
+        "manifest": {
+            "file_name": manifest.file_name,
+            "file_size": manifest.file_size,
+            "chunk_size": manifest.chunk_size,
+            "total_chunks": manifest.total_chunks,
+            "sha256_hex": manifest.sha256.hex(),
+            "metadata": {
+                str(key): value.hex() for key, value in manifest.metadata.items()
+            },
+        },
+        "part_path": part_path.name,
+        "final_path": manifest.file_name,
+        "received_ranges": [],
+        "source_addr": ["127.0.0.1", 30000],
+    }
+
+    transfer = receiver._restore_transfer(raw)
+
+    assert transfer is not None
+    assert transfer.reply_addr == ("127.0.0.1", 42424)
+
+
+def test_receiver_rejects_conflicting_active_transfer_same_final_path(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-conflicting-final"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(output_dir=receiver_dir, enable_feedback=True),
+    )
+    manifest1 = TransferManifest.from_bytes(
+        raw=b"first-payload",
+        file_name="conflict.bin",
+        chunk_size=4,
+    )
+    manifest2 = TransferManifest.from_bytes(
+        raw=b"second-payload",
+        file_name="conflict.bin",
+        chunk_size=4,
+    )
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver_sock:
+        receiver_sock.bind(("127.0.0.1", 0))
+        source_addr = ("127.0.0.1", 30001)
+        receiver._prepare_transfer(receiver_sock, manifest1, source_addr)
+        receiver._prepare_transfer(receiver_sock, manifest2, source_addr)
+
+    assert manifest1.transfer_id in receiver._transfers
+    assert manifest2.transfer_id not in receiver._transfers
+
+
+def test_receiver_rejects_oversize_manifest_before_part_allocation(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-oversize"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(
+            output_dir=receiver_dir,
+            enable_feedback=True,
+            max_file_size_bytes=4,
+        ),
+    )
+    manifest = TransferManifest.from_bytes(
+        raw=b"too-large",
+        file_name="oversize.bin",
+        chunk_size=4,
+    )
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver_sock:
+        receiver_sock.bind(("127.0.0.1", 0))
+        receiver._prepare_transfer(receiver_sock, manifest, ("127.0.0.1", 30002))
+
+    assert manifest.transfer_id not in receiver._transfers
+    assert not (receiver_dir / f".{manifest.transfer_id.hex()}.part").exists()
+
+
+def test_receiver_rejects_active_transfer_count_limit(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-active-limit"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(
+            output_dir=receiver_dir,
+            enable_feedback=True,
+            max_active_transfers=1,
+        ),
+    )
+    manifest1 = TransferManifest.from_bytes(raw=b"one", file_name="one.bin", chunk_size=2)
+    manifest2 = TransferManifest.from_bytes(raw=b"two", file_name="two.bin", chunk_size=2)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver_sock:
+        receiver_sock.bind(("127.0.0.1", 0))
+        receiver._prepare_transfer(receiver_sock, manifest1, ("127.0.0.1", 30003))
+        receiver._prepare_transfer(receiver_sock, manifest2, ("127.0.0.1", 30003))
+
+    assert manifest1.transfer_id in receiver._transfers
+    assert manifest2.transfer_id not in receiver._transfers
+
+
+def test_receiver_rejects_active_allocation_limit(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-allocation-limit"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(
+            output_dir=receiver_dir,
+            enable_feedback=True,
+            max_active_allocation_bytes=5,
+        ),
+    )
+    manifest1 = TransferManifest.from_bytes(raw=b"1234", file_name="one.bin", chunk_size=2)
+    manifest2 = TransferManifest.from_bytes(raw=b"5678", file_name="two.bin", chunk_size=2)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver_sock:
+        receiver_sock.bind(("127.0.0.1", 0))
+        receiver._prepare_transfer(receiver_sock, manifest1, ("127.0.0.1", 30004))
+        receiver._prepare_transfer(receiver_sock, manifest2, ("127.0.0.1", 30004))
+
+    assert manifest1.transfer_id in receiver._transfers
+    assert manifest2.transfer_id not in receiver._transfers
+
+
+def test_receiver_rejects_symlink_component_escape(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-symlink"
+    outside_dir = tmp_path / "outside"
+    receiver_dir.mkdir()
+    outside_dir.mkdir()
+    (receiver_dir / "escape").symlink_to(outside_dir, target_is_directory=True)
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(output_dir=receiver_dir, enable_feedback=True),
+    )
+    manifest = TransferManifest.from_bytes(
+        raw=b"payload",
+        file_name="escape/payload.bin",
+        chunk_size=4,
+    )
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver_sock:
+        receiver_sock.bind(("127.0.0.1", 0))
+        receiver._prepare_transfer(receiver_sock, manifest, ("127.0.0.1", 30005))
+
+    assert manifest.transfer_id not in receiver._transfers
+    assert not (outside_dir / "payload.bin").exists()
 
 
 def test_receiver_advertises_incomplete_state_on_repeated_manifest(tmp_path: Path) -> None:
@@ -844,6 +1036,8 @@ def test_receiver_chains_post_fin_repairs_without_periodic_wait(tmp_path: Path) 
                 feedback_wait_s=0.2,
                 midstream_repair_max_rounds_per_poll=0,
                 midstream_repair_max_chunks_per_poll=0,
+                primary_feedback_max_rounds=0,
+                primary_feedback_max_seconds=0.0,
             )
         )
         result = sender.send_file(source_path, "127.0.0.1", receiver.bind_port)
@@ -964,6 +1158,7 @@ def test_receiver_hides_fully_received_no_feedback_transfer_from_active_journal(
             config=SenderConfig(
                 chunk_size=1024,
                 enable_feedback=False,
+                auto_feedback_discovery=False,
             )
         )
         result = sender.send_file(source_path, "127.0.0.1", receiver.bind_port)

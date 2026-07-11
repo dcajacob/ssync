@@ -13,16 +13,30 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .cli_output import (
+    result_delivery_confirmed,
+    result_outcome_value,
+    result_transmission_complete,
+)
 from .config_file import detect_cli_command, load_cli_config_defaults
 from .monitor import run_monitor_tui
 from .receiver import SpaceSyncReceiver
 from .sender import SpaceSyncSender
-from .types import DEFAULT_CHUNK_SIZE, ReceiverConfig, RemoteFileInfo, SenderConfig
+from .sync_runner import run_sync
+from .types import (
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_MAX_ACTIVE_ALLOCATION_BYTES,
+    DEFAULT_MAX_ACTIVE_TRANSFERS,
+    DEFAULT_MAX_FILE_SIZE_BYTES,
+    ReceiverConfig,
+    RemoteFileInfo,
+    SenderConfig,
+)
 
 _REVISIT_WORKER_POLL_INTERVAL_S = 0.05
 _DEFAULT_OPEN_LOOP_MAX_ROUNDS = 10
@@ -33,7 +47,7 @@ class _OverrideAppendAction(argparse.Action):
         self,
         parser: argparse.ArgumentParser,
         namespace: argparse.Namespace,
-        values: str | list[str] | None,
+        values: str | Sequence[Any] | None,
         option_string: str | None = None,
     ) -> None:
         marker = f"_{self.dest}_explicit"
@@ -233,7 +247,10 @@ def _build_parser(config_defaults: dict[str, Any] | None = None) -> argparse.Arg
         "--forward-stream-quiet-s",
         type=float,
         default=g("forward_stream_quiet_s", 0.5),
-        help="Seconds of DATA silence before allowing state advertisements during forward streaming",
+        help=(
+            "Seconds of DATA silence before allowing state advertisements during "
+            "forward streaming"
+        ),
     )
     _add_cli_argument(
         recv,
@@ -261,6 +278,27 @@ def _build_parser(config_defaults: dict[str, Any] | None = None) -> argparse.Arg
         "--pre-metadata-ttl-s",
         type=float,
         default=g("pre_metadata_ttl_s", 30.0),
+        hidden=True,
+    )
+    _add_cli_argument(
+        recv,
+        "--max-file-size-bytes",
+        type=int,
+        default=g("max_file_size_bytes", DEFAULT_MAX_FILE_SIZE_BYTES),
+        hidden=True,
+    )
+    _add_cli_argument(
+        recv,
+        "--max-active-transfers",
+        type=int,
+        default=g("max_active_transfers", DEFAULT_MAX_ACTIVE_TRANSFERS),
+        hidden=True,
+    )
+    _add_cli_argument(
+        recv,
+        "--max-active-allocation-bytes",
+        type=int,
+        default=g("max_active_allocation_bytes", DEFAULT_MAX_ACTIVE_ALLOCATION_BYTES),
         hidden=True,
     )
     _add_log_level_arg(recv, g)
@@ -395,13 +433,6 @@ def _build_parser(config_defaults: dict[str, Any] | None = None) -> argparse.Arg
     )
     _add_cli_argument(
         send,
-        "--initial-pass-repair-max-chunks-per-burst",
-        type=int,
-        default=g("initial_pass_repair_max_chunks_per_burst", 16),
-        hidden=True,
-    )
-    _add_cli_argument(
-        send,
         "--repair-worker-poll-interval-s",
         type=float,
         default=g("repair_worker_poll_interval_s", 0.01),
@@ -430,30 +461,16 @@ def _build_parser(config_defaults: dict[str, Any] | None = None) -> argparse.Arg
     )
     _add_cli_argument(
         send,
-        "--revisit-incomplete-passes",
-        type=int,
-        default=g("revisit_incomplete_passes", 2),
-        hidden=True,
-    )
-    _add_cli_argument(
-        send,
-        "--revisit-max-rounds-per-pass",
-        type=int,
-        default=g("revisit_max_rounds_per_pass", 8),
-        hidden=True,
-    )
-    _add_cli_argument(
-        send,
         "--primary-feedback-max-rounds",
         type=int,
-        default=g("primary_feedback_max_rounds", 0),
+        default=g("primary_feedback_max_rounds", 64),
         hidden=True,
     )
     _add_cli_argument(
         send,
         "--primary-feedback-max-seconds",
         type=float,
-        default=g("primary_feedback_max_seconds", 0.0),
+        default=g("primary_feedback_max_seconds", 8.0),
         hidden=True,
     )
     send.add_argument(
@@ -653,7 +670,10 @@ def _add_server_args(parser: argparse.ArgumentParser, g: Callable[[str, Any], An
         "--forward-stream-quiet-s",
         type=float,
         default=g("forward_stream_quiet_s", 0.5),
-        help="Seconds of DATA silence before allowing state advertisements during forward streaming",
+        help=(
+            "Seconds of DATA silence before allowing state advertisements during "
+            "forward streaming"
+        ),
     )
     _add_cli_argument(
         parser,
@@ -681,6 +701,27 @@ def _add_server_args(parser: argparse.ArgumentParser, g: Callable[[str, Any], An
         "--pre-metadata-ttl-s",
         type=float,
         default=g("pre_metadata_ttl_s", 30.0),
+        hidden=True,
+    )
+    _add_cli_argument(
+        parser,
+        "--max-file-size-bytes",
+        type=int,
+        default=g("max_file_size_bytes", DEFAULT_MAX_FILE_SIZE_BYTES),
+        hidden=True,
+    )
+    _add_cli_argument(
+        parser,
+        "--max-active-transfers",
+        type=int,
+        default=g("max_active_transfers", DEFAULT_MAX_ACTIVE_TRANSFERS),
+        hidden=True,
+    )
+    _add_cli_argument(
+        parser,
+        "--max-active-allocation-bytes",
+        type=int,
+        default=g("max_active_allocation_bytes", DEFAULT_MAX_ACTIVE_ALLOCATION_BYTES),
         hidden=True,
     )
     _add_log_level_arg(parser, g)
@@ -736,13 +777,6 @@ def _add_sync_args(
         action=_OverrideAppendAction,
         default=g("exclude", []),
         help="Exclude paths matching glob",
-    )
-    _add_cli_argument(
-        parser,
-        "--delete",
-        action="store_true",
-        default=g("delete", False),
-        hidden=True,
     )
     parser.add_argument(
         "--skip-unchanged",
@@ -872,13 +906,6 @@ def _add_sync_args(
     )
     _add_cli_argument(
         parser,
-        "--initial-pass-repair-max-chunks-per-burst",
-        type=int,
-        default=g("initial_pass_repair_max_chunks_per_burst", 16),
-        hidden=True,
-    )
-    _add_cli_argument(
-        parser,
         "--repair-worker-poll-interval-s",
         type=float,
         default=g("repair_worker_poll_interval_s", 0.01),
@@ -987,6 +1014,9 @@ def _run_receiver_common(
     pre_metadata_max_pending_bytes_per_transfer: int,
     pre_metadata_max_pending_transfers: int,
     pre_metadata_ttl_s: float,
+    max_file_size_bytes: int,
+    max_active_transfers: int,
+    max_active_allocation_bytes: int,
     banner: str,
 ) -> int:
     resolved_monitor_ipc_socket = monitor_ipc_socket or _default_monitor_ipc_socket_for_dir(
@@ -1025,6 +1055,9 @@ def _run_receiver_common(
             ),
             pre_metadata_max_pending_transfers=max(1, pre_metadata_max_pending_transfers),
             pre_metadata_ttl_s=max(0.0, pre_metadata_ttl_s),
+            max_file_size_bytes=max(0, max_file_size_bytes),
+            max_active_transfers=max(0, max_active_transfers),
+            max_active_allocation_bytes=max(0, max_active_allocation_bytes),
         ),
     )
     receiver.start()
@@ -1076,6 +1109,9 @@ def _run_receiver(args: argparse.Namespace) -> int:
         ),
         pre_metadata_max_pending_transfers=args.pre_metadata_max_pending_transfers,
         pre_metadata_ttl_s=args.pre_metadata_ttl_s,
+        max_file_size_bytes=args.max_file_size_bytes,
+        max_active_transfers=args.max_active_transfers,
+        max_active_allocation_bytes=args.max_active_allocation_bytes,
         banner=f"Space Sync receiver listening on {args.bind_host}:{args.bind_port}",
     )
 
@@ -1110,6 +1146,9 @@ def _run_server(args: argparse.Namespace) -> int:
         ),
         pre_metadata_max_pending_transfers=args.pre_metadata_max_pending_transfers,
         pre_metadata_ttl_s=args.pre_metadata_ttl_s,
+        max_file_size_bytes=args.max_file_size_bytes,
+        max_active_transfers=args.max_active_transfers,
+        max_active_allocation_bytes=args.max_active_allocation_bytes,
         banner=(
             "Space Sync server listening on "
             f"{args.bind_host}:{args.bind_port} root={args.root_dir}"
@@ -1142,15 +1181,10 @@ def _run_sender(args: argparse.Namespace) -> int:
             repair_duplicate_suppression_s=max(0.0, args.repair_duplicate_suppression_s),
             repair_queue_max_pending_requests=max(1, args.repair_queue_max_pending_requests),
             repair_worker_max_chunks_per_burst=max(1, args.repair_worker_max_chunks_per_burst),
-            initial_pass_repair_max_chunks_per_burst=max(
-                1, args.initial_pass_repair_max_chunks_per_burst
-            ),
             repair_worker_poll_interval_s=max(0.001, args.repair_worker_poll_interval_s),
             beacon_interval_s=max(0.0, args.beacon_interval_s),
             periodic_metadata_interval_s=max(0.0, args.periodic_metadata_interval_s),
             periodic_metadata_every_n_chunks=max(0, args.periodic_metadata_every_n_chunks),
-            revisit_incomplete_passes=max(0, args.revisit_incomplete_passes),
-            revisit_max_rounds_per_pass=max(0, args.revisit_max_rounds_per_pass),
             primary_feedback_max_rounds=max(0, args.primary_feedback_max_rounds),
             primary_feedback_max_seconds=max(0.0, args.primary_feedback_max_seconds),
         )
@@ -1167,6 +1201,7 @@ def _run_sender(args: argparse.Namespace) -> int:
     results: list[dict[str, object]] = []
     failed = 0
     should_stop = False
+    processed = 0
 
     def _handle_signal(_signum: int, _frame: object) -> None:
         nonlocal should_stop
@@ -1186,14 +1221,21 @@ def _run_sender(args: argparse.Namespace) -> int:
             destination_port=args.dest_port,
             stop_requested=lambda: should_stop,
         )
-        if not result.completed:
+        processed += 1
+        result_complete = result_transmission_complete(result)
+        result_outcome = result_outcome_value(result)
+        if not result_complete:
             failed += 1
-        entry = {
+        entry: dict[str, object] = {
             "source": str(file_path),
+            "status": "sent" if result_complete else "incomplete",
             "transfer_id": result.transfer_id_hex,
             "chunks": result.total_chunks,
             "repaired": result.repaired_chunks,
             "rounds": result.repair_rounds,
+            "outcome": result_outcome,
+            "transmission_complete": result_complete,
+            "delivery_confirmed": result_delivery_confirmed(result),
             "completed": result.completed,
         }
         results.append(entry)
@@ -1201,36 +1243,27 @@ def _run_sender(args: argparse.Namespace) -> int:
             print(
                 f"source={file_path} transfer_id={result.transfer_id_hex} "
                 f"chunks={result.total_chunks} repaired={result.repaired_chunks} "
-                f"rounds={result.repair_rounds} completed={result.completed}"
+                f"rounds={result.repair_rounds} outcome={result_outcome}"
             )
 
     if args.json_output:
-        if len(results) == 1:
-            single = results[0]
-            print(
-                json.dumps(
-                    {
-                        "transfer_id": single["transfer_id"],
-                        "chunks": single["chunks"],
-                        "repaired": single["repaired"],
-                        "rounds": single["rounds"],
-                        "completed": single["completed"],
-                    }
-                )
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "summary": {
+                        "files_total": len(files),
+                        "files_processed": processed,
+                        "incomplete": failed,
+                        "interrupted": should_stop,
+                        "success": failed == 0 and not should_stop,
+                    },
+                    "results": results,
+                }
             )
-        else:
-            print(
-                json.dumps(
-                    {
-                        "summary": {
-                            "files": len(results),
-                            "incomplete": failed,
-                            "success": failed == 0,
-                        },
-                        "results": results,
-                    }
-                )
-            )
+        )
+    if should_stop:
+        return 130
     return 0 if failed == 0 else 1
 
 
@@ -1414,6 +1447,10 @@ class _RevisitEntry:
 
 
 def _run_sync(args: argparse.Namespace) -> int:
+    return run_sync(args)
+
+
+def _run_sync_impl(args: argparse.Namespace) -> int:
     if len(args.paths) < 2:
         print("sync error: expected at least one source and one destination")
         return 2
@@ -1444,9 +1481,6 @@ def _run_sync(args: argparse.Namespace) -> int:
             sync_plans.append((destination_host, destination_items))
     except ValueError as exc:
         print(f"sync error: {exc}")
-        return 2
-    if args.delete:
-        print("sync error: --delete is not implemented yet")
         return 2
     if args.checksum and not args.skip_unchanged:
         print("sync error: --checksum requires --skip-unchanged")
@@ -1479,15 +1513,10 @@ def _run_sync(args: argparse.Namespace) -> int:
             repair_duplicate_suppression_s=max(0.0, args.repair_duplicate_suppression_s),
             repair_queue_max_pending_requests=max(1, args.repair_queue_max_pending_requests),
             repair_worker_max_chunks_per_burst=max(1, args.repair_worker_max_chunks_per_burst),
-            initial_pass_repair_max_chunks_per_burst=max(
-                1, args.initial_pass_repair_max_chunks_per_burst
-            ),
             repair_worker_poll_interval_s=max(0.001, args.repair_worker_poll_interval_s),
             beacon_interval_s=max(0.0, args.beacon_interval_s),
             periodic_metadata_interval_s=max(0.0, args.periodic_metadata_interval_s),
             periodic_metadata_every_n_chunks=max(0, args.periodic_metadata_every_n_chunks),
-            revisit_incomplete_passes=max(0, args.revisit_incomplete_passes),
-            revisit_max_rounds_per_pass=max(0, args.revisit_max_rounds_per_pass),
             primary_feedback_max_rounds=max(0, args.primary_feedback_max_rounds),
             primary_feedback_max_seconds=max(0.0, args.primary_feedback_max_seconds),
         )
@@ -1497,6 +1526,7 @@ def _run_sync(args: argparse.Namespace) -> int:
     sent_count = 0
     skipped_count = 0
     dry_run_count = 0
+    unreadable_count = 0
     should_query_destination = bool(args.skip_unchanged)
     send_file_params = inspect.signature(sender.send_file).parameters
     supports_sha256_override = (
@@ -1791,7 +1821,9 @@ def _run_sync(args: argparse.Namespace) -> int:
                 max_feedback_seconds_override=0.0,
                 max_feedback_total_rounds_override=0,
             )
-            status = "revisit-sent" if result.completed else "revisit-incomplete"
+            result_complete = result_transmission_complete(result)
+            result_outcome = result_outcome_value(result)
+            status = "revisit-sent" if result_complete else "revisit-incomplete"
             item_result = {
                 "status": status,
                 "source": str(source_file),
@@ -1800,6 +1832,9 @@ def _run_sync(args: argparse.Namespace) -> int:
                 "chunks": result.total_chunks,
                 "repaired": result.repaired_chunks,
                 "rounds": result.repair_rounds,
+                "outcome": result_outcome,
+                "transmission_complete": result_complete,
+                "delivery_confirmed": result_delivery_confirmed(result),
                 "completed": result.completed,
                 "revisit_attempt": attempts,
             }
@@ -1808,9 +1843,9 @@ def _run_sync(args: argparse.Namespace) -> int:
             if args.verbose and not args.json_output:
                 print(
                     f"[{status}] {source_file} -> {destination_host}:{remote_name} "
-                    f"completed={result.completed} attempt={attempts}"
+                    f"outcome={result_outcome} attempt={attempts}"
                 )
-            if result.completed:
+            if result_complete:
                 with counters_lock:
                     sent_count += 1
                 completed_transfers += 1
@@ -1917,6 +1952,7 @@ def _run_sync(args: argparse.Namespace) -> int:
                     _start_revisit_worker()
                     with revisit_lock:
                         current_primary_revisit_key = (destination_host, remote_name)
+                    result = None
                     try:
                         prefetched_checksum = _get_prefetched_checksum(source_file)
                         if prefetched_checksum is not None:
@@ -1946,36 +1982,49 @@ def _run_sync(args: argparse.Namespace) -> int:
                             f"{exc.strerror} ({exc.errno})",
                             file=sys.stderr,
                         )
-                        skipped_count += 1
-                        continue
+                        failed += 1
+                        unreadable_count += 1
+                        status = "unreadable"
+                        item_result = {
+                            "status": "unreadable",
+                            "source": str(source_file),
+                            "destination": f"{destination_host}:{remote_name}",
+                            "completed": False,
+                        }
                     finally:
                         with revisit_lock:
                             current_primary_revisit_key = None
                         _stop_revisit_worker()
-                    status = "sent" if result.completed else "incomplete"
-                    if not result.completed:
-                        if revisit_enabled:
-                            _enqueue_revisit(
-                                source_file=source_file,
-                                destination_host=destination_host,
-                                remote_name=remote_name,
-                                transfer_id_hex=result.transfer_id_hex,
-                                prioritize=True,
-                            )
+                    if result is not None:
+                        result_complete = result_transmission_complete(result)
+                        result_outcome = result_outcome_value(result)
+                        status = "sent" if result_complete else "incomplete"
+                        if not result_complete:
+                            if revisit_enabled:
+                                _enqueue_revisit(
+                                    source_file=source_file,
+                                    destination_host=destination_host,
+                                    remote_name=remote_name,
+                                    transfer_id_hex=result.transfer_id_hex,
+                                    prioritize=True,
+                                )
+                            else:
+                                failed += 1
                         else:
-                            failed += 1
-                    else:
-                        sent_count += 1
-                    item_result = {
-                        "status": status,
-                        "source": str(source_file),
-                        "destination": f"{destination_host}:{remote_name}",
-                        "transfer_id": result.transfer_id_hex,
-                        "chunks": result.total_chunks,
-                        "repaired": result.repaired_chunks,
-                        "rounds": result.repair_rounds,
-                        "completed": result.completed,
-                    }
+                            sent_count += 1
+                        item_result = {
+                            "status": status,
+                            "source": str(source_file),
+                            "destination": f"{destination_host}:{remote_name}",
+                            "transfer_id": result.transfer_id_hex,
+                            "chunks": result.total_chunks,
+                            "repaired": result.repaired_chunks,
+                            "rounds": result.repair_rounds,
+                            "outcome": result_outcome,
+                            "transmission_complete": result_complete,
+                            "delivery_confirmed": result_delivery_confirmed(result),
+                            "completed": result.completed,
+                        }
                     if _open_loop_mode_active():
                         key = _retransmission_key(
                             destination_host=destination_host,
@@ -2029,12 +2078,16 @@ def _run_sync(args: argparse.Namespace) -> int:
             print(
                 json.dumps(
                     {
+                        "schema_version": 1,
                         "summary": {
-                            "files": total_items,
+                            "files_total": total_items,
+                            "files_processed": sent_count + skipped_count + dry_run_count + failed,
                             "incomplete": failed,
                             "sent": sent_count,
                             "skipped": skipped_count,
+                            "unreadable": unreadable_count,
                             "would_send": dry_run_count,
+                            "interrupted": should_stop,
                             "success": False,
                         },
                         "results": item_results if item_results is not None else [],
@@ -2044,18 +2097,24 @@ def _run_sync(args: argparse.Namespace) -> int:
             )
         else:
             print(f"sync completed with {failed} incomplete transfer(s)")
+        if should_stop:
+            return 130
         return 1
     if args.json_output:
         print(
             json.dumps(
                 {
+                    "schema_version": 1,
                     "summary": {
-                        "files": total_items,
+                        "files_total": total_items,
+                        "files_processed": sent_count + skipped_count + dry_run_count,
                         "incomplete": 0,
                         "sent": sent_count,
                         "skipped": skipped_count,
+                        "unreadable": unreadable_count,
                         "would_send": dry_run_count,
-                        "success": True,
+                        "interrupted": should_stop,
+                        "success": not should_stop,
                     },
                     "results": item_results if item_results is not None else [],
                     "results_limited": item_results is None,
@@ -2068,6 +2127,8 @@ def _run_sync(args: argparse.Namespace) -> int:
             f"files={total_items} sent={sent_count} skipped={skipped_count} "
             f"would_send={dry_run_count}"
         )
+    if should_stop:
+        return 130
     return 0
 
 

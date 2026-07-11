@@ -283,6 +283,13 @@ def decode_status(payload: bytes) -> TransferStatus:
     )
 
 
+def try_decode_status(payload: bytes) -> TransferStatus | None:
+    try:
+        return decode_status(payload)
+    except ValueError:
+        return None
+
+
 def encode_beacon(
     role: BeaconRole,
     transfer_id: bytes,

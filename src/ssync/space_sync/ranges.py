@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import struct
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from .types import Range
@@ -45,6 +46,25 @@ def expand_ranges(ranges: list[Range]) -> list[int]:
     for start, end in ranges:
         values.extend(range(start, end))
     return values
+
+
+def clamp_ranges_to_chunks(ranges: list[Range], total_chunks: int) -> list[Range]:
+    """Clamp half-open chunk ranges to [0, total_chunks)."""
+    if total_chunks <= 0:
+        return []
+    clamped: list[Range] = []
+    for start, end in merge_ranges(ranges):
+        bounded_start = max(0, min(start, total_chunks))
+        bounded_end = max(0, min(end, total_chunks))
+        if bounded_start < bounded_end:
+            clamped.append((bounded_start, bounded_end))
+    return clamped
+
+
+def iter_range_chunks(ranges: list[Range], total_chunks: int) -> Iterator[int]:
+    """Yield valid chunk indexes without materializing untrusted ranges."""
+    for start, end in clamp_ranges_to_chunks(ranges, total_chunks):
+        yield from range(start, end)
 
 
 def summarize_ranges(ranges: list[Range]) -> str:

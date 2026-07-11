@@ -18,19 +18,25 @@ from .frames import (
     BEACON_PEER_AGE_NEVER,
     decode_beacon,
     decode_frame,
-    decode_status,
     encode_beacon,
     encode_data_chunk,
     encode_metadata,
+    try_decode_status,
 )
 from .manifest import TransferManifest
-from .ranges import expand_ranges, limit_ranges_to_chunk_budget, summarize_ranges
+from .ranges import (
+    clamp_ranges_to_chunks,
+    iter_range_chunks,
+    limit_ranges_to_chunk_budget,
+    summarize_ranges,
+)
 from .types import (
     BeaconRole,
     FrameType,
     MetadataType,
     RemoteFileInfo,
     SenderConfig,
+    SendOutcome,
     SendResult,
     StatusKind,
     TransferState,
@@ -59,6 +65,7 @@ class _ParallelRepairRuntime:
     suppressed_duplicates: int = 0
     last_signature: tuple[tuple[int, int], ...] | None = None
     last_signature_s: float = 0.0
+    deferred_request: _QueuedRepairRequest | None = None
 
 
 class SpaceSyncSender:
@@ -106,6 +113,7 @@ class SpaceSyncSender:
         repair_rounds = 0
         feedback_budget_rounds = 0
         completed = False
+        hash_mismatch = False
         effective_max_repair_rounds = (
             self.config.max_repair_rounds
             if max_repair_rounds_override is None
@@ -300,6 +308,47 @@ class SpaceSyncSender:
                     stop_event=threading.Event(),
                 )
 
+                def _defer_repair_request(request: _QueuedRepairRequest) -> None:
+                    assert parallel_runtime is not None
+                    with parallel_runtime.state_lock:
+                        existing = parallel_runtime.deferred_request
+                        if existing is None:
+                            parallel_runtime.deferred_request = request
+                            return
+                        merged_ranges = clamp_ranges_to_chunks(
+                            list(existing.signature) + list(request.signature),
+                            total_chunks,
+                        )
+                        parallel_runtime.deferred_request = _QueuedRepairRequest(
+                            missing_ranges=merged_ranges,
+                            signature=tuple(merged_ranges),
+                            enqueued_s=request.enqueued_s,
+                        )
+
+                def _service_repair_request(request: _QueuedRepairRequest) -> None:
+                    nonlocal paced_data_bytes
+                    assert parallel_runtime is not None
+                    limited_ranges = limit_ranges_to_chunk_budget(
+                        clamp_ranges_to_chunks(request.missing_ranges, total_chunks),
+                        max(1, self.config.repair_worker_max_chunks_per_burst),
+                    )
+                    repaired_now, _, paced_data_bytes = self._send_requested_repairs(
+                        sock=tx_sock,
+                        manifest=manifest,
+                        total_chunks=total_chunks,
+                        chunk_reader=chunk_reader,
+                        destination=destination,
+                        missing_ranges=limited_ranges,
+                        paced_start_s=paced_start_s,
+                        paced_data_bytes=paced_data_bytes,
+                    )
+                    with parallel_runtime.state_lock:
+                        if repaired_now > 0:
+                            parallel_runtime.repaired_chunks += repaired_now
+                            parallel_runtime.repair_rounds += 1
+                        parallel_runtime.last_signature = request.signature
+                        parallel_runtime.last_signature_s = request.enqueued_s
+
                 def _recv_pump() -> None:
                     nonlocal last_uplink_activity_s, last_peer_beacon_rx_s
                     assert parallel_runtime is not None
@@ -328,7 +377,9 @@ class SpaceSyncSender:
                             continue
                         if parsed.frame_type != FrameType.STATUS:
                             continue
-                        status = decode_status(parsed.payload)
+                        status = try_decode_status(parsed.payload)
+                        if status is None:
+                            continue
                         if status.kind != StatusKind.TRANSFER:
                             continue
                         if status.transfer_id != manifest.transfer_id:
@@ -354,12 +405,21 @@ class SpaceSyncSender:
                         try:
                             parallel_runtime.queue.put_nowait(request)
                         except queue.Full:
-                            continue
+                            _defer_repair_request(request)
 
                 def _repair_worker() -> None:
-                    nonlocal paced_data_bytes
                     assert parallel_runtime is not None
                     while not parallel_runtime.stop_event.is_set():
+                        if (
+                            initial_data_phase_complete
+                            and parallel_runtime.deferred_request is not None
+                        ):
+                            with parallel_runtime.state_lock:
+                                request = parallel_runtime.deferred_request
+                                parallel_runtime.deferred_request = None
+                            if request is not None:
+                                _service_repair_request(request)
+                                continue
                         try:
                             request = parallel_runtime.queue.get(
                                 timeout=self.config.repair_worker_poll_interval_s
@@ -384,28 +444,9 @@ class SpaceSyncSender:
                             # repairs to avoid adding bandwidth on top of the
                             # rate-limited forward data and causing receiver
                             # buffer overflows.
-                            time.sleep(self.config.repair_worker_poll_interval_s)
+                            _defer_repair_request(request)
                             continue
-                        limited_ranges = limit_ranges_to_chunk_budget(
-                            request.missing_ranges,
-                            max(1, self.config.repair_worker_max_chunks_per_burst),
-                        )
-                        repaired_now, _, paced_data_bytes = self._send_requested_repairs(
-                            sock=tx_sock,
-                            manifest=manifest,
-                            total_chunks=total_chunks,
-                            chunk_reader=chunk_reader,
-                            destination=destination,
-                            missing_ranges=limited_ranges,
-                            paced_start_s=paced_start_s,
-                            paced_data_bytes=paced_data_bytes,
-                        )
-                        with parallel_runtime.state_lock:
-                            if repaired_now > 0:
-                                parallel_runtime.repaired_chunks += repaired_now
-                                parallel_runtime.repair_rounds += 1
-                            parallel_runtime.last_signature = request.signature
-                            parallel_runtime.last_signature_s = request.enqueued_s
+                        _service_repair_request(request)
 
                 parallel_threads.extend(
                     [
@@ -422,9 +463,36 @@ class SpaceSyncSender:
 
             def _stop_parallel_repairs() -> None:
                 nonlocal parallel_runtime, completed, repair_rounds, repaired_chunks
-                nonlocal last_uplink_activity_s
+                nonlocal last_uplink_activity_s, paced_data_bytes, hash_mismatch
                 if parallel_runtime is None:
                     return
+                deferred_request: _QueuedRepairRequest | None = None
+                with parallel_runtime.state_lock:
+                    deferred_request = parallel_runtime.deferred_request
+                    parallel_runtime.deferred_request = None
+                if (
+                    deferred_request is not None
+                    and not parallel_runtime.completed
+                    and not parallel_runtime.hash_mismatch
+                ):
+                    limited_ranges = limit_ranges_to_chunk_budget(
+                        clamp_ranges_to_chunks(deferred_request.missing_ranges, total_chunks),
+                        max(1, self.config.repair_worker_max_chunks_per_burst),
+                    )
+                    repaired_now, _, paced_data_bytes = self._send_requested_repairs(
+                        sock=tx_sock,
+                        manifest=manifest,
+                        total_chunks=total_chunks,
+                        chunk_reader=chunk_reader,
+                        destination=destination,
+                        missing_ranges=limited_ranges,
+                        paced_start_s=paced_start_s,
+                        paced_data_bytes=paced_data_bytes,
+                    )
+                    with parallel_runtime.state_lock:
+                        if repaired_now > 0:
+                            parallel_runtime.repaired_chunks += repaired_now
+                            parallel_runtime.repair_rounds += 1
                 parallel_runtime.stop_event.set()
                 for thread in parallel_threads:
                     thread.join(timeout=1.0)
@@ -435,6 +503,7 @@ class SpaceSyncSender:
                     repair_rounds += parallel_runtime.repair_rounds
                     completed = parallel_runtime.completed
                     if parallel_runtime.hash_mismatch:
+                        hash_mismatch = True
                         completed = False
                     if parallel_runtime.saw_uplink:
                         last_uplink_activity_s = time.monotonic()
@@ -480,9 +549,9 @@ class SpaceSyncSender:
                 return SendResult(
                     transfer_id_hex=manifest.transfer_id.hex(),
                     total_chunks=0,
+                    outcome=SendOutcome.OPEN_LOOP_SENT,
                     repaired_chunks=0,
                     repair_rounds=0,
-                    completed=True,
                 )
 
             dropped = 0
@@ -712,9 +781,14 @@ class SpaceSyncSender:
                 return SendResult(
                     transfer_id_hex=manifest.transfer_id.hex(),
                     total_chunks=total_chunks,
+                    outcome=(
+                        SendOutcome.OPEN_LOOP_SENT
+                        if dropped == 0
+                        else SendOutcome.INCOMPLETE
+                    ),
                     repaired_chunks=0,
                     repair_rounds=0,
-                    completed=(dropped == 0),
+                    dropped_initial_chunks=dropped,
                 )
 
             post_fin_repair_rounds = 0
@@ -729,9 +803,9 @@ class SpaceSyncSender:
                 return SendResult(
                     transfer_id_hex=manifest.transfer_id.hex(),
                     total_chunks=total_chunks,
+                    outcome=SendOutcome.RECEIVER_COMPLETE,
                     repaired_chunks=repaired_chunks,
                     repair_rounds=repair_rounds,
-                    completed=True,
                 )
             rx_sock.setblocking(True)
             rx_sock.settimeout(self.config.feedback_wait_s)
@@ -811,7 +885,9 @@ class SpaceSyncSender:
                         last_peer_beacon_rx_s = time.monotonic()
                     continue
                 if parsed.frame_type == FrameType.STATUS:
-                    status = decode_status(parsed.payload)
+                    status = try_decode_status(parsed.payload)
+                    if status is None:
+                        continue
                     if status.kind != StatusKind.TRANSFER:
                         continue
                     if status.transfer_id != manifest.transfer_id:
@@ -828,6 +904,7 @@ class SpaceSyncSender:
                         completed = True
                         break
                     if status.state == TransferState.HASH_MISMATCH:
+                        hash_mismatch = True
                         completed = False
                         break
                     if status.state != TransferState.INCOMPLETE:
@@ -844,13 +921,17 @@ class SpaceSyncSender:
                     ):
                         suppressed_duplicate_repairs += 1
                         continue
+                    repair_ranges = limit_ranges_to_chunk_budget(
+                        clamp_ranges_to_chunks(status.missing_ranges, total_chunks),
+                        max(1, self.config.repair_worker_max_chunks_per_burst),
+                    )
                     repaired_now, _, paced_data_bytes = self._send_requested_repairs(
                         sock=tx_sock,
                         manifest=manifest,
                         total_chunks=total_chunks,
                         chunk_reader=chunk_reader,
                         destination=destination,
-                        missing_ranges=status.missing_ranges,
+                        missing_ranges=repair_ranges,
                         paced_start_s=paced_start_s,
                         paced_data_bytes=paced_data_bytes,
                     )
@@ -889,9 +970,16 @@ class SpaceSyncSender:
         return SendResult(
             transfer_id_hex=manifest.transfer_id.hex(),
             total_chunks=total_chunks,
+            outcome=(
+                SendOutcome.RECEIVER_COMPLETE
+                if completed
+                else SendOutcome.HASH_MISMATCH
+                if hash_mismatch
+                else SendOutcome.INCOMPLETE
+            ),
             repaired_chunks=repaired_chunks,
             repair_rounds=repair_rounds,
-            completed=completed,
+            dropped_initial_chunks=dropped if "dropped" in locals() else 0,
         )
 
     @staticmethod
@@ -903,9 +991,9 @@ class SpaceSyncSender:
         return SendResult(
             transfer_id_hex=transfer_id_hex,
             total_chunks=total_chunks,
+            outcome=SendOutcome.ABORTED,
             repaired_chunks=0,
             repair_rounds=0,
-            completed=False,
         )
 
     def _sendto_with_interrupt(
@@ -1018,7 +1106,9 @@ class SpaceSyncSender:
                 parsed = decode_frame(response_raw)
                 if parsed.frame_type != FrameType.STATUS:
                     continue
-                status = decode_status(parsed.payload)
+                status = try_decode_status(parsed.payload)
+                if status is None:
+                    continue
                 if status.kind != StatusKind.FILE_INFO_RESPONSE:
                     continue
                 if status.query_token != query_token:
@@ -1055,13 +1145,11 @@ class SpaceSyncSender:
         paced_start_s: float,
         paced_data_bytes: int,
     ) -> tuple[int, bool, int]:
-        indexes = expand_ranges(missing_ranges)
-        if not indexes:
+        bounded_ranges = clamp_ranges_to_chunks(missing_ranges, total_chunks)
+        if not bounded_ranges:
             return 0, True, paced_data_bytes
         repaired = 0
-        for chunk_index in indexes:
-            if chunk_index >= total_chunks:
-                continue
+        for chunk_index in iter_range_chunks(bounded_ranges, total_chunks):
             chunk_payload = chunk_reader(chunk_index)
             if not chunk_payload:
                 continue
@@ -1117,7 +1205,9 @@ class SpaceSyncSender:
             except ValueError:
                 continue
             if parsed.frame_type == FrameType.STATUS:
-                status = decode_status(parsed.payload)
+                status = try_decode_status(parsed.payload)
+                if status is None:
+                    continue
                 if status.kind != StatusKind.TRANSFER:
                     continue
                 if status.transfer_id != manifest.transfer_id:

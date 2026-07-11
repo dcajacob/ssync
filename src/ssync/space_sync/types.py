@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 from pathlib import Path
 
 PROTOCOL_MAGIC = b"SS"
@@ -16,6 +16,9 @@ DEFAULT_CHUNK_SIZE = 4096
 DEFAULT_MANIFEST_REPEATS = 3
 DEFAULT_METADATA_REPEATS = DEFAULT_MANIFEST_REPEATS
 DEFAULT_SOCKET_TIMEOUT = 0.5
+DEFAULT_MAX_FILE_SIZE_BYTES = 8 * 1024 * 1024 * 1024
+DEFAULT_MAX_ACTIVE_TRANSFERS = 64
+DEFAULT_MAX_ACTIVE_ALLOCATION_BYTES = 32 * 1024 * 1024 * 1024
 
 
 class FrameType(IntEnum):
@@ -56,6 +59,14 @@ class MetadataType(IntEnum):
 Range = tuple[int, int]
 
 
+class SendOutcome(StrEnum):
+    RECEIVER_COMPLETE = "receiver_complete"
+    OPEN_LOOP_SENT = "open_loop_sent"
+    INCOMPLETE = "incomplete"
+    HASH_MISMATCH = "hash_mismatch"
+    ABORTED = "aborted"
+
+
 @dataclass(slots=True)
 class SenderConfig:
     chunk_size: int = DEFAULT_CHUNK_SIZE
@@ -77,13 +88,10 @@ class SenderConfig:
     beacon_interval_s: float = 1.0
     periodic_metadata_interval_s: float = 10.0
     periodic_metadata_every_n_chunks: int = 0
-    revisit_incomplete_passes: int = 2
-    revisit_max_rounds_per_pass: int = 8
-    primary_feedback_max_rounds: int = 0
-    primary_feedback_max_seconds: float = 0.0
+    primary_feedback_max_rounds: int = 64
+    primary_feedback_max_seconds: float = 8.0
     repair_queue_max_pending_requests: int = 1024
     repair_worker_max_chunks_per_burst: int = 256
-    initial_pass_repair_max_chunks_per_burst: int = 16
     repair_worker_poll_interval_s: float = 0.01
 
     @property
@@ -116,6 +124,9 @@ class ReceiverConfig:
     pre_metadata_max_pending_transfers: int = 128
     pre_metadata_ttl_s: float = 30.0
     forward_stream_quiet_s: float = 0.5
+    max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES
+    max_active_transfers: int = DEFAULT_MAX_ACTIVE_TRANSFERS
+    max_active_allocation_bytes: int = DEFAULT_MAX_ACTIVE_ALLOCATION_BYTES
     monitor_ipc_socket: Path | None = None
 
 
@@ -123,9 +134,25 @@ class ReceiverConfig:
 class SendResult:
     transfer_id_hex: str
     total_chunks: int
+    outcome: SendOutcome
     repaired_chunks: int = 0
     repair_rounds: int = 0
-    completed: bool = True
+    dropped_initial_chunks: int = 0
+
+    @property
+    def transmission_complete(self) -> bool:
+        return self.outcome in {
+            SendOutcome.RECEIVER_COMPLETE,
+            SendOutcome.OPEN_LOOP_SENT,
+        }
+
+    @property
+    def delivery_confirmed(self) -> bool:
+        return self.outcome == SendOutcome.RECEIVER_COMPLETE
+
+    @property
+    def completed(self) -> bool:
+        return self.transmission_complete
 
 
 @dataclass(slots=True)

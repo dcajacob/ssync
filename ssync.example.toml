@@ -1,7 +1,8 @@
-# Default ssync configuration.
+# Example ssync configuration.
 #
 # ssync loads config from ~/.config/ssync/config.toml, ~/.ssync.toml, then
-# ./.ssync.toml. Later files override earlier files.
+# ./.ssync.toml. Later files override earlier files. Copy this file to one
+# of those locations when you want local defaults.
 
 [global]
 # Omitted by default so SSYNC_LOG_LEVEL can still control logging.
@@ -26,15 +27,12 @@ midstream_repair_max_chunks_per_poll = 512
 repair_duplicate_suppression_s = 0.2
 repair_queue_max_pending_requests = 1024
 repair_worker_max_chunks_per_burst = 256
-initial_pass_repair_max_chunks_per_burst = 16
 repair_worker_poll_interval_s = 0.01
 beacon_interval_s = 1.0
 periodic_metadata_interval_s = 10.0
 periodic_metadata_every_n_chunks = 0
-revisit_incomplete_passes = 2
-revisit_max_rounds_per_pass = 8
-primary_feedback_max_rounds = 0
-primary_feedback_max_seconds = 0.0
+primary_feedback_max_rounds = 64
+primary_feedback_max_seconds = 8.0
 json_output = false
 
 [receive]
@@ -65,6 +63,9 @@ pre_metadata_max_pending_bytes = 8388608
 pre_metadata_max_pending_bytes_per_transfer = 524288
 pre_metadata_max_pending_transfers = 128
 pre_metadata_ttl_s = 30.0
+max_file_size_bytes = 8589934592
+max_active_transfers = 64
+max_active_allocation_bytes = 34359738368
 
 [sync]
 destinations = []
@@ -73,7 +74,6 @@ dry_run = false
 verbose = 0
 include = []
 exclude = []
-delete = false
 skip_unchanged = false
 checksum = false
 dest_port = 9000
@@ -93,7 +93,6 @@ midstream_repair_max_chunks_per_poll = 512
 repair_duplicate_suppression_s = 0.2
 repair_queue_max_pending_requests = 1024
 repair_worker_max_chunks_per_burst = 256
-initial_pass_repair_max_chunks_per_burst = 16
 repair_worker_poll_interval_s = 0.01
 beacon_interval_s = 1.0
 periodic_metadata_interval_s = 10.0
@@ -134,6 +133,9 @@ pre_metadata_max_pending_bytes = 8388608
 pre_metadata_max_pending_bytes_per_transfer = 524288
 pre_metadata_max_pending_transfers = 128
 pre_metadata_ttl_s = 30.0
+max_file_size_bytes = 8589934592
+max_active_transfers = 64
+max_active_allocation_bytes = 34359738368
 
 [monitor]
 output_dir = "./received"

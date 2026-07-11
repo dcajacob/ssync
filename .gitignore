@@ -16,3 +16,4 @@ demo.bin
 artifacts/
 docs/protocol-sequence-diagrams.md
 .vscode/
+.aider*

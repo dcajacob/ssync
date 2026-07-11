@@ -11,6 +11,9 @@ This repository includes:
 - feedback-assisted repair mode (sparse missing-range requests)
 - tests for core behavior and local end-to-end transfer
 
+For operational guidance on RF deployments, external security, receiver limits,
+and directory permissions, see [`docs/deployment.md`](docs/deployment.md).
+
 ## Python and environment
 
 - Python `>=3.13`
@@ -73,9 +76,10 @@ and can fall back to open-loop if uplink goes idle. Use `--feedback` or
 
 `--help` shows the common workflow and transport options. Many repair/metadata/debug
 knobs are still accepted on the command line for compatibility but are hidden from
-help; put them in `./.ssync.toml`, `~/.ssync.toml`, or `~/.config/ssync/config.toml`
-under the matching command section when you want tuning without long invocations
-(see allowed keys in `src/ssync/space_sync/config_file.py`).
+help; copy `ssync.example.toml` to `./.ssync.toml`, `~/.ssync.toml`, or
+`~/.config/ssync/config.toml` under the matching command section when you want
+tuning without long invocations (see allowed keys in
+`src/ssync/space_sync/config_file.py`).
 
 Rsync-style convenience options:
 

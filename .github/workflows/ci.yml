@@ -30,3 +30,6 @@ jobs:
 
       - name: Pytest
         run: uv run pytest -q
+
+      - name: Loopback scenarios
+        run: uv run python scripts/run_loopback_tests.py
