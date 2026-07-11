@@ -13,5 +13,6 @@ received/
 *.log
 tcpdump.log
 demo.bin
+artifacts/
 docs/protocol-sequence-diagrams.md
 .vscode/
