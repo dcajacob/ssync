@@ -30,3 +30,43 @@ jobs:
 
       - name: Pytest
         run: uv run pytest -q
+
+  install-profiles:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        profile: [space, ground]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+
+      - name: Build and install profile in isolation
+        run: |
+          make wheel
+          uv venv .profile-venv
+          wheels=(dist/*.whl)
+          uv pip install --python .profile-venv/bin/python "${wheels[0]}[${{ matrix.profile }}]"
+
+      - name: Verify dependencies and entry points
+        env:
+          SSYNC_PROFILE: ${{ matrix.profile }}
+        run: |
+          .profile-venv/bin/python - <<'PY'
+          import importlib.util
+          import os
+
+          is_ground = os.environ["SSYNC_PROFILE"] == "ground"
+          assert (importlib.util.find_spec("rich") is not None) == is_ground
+          if is_ground:
+              from ssync.space_sync.monitor import run_monitor_tui
+          PY
+          .profile-venv/bin/ssync --help
+          .profile-venv/bin/ssyncd --help

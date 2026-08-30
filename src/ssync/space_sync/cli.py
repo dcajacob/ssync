@@ -19,7 +19,6 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .config_file import detect_cli_command, load_cli_config_defaults
-from .monitor import run_monitor_tui
 from .receiver import SpaceSyncReceiver
 from .sender import SpaceSyncSender
 from .types import DEFAULT_CHUNK_SIZE, ReceiverConfig, RemoteFileInfo, SenderConfig
@@ -2073,6 +2072,18 @@ def _run_sync(args: argparse.Namespace) -> int:
 
 def _run_monitor(args: argparse.Namespace) -> int:
     try:
+        from .monitor import run_monitor_tui
+    except ModuleNotFoundError as exc:
+        if exc.name != "rich":
+            raise
+        print(
+            "monitor error: Rich is required for the ground monitor. "
+            "Install ssync with the 'ground' extra (ssync[ground]).",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
         return run_monitor_tui(
             output_dir=args.output_dir,
             refresh_interval_s=args.refresh_interval_s,
@@ -2136,4 +2147,3 @@ def ssyncd_main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

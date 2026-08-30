@@ -14,12 +14,71 @@ This repository includes:
 ## Python and environment
 
 - Python `>=3.13`
-- dependency-light runtime (uses `rich` for monitor TUI)
+- space runtime has no third-party dependencies
+- ground installation requires `rich` for the monitor TUI
 - tooling is `uv`-friendly
+
+## Install for space or ground
+
+Choose the installation profile on each host. From a checkout of this repository:
+
+```bash
+# Space side: sender, receiver, and daemon without Rich.
+python3 -m pip install '.[space]'
+
+# Ground side: the same transport commands plus Rich for the monitor.
+python3 -m pip install '.[ground]'
+```
+
+Both profiles provide `ssync` and `ssyncd`; they select dependencies, not a fixed
+send/receive role. A plain install without an extra is minimal, like `space`.
+The space installation does not load the monitor. Running `ssync monitor` without
+Rich exits with an explanation to install the `ground` extra.
+
+Build a wheel on a machine with Make and `uv`:
+
+```bash
+make wheel
+# Equivalent alias:
+make build
+```
+
+The build writes a `.whl` and source archive (`.tar.gz`) to `dist/`. It builds the
+wheel from the source archive to avoid stale files left in `build/` by earlier
+branches. Override the output directory or use cached build dependencies with:
+
+```bash
+make wheel DIST_DIR=artifacts/dist
+make wheel BUILD_FLAGS=--offline
+```
+
+Offline builds require the build dependencies to already be cached. Neither Make
+nor `uv` is required on the target when installing the wheel with pip.
+
+Select the profile when installing the built wheel:
+
+```bash
+python3 -m pip install './dist/ssync-0.1.0-py3-none-any.whl[space]'
+python3 -m pip install './dist/ssync-0.1.0-py3-none-any.whl[ground]'
+```
+
+The same wheel supports both profiles. Building it does not bundle dependencies;
+the ground installer also needs access to Rich and its dependencies.
+
+With `uv`, omit development dependencies for deployed hosts:
+
+```bash
+uv sync --no-dev --extra space
+uv run --no-dev --extra space ssyncd --root-dir ./received
+
+uv sync --no-dev --extra ground
+uv run --no-dev --extra ground ssync monitor --output-dir ./received
+```
 
 ## Quick start
 
-Install editable package and test dependencies:
+For development, install the editable package and test dependencies, including
+Rich for the monitor tests:
 
 ```bash
 uv sync --dev
