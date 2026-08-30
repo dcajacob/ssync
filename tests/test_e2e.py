@@ -17,6 +17,7 @@ from ssync.space_sync.frames import (
     encode_manifest,
 )
 from ssync.space_sync.manifest import TransferManifest
+from ssync.space_sync.output_dir import write_clear_request
 from ssync.space_sync.receiver import SpaceSyncReceiver
 from ssync.space_sync.sender import SpaceSyncSender
 from ssync.space_sync.types import (
@@ -103,6 +104,39 @@ def test_open_loop_local_transfer(tmp_path: Path) -> None:
         assert not part_path.exists()
     finally:
         receiver.stop()
+
+
+def test_open_loop_tail_redundancy_recovers_dropped_last_chunk(tmp_path: Path) -> None:
+    receiver_dir = tmp_path / "rx-open-tail-redundancy"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(output_dir=receiver_dir, enable_feedback=False),
+    )
+    receiver.start()
+    try:
+        source_path = tmp_path / "source-open-tail-redundancy.bin"
+        source_payload = b"A" * (256 * 3) + b"tail-last-chunk"
+        source_path.write_bytes(source_payload)
+
+        sender = SpaceSyncSender(
+            config=SenderConfig(
+                chunk_size=256,
+                enable_feedback=False,
+                drop_every_nth_data=4,
+                tail_redundancy_chunks=4,
+            ),
+        )
+        result = sender.send_file(source_path, "127.0.0.1", receiver.bind_port)
+
+        assert result.total_chunks == 4
+        assert result.completed is True
+        target_path = receiver_dir / source_path.name
+        assert _wait_for_file(target_path, timeout_s=8.0)
+        assert target_path.read_bytes() == source_payload
+    finally:
+        receiver.stop()
+
 
 
 def test_receiver_emits_monitor_ipc_events(tmp_path: Path) -> None:
@@ -982,6 +1016,58 @@ def test_receiver_hides_fully_received_no_feedback_transfer_from_active_journal(
             timeout_s=2.0,
         )
         assert _wait_for_file(receiver_dir / source_path.name, timeout_s=8.0)
+    finally:
+        receiver.stop()
+
+
+
+def test_receiver_clear_request_resets_live_state_and_allows_restart(
+    tmp_path: Path,
+) -> None:
+    receiver_dir = tmp_path / "rx-clear-live-state"
+    receiver = SpaceSyncReceiver(
+        bind_host="127.0.0.1",
+        bind_port=_free_udp_port(),
+        config=ReceiverConfig(
+            output_dir=receiver_dir,
+            enable_feedback=True,
+            transfer_inactivity_timeout_s=0.5,
+        ),
+    )
+    receiver.start()
+    try:
+        source_path = tmp_path / "source-clear-live-state.bin"
+        source_payload = b"clear-live-state-" * 80_000
+        source_path.write_bytes(source_payload)
+        sender = SpaceSyncSender(
+            config=SenderConfig(
+                chunk_size=256,
+                enable_feedback=False,
+            )
+        )
+        stop_deadline = time.monotonic() + 0.02
+        first = sender.send_file(
+            source_path,
+            "127.0.0.1",
+            receiver.bind_port,
+            stop_requested=lambda: time.monotonic() >= stop_deadline,
+        )
+        assert first.completed is False
+        assert _wait_for_predicate(lambda: bool(receiver._transfers), timeout_s=2.0)
+
+        write_clear_request(receiver_dir)
+        assert _wait_for_predicate(lambda: not receiver._transfers, timeout_s=2.0)
+        assert _wait_for_predicate(
+            lambda: not receiver._transfer_ids_by_signature
+            and not receiver._completed_hash_cache
+            and not receiver._completed,
+            timeout_s=2.0,
+        )
+
+        second = sender.send_file(source_path, "127.0.0.1", receiver.bind_port)
+        assert second.completed is True
+        assert _wait_for_file(receiver_dir / source_path.name, timeout_s=8.0)
+        assert (receiver_dir / source_path.name).read_bytes() == source_payload
     finally:
         receiver.stop()
 

@@ -338,6 +338,51 @@ def test_send_file_open_loop_uses_blocking_socket(tmp_path: Path) -> None:
     assert timeout_values and timeout_values[0] == pytest.approx(0.5)
 
 
+def test_send_file_open_loop_resends_tail_chunks(tmp_path: Path) -> None:
+    source_path = tmp_path / "payload-tail-redundancy.bin"
+    source_path.write_bytes(b"abcdefghijkl")
+    sender = SpaceSyncSender(
+        SenderConfig(
+            chunk_size=4,
+            enable_feedback=False,
+            manifest_repeats=1,
+            tail_redundancy_chunks=2,
+        )
+    )
+    sent_data_indexes: list[int] = []
+
+    class FakeSocket(_FakeSocketBase):
+        def __enter__(self) -> FakeSocket:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def settimeout(self, _value: float | None) -> None:
+            return None
+
+        def setblocking(self, _flag: bool) -> None:
+            return None
+
+        def sendto(self, payload: bytes, _destination: tuple[str, int]) -> int:
+            frame = decode_frame(payload)
+            if frame.frame_type == FrameType.DATA:
+                sent_data_indexes.append(decode_data_chunk(frame.payload).chunk_index)
+            return len(payload)
+
+    monkeypatch = pytest.MonkeyPatch()
+    _shared_fake = FakeSocket()
+    monkeypatch.setattr(sender_module.socket, "socket", lambda *_args: _shared_fake)
+    try:
+        result = sender.send_file(source_path, "127.0.0.1", 9000)
+    finally:
+        monkeypatch.undo()
+
+    assert result.completed is True
+    assert sent_data_indexes == [0, 1, 2, 1, 2]
+
+
+
 def test_send_file_revisit_mode_repairs_without_initial_data(tmp_path: Path) -> None:
     source_path = tmp_path / "payload-revisit.bin"
     source_path.write_bytes(b"abcdefgh")

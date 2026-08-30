@@ -27,6 +27,7 @@ from .frames import (
     encode_status,
 )
 from .manifest import TransferManifest
+from .output_dir import clear_output_dir, consume_clear_request
 from .ranges import ChunkTracker, limit_ranges_to_chunk_budget, summarize_ranges
 from .types import (
     DEFAULT_SOCKET_TIMEOUT,
@@ -252,6 +253,7 @@ class SpaceSyncReceiver:
     def _run_maintenance_loop(self) -> None:
         while not self._stop_event.is_set():
             time.sleep(0.05)
+            self._maybe_handle_clear_request()
             with self._lock:
                 active_transfers = list(self._transfers.values())
                 self._evict_expired_pre_metadata_locked()
@@ -1347,6 +1349,41 @@ class SpaceSyncReceiver:
                 "ts_s": time.monotonic(),
             }
         )
+
+    def _maybe_handle_clear_request(self) -> None:
+        if not consume_clear_request(self.config.output_dir):
+            return
+        with self._lock:
+            active_ids = [transfer.manifest.transfer_id.hex() for transfer in self._transfers.values()]
+            for transfer in self._transfers.values():
+                self._close_transfer_mmap(transfer)
+            self._transfers.clear()
+            self._transfer_ids_by_signature.clear()
+            self._completed.clear()
+            self._completed_hash_cache.clear()
+            self._pending_pre_metadata.clear()
+            self._pending_pre_metadata_total_bytes = 0
+            self._journal_dirty = False
+            self._last_journal_flush_s = 0.0
+        while True:
+            try:
+                self._finalize_queue.get_nowait()
+            except queue_mod.Empty:
+                break
+        try:
+            clear_output_dir(self.config.output_dir)
+        except ValueError:
+            return
+        with self._lock:
+            self._mark_journal_dirty_locked()
+            self._flush_journal_locked(force=True)
+        for transfer_id_hex in active_ids:
+            self._publish_transfer_terminal_event(
+                transfer_id_hex=transfer_id_hex,
+                state="CLEARED",
+                missing_ranges=[],
+            )
+        LOGGER.info("receiver state cleared output_dir=%s", self.config.output_dir)
 
     def _manifest_signature(self, manifest: TransferManifest) -> tuple[int, int, bytes, str]:
         return (

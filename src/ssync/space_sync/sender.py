@@ -486,6 +486,7 @@ class SpaceSyncSender:
                 )
 
             dropped = 0
+            dropped_chunk_indexes: set[int] = set()
             completed_by_receiver_signal = False
             if send_initial_data:
                 if feedback_active:
@@ -594,6 +595,7 @@ class SpaceSyncSender:
                         )
                         if should_drop:
                             dropped += 1
+                            dropped_chunk_indexes.add(chunk_index)
                             continue
                         if not self._sendto_with_interrupt(
                             sock=tx_sock,
@@ -634,6 +636,33 @@ class SpaceSyncSender:
                     _stop_parallel_repairs()
                     if completed:
                         completed_by_receiver_signal = True
+
+            if send_initial_data and not feedback_active and total_chunks > 0:
+                (
+                    tail_redundancy_sent,
+                    paced_data_bytes,
+                    tail_aborted,
+                ) = self._send_tail_redundancy(
+                    sock=tx_sock,
+                    manifest=manifest,
+                    total_chunks=total_chunks,
+                    chunk_reader=chunk_reader,
+                    destination=destination,
+                    paced_start_s=paced_start_s,
+                    paced_data_bytes=paced_data_bytes,
+                    stop_requested=stop_requested,
+                )
+                if tail_aborted:
+                    return self._aborted_result(manifest.transfer_id.hex(), total_chunks)
+                if tail_redundancy_sent:
+                    tail_start = max(0, total_chunks - self.config.tail_redundancy_chunks)
+                    dropped_chunk_indexes.difference_update(range(tail_start, total_chunks))
+                    LOGGER.debug(
+                        "transfer_id=%s resent_tail_chunks=%d start_chunk=%d",
+                        transfer_id_hex,
+                        tail_redundancy_sent,
+                        tail_start,
+                    )
 
             if (
                 feedback_active
@@ -703,10 +732,11 @@ class SpaceSyncSender:
                 if auto_feedback_enabled:
                     self._auto_feedback_active = False
                     self._last_auto_uplink_activity_s = last_uplink_activity_s
+                open_loop_completed = not dropped_chunk_indexes
                 LOGGER.info(
                     "send done transfer_id=%s completed=%s dropped_initial=%d",
                     transfer_id_hex,
-                    dropped == 0,
+                    open_loop_completed,
                     dropped,
                 )
                 return SendResult(
@@ -714,7 +744,7 @@ class SpaceSyncSender:
                     total_chunks=total_chunks,
                     repaired_chunks=0,
                     repair_rounds=0,
-                    completed=(dropped == 0),
+                    completed=open_loop_completed,
                 )
 
             post_fin_repair_rounds = 0
@@ -1042,6 +1072,44 @@ class SpaceSyncSender:
         offset = chunk_index * chunk_size
         file_stream.seek(offset)
         return file_stream.read(chunk_size)
+
+    def _send_tail_redundancy(
+        self,
+        *,
+        sock: socket.socket,
+        manifest: TransferManifest,
+        total_chunks: int,
+        chunk_reader: Callable[[int], bytes],
+        destination: tuple[str, int],
+        paced_start_s: float,
+        paced_data_bytes: int,
+        stop_requested: Callable[[], bool] | None,
+    ) -> tuple[int, int, bool]:
+        tail_chunks = max(0, self.config.tail_redundancy_chunks)
+        if tail_chunks <= 0 or total_chunks <= 0:
+            return 0, paced_data_bytes, False
+        start_index = max(0, total_chunks - tail_chunks)
+        resent = 0
+        for chunk_index in range(start_index, total_chunks):
+            chunk_payload = chunk_reader(chunk_index)
+            if not chunk_payload:
+                continue
+            if not self._sendto_with_interrupt(
+                sock=sock,
+                payload=encode_data_chunk(manifest.transfer_id, chunk_index, chunk_payload),
+                destination=destination,
+                stop_requested=stop_requested,
+            ):
+                return resent, paced_data_bytes, True
+            paced_data_bytes = self._apply_rate_limit(
+                paced_start_s=paced_start_s,
+                paced_data_bytes=paced_data_bytes,
+                just_sent_bytes=len(chunk_payload),
+            )
+            resent += 1
+            if self.config.inter_packet_delay_s > 0:
+                time.sleep(self.config.inter_packet_delay_s)
+        return resent, paced_data_bytes, False
 
     def _send_requested_repairs(
         self,
