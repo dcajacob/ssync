@@ -3,7 +3,11 @@ name = "ssync"
 version = "0.1.0"
 description = "Space Sync UDP transport protocol prototype"
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.13"
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+]
 dependencies = [
     "rich>=14.3.3",
 ]

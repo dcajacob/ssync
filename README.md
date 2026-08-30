@@ -301,3 +301,6 @@ uv run pytest -q
 - receiver-side persistent recovery state is supported via journal replay
 - file transfer first; stream transport deferred
 
+## License
+
+Space Sync is available under the [MIT License](LICENSE).
